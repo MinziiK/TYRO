@@ -1,5 +1,20 @@
 # Tyro team
 
+## Installation
+### 1) Clone the repository
+```
+git clone https://github.com/MinziiK/TYRO.git
+```
+### 2) Install libraries
+```
+# create conda env (Python 3.10)
+conda create -n tyro python=3.10 -y
+conda activate tyro
+
+# install dependencies
+pip install -r requirements.txt
+```
+
 ## Check GUI
 ```
 # 기본 GUI: 200 step 실시간 재생 (10초), 끝나면 창 유지

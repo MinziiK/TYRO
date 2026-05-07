@@ -5,5 +5,4 @@ scipy>=1.10
 stable-baselines3>=2.3.0
 torch>=2.4
 tensorboard>=2.15
-# Optional:
-# wandb>=0.16
+wandb>=0.16
