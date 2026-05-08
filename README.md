@@ -46,6 +46,6 @@ python -m src.train --stage 3 --phase 3 --total-steps 2_000_000 --num-envs 8 \
 # 평가 (GUI 로 확인)
 python -m src.eval runs/stage3_phase3_*/best/best_model.zip --render --episodes 5
 
-# 학습 곡선
+# 학습 그래프
 tensorboard --logdir runs/
 ```
