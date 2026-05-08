@@ -150,9 +150,16 @@ class TyroEnv(gym.Env):
             p.stepSimulation(physicsClientId=self.client)
 
         self._step_count += 1
+        # Evaluate world-state checks once per step; reuse for both reward
+        # penalty computation and termination logic so they cannot diverge
+        # (Stage 1 used to skip collision termination because the penalty
+        #  weight was 0 — see the design-spec review).
+        in_collision = self._in_bad_collision()
+        out_of_ws = self._out_of_workspace()
         obs = self._compute_obs()
-        reward, breakdown = self._compute_reward(action)
-        terminated, truncated, term_info = self._check_termination(breakdown)
+        reward, breakdown = self._compute_reward(action, in_collision, out_of_ws)
+        terminated, truncated, term_info = self._check_termination(
+            breakdown, in_collision, out_of_ws)
 
         info: Dict[str, Any] = {
             "reward_terms": breakdown.__dict__,
@@ -227,7 +234,8 @@ class TyroEnv(gym.Env):
     # ------------------------------------------------------------------
     # Reward
     # ------------------------------------------------------------------
-    def _compute_reward(self, action: np.ndarray
+    def _compute_reward(self, action: np.ndarray, in_collision: bool,
+                        out_of_workspace: bool
                         ) -> Tuple[float, rewards.RewardBreakdown]:
         rcfg = self.cfg.reward
         b = rewards.RewardBreakdown()
@@ -246,8 +254,10 @@ class TyroEnv(gym.Env):
         b.reach_B, b.d_B, b.theta_B = rewards.reach_reward(
             eeB_pos, bolt_pos, eeB_z, bolt_axis, rcfg)
         b.coop = rewards.coop_reward(b.d_A, b.d_B, rcfg)
-        b.success, b.is_success = rewards.success_bonus(b.d_A, b.theta_A, b.d_B, rcfg)
-        b.collision = rewards.collision_penalty(self._in_bad_collision(), rcfg)
+        b.success, b.is_success = rewards.success_bonus(
+            b.d_A, b.theta_A, b.d_B, b.theta_B, rcfg)
+        b.collision = rewards.collision_penalty(in_collision, rcfg)
+        b.workspace = rewards.workspace_penalty(out_of_workspace, rcfg)
         b.action = rewards.action_penalty(action, rcfg)
         b.jerk = rewards.jerk_penalty(action, self._prev_action, rcfg)
         b.shape_A = rewards.shaping_reward(self._prev_d_A, b.d_A, rcfg.w_shape_A)
@@ -275,14 +285,18 @@ class TyroEnv(gym.Env):
             return True
         return False
 
-    def _check_termination(self, b: rewards.RewardBreakdown
+    def _check_termination(self, b: rewards.RewardBreakdown,
+                           in_collision: bool, out_of_workspace: bool
                            ) -> Tuple[bool, bool, Dict[str, Any]]:
         info: Dict[str, Any] = {"is_success": b.is_success}
         if b.is_success:
             return True, False, {**info, "termination": "success"}
-        if b.collision < 0:
+        # Trigger on the raw geometric condition, not on the penalty value —
+        # the latter is gated to 0 in early stages (w_collision = 0) and would
+        # otherwise let the episode keep running through a clipping contact.
+        if in_collision:
             return True, False, {**info, "termination": "collision"}
-        if self._out_of_workspace():
+        if out_of_workspace:
             return True, False, {**info, "termination": "workspace"}
         if self._step_count >= self.cfg.max_steps:
             return False, True, {**info, "termination": "max_steps"}

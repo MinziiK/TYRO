@@ -22,6 +22,7 @@ class RewardBreakdown:
     coop: float = 0.0
     success: float = 0.0
     collision: float = 0.0
+    workspace: float = 0.0
     action: float = 0.0
     jerk: float = 0.0
     shape_A: float = 0.0
@@ -58,13 +59,21 @@ def coop_reward(d_A: float, d_B: float, cfg: RewardConfig) -> float:
     return cfg.w_c * float(np.exp(-cfg.alpha * d_A)) * float(np.exp(-cfg.beta * d_B))
 
 
-def success_bonus(d_A, theta_A, d_B, cfg: RewardConfig) -> tuple[float, bool]:
-    ok = (d_A < cfg.eps_A) and (theta_A < cfg.delta_A) and (d_B < cfg.eps_B)
+def success_bonus(d_A, theta_A, d_B, theta_B, cfg: RewardConfig) -> tuple[float, bool]:
+    # Spec §4.1 (4) lists d_A/theta_A/d_B; theta_B is added so the gripper must
+    # also be aligned to the bolt axis — otherwise success can fire while the
+    # gripper is pointed sideways.
+    ok = ((d_A < cfg.eps_A) and (theta_A < cfg.delta_A)
+          and (d_B < cfg.eps_B) and (theta_B < cfg.delta_B))
     return (cfg.R_success if ok else 0.0), bool(ok)
 
 
 def collision_penalty(in_collision: bool, cfg: RewardConfig) -> float:
     return -cfg.w_collision if in_collision else 0.0
+
+
+def workspace_penalty(out_of_workspace: bool, cfg: RewardConfig) -> float:
+    return -cfg.w_workspace if out_of_workspace else 0.0
 
 
 def action_penalty(action: np.ndarray, cfg: RewardConfig) -> float:
@@ -88,8 +97,9 @@ def shaping_reward(prev_d: Optional[float], curr_d: float, weight: float) -> flo
 
 def aggregate(parts: dict, use_shaping: bool) -> float:
     """Sum terms per spec §4.2 — picks dense vs shaping path."""
+    common = ("coop", "success", "collision", "workspace", "action", "jerk")
     if use_shaping:
-        keys = ("shape_A", "shape_B", "coop", "success", "collision", "action", "jerk")
+        keys = ("shape_A", "shape_B") + common
     else:
-        keys = ("align_A", "reach_B", "coop", "success", "collision", "action", "jerk")
+        keys = ("align_A", "reach_B") + common
     return float(sum(parts.get(k, 0.0) for k in keys))

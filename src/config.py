@@ -33,9 +33,11 @@ class RewardConfig:
     eps_A: float = 0.01     # 1 cm — tire-hub position threshold
     delta_A: float = np.deg2rad(5.0)  # 5° — tire-hub angle threshold
     eps_B: float = 0.01     # 1 cm — gripper_B-bolt position threshold
+    delta_B: float = np.deg2rad(5.0)  # 5° — gripper-bolt axis threshold
 
     # Penalties
     w_collision: float = 5.0
+    w_workspace: float = 5.0
     w_action: float = 0.01
     w_jerk: float = 0.01
 
@@ -137,22 +139,22 @@ def make_reward_config(stage: int) -> RewardConfig:
         rc.w_c = 0.0
         rc.R_success = 0.0
         rc.w_collision = 0.0
+        rc.w_workspace = 0.0
         rc.w_action = 0.0
         rc.w_jerk = 0.0
     elif stage == 2:
         rc.R_success = 0.0
         rc.w_collision = 0.0
+        rc.w_workspace = 0.0
         rc.w_action = 0.0
         rc.w_jerk = 0.0
     elif stage == 3:
         pass  # all defaults
     elif stage == 4:
-        # use_shaping toggle (set on EnvConfig) replaces align/reach with shape_*.
-        # Keep coop/success/penalties as in stage 3.
-        rc.w_d_A = 0.0
-        rc.w_theta_A = 0.0
-        rc.w_d_B = 0.0
-        rc.w_theta_B = 0.0
+        # use_shaping toggle (set on EnvConfig) makes aggregate() pick shape_*
+        # instead of align_A/reach_B, so the dense weights stay at their
+        # defaults — they're just not summed. Keep coop/success/penalties.
+        pass
     else:
         raise ValueError(f"unknown stage {stage}; valid: 1..4")
     return rc
