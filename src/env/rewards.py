@@ -6,7 +6,7 @@ so it stays unit-tested without PyBullet. The env aggregates terms in step().
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -20,6 +20,7 @@ class RewardBreakdown:
     align_A: float = 0.0
     reach_B: float = 0.0
     coop: float = 0.0
+    sync_joint_A: float = 0.0
     success: float = 0.0
     collision: float = 0.0
     workspace: float = 0.0
@@ -28,12 +29,16 @@ class RewardBreakdown:
     shape_A: float = 0.0
     shape_B: float = 0.0
     total: float = 0.0
+    dense_total_pre_mix: float = 0.0
     # auxiliary (for logging / termination)
     d_A: float = 0.0
     theta_A: float = 0.0
     d_B: float = 0.0
     theta_B: float = 0.0
     is_success: bool = False
+    axial_dot_th: float = 0.0
+    lateral_th: float = 0.0
+    lug_spin_err_rad: float = 0.0
 
 
 def align_reward(tire_pos, hub_pos, tire_axis, hub_axis,
@@ -59,12 +64,49 @@ def coop_reward(d_A: float, d_B: float, cfg: RewardConfig) -> float:
     return cfg.w_c * float(np.exp(-cfg.alpha * d_A)) * float(np.exp(-cfg.beta * d_B))
 
 
-def success_bonus(d_A, theta_A, d_B, theta_B, cfg: RewardConfig) -> tuple[float, bool]:
-    # Spec §4.1 (4) lists d_A/theta_A/d_B; theta_B is added so the gripper must
-    # also be aligned to the bolt axis — otherwise success can fire while the
-    # gripper is pointed sideways.
-    ok = ((d_A < cfg.eps_A) and (theta_A < cfg.delta_A)
-          and (d_B < cfg.eps_B) and (theta_B < cfg.delta_B))
+def sync_joint_a_penalty(qdot_a: np.ndarray, cfg: RewardConfig) -> float:
+    """Penalty on squared joint velocity magnitude for Robot A (UR10)."""
+    q = np.asarray(qdot_a, dtype=np.float64)
+    return -cfg.w_sync_joint_a * float(np.dot(q, q))
+
+
+def success_bonus(
+    d_A: float,
+    theta_A: float,
+    d_B: float,
+    theta_B: float,
+    cfg: RewardConfig,
+    mount: Optional[Tuple[float, float, float]] = None,
+) -> tuple[float, bool]:
+    """Sparse success predicate.
+
+    If ``mount`` is ``(axial_dot, lateral_norm, lug_spin_err_rad)`` and
+    ``cfg.use_lug_aligned_success``, require hub-face-style proximity using those
+    terms in addition to the gripper / axis checks.
+    """
+    if cfg.R_success <= 0.0:
+        return 0.0, False
+
+    grip_ok = (
+        theta_A < cfg.delta_A
+        and d_B < cfg.eps_B
+        and theta_B < cfg.delta_B
+    )
+    if not grip_ok:
+        return 0.0, False
+
+    if cfg.use_lug_aligned_success and mount is not None:
+        axial, lat, lug = mount
+        pos_ok = d_A < cfg.eps_A_mounted
+        mating_ok = (
+            abs(axial - cfg.success_axial_dot_target) < cfg.success_axial_tolerance
+            and lat < cfg.success_lateral_tolerance
+            and lug < cfg.lug_spin_tolerance_rad
+        )
+        ok = pos_ok and mating_ok
+        return ((cfg.R_success if ok else 0.0), bool(ok))
+
+    ok = grip_ok and (d_A < cfg.eps_A)
     return (cfg.R_success if ok else 0.0), bool(ok)
 
 
@@ -95,11 +137,16 @@ def shaping_reward(prev_d: Optional[float], curr_d: float, weight: float) -> flo
     return weight * (prev_d - curr_d)
 
 
-def aggregate(parts: dict, use_shaping: bool) -> float:
-    """Sum terms per spec §4.2 — picks dense vs shaping path."""
-    common = ("coop", "success", "collision", "workspace", "action", "jerk")
+def aggregate(parts: dict, use_shaping: bool, rcfg: RewardConfig) -> float:
+    """Combine dense process reward with sparse success using configured mix."""
+    common = ("coop", "sync_joint_A", "collision", "workspace", "action", "jerk")
     if use_shaping:
-        keys = ("shape_A", "shape_B") + common
+        dense_core = float(parts.get("shape_A", 0.0) + parts.get("shape_B", 0.0))
     else:
-        keys = ("align_A", "reach_B") + common
-    return float(sum(parts.get(k, 0.0) for k in keys))
+        dense_core = float(parts.get("align_A", 0.0) + parts.get("reach_B", 0.0))
+    dense = dense_core + float(sum(parts.get(k, 0.0) for k in common))
+    succ = float(parts.get("success", 0.0))
+    return (
+        rcfg.mix_dense * dense
+        + rcfg.mix_sparse_success * succ
+    )

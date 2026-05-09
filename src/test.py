@@ -7,7 +7,7 @@ Run from repo root:
     python -m src.test --render --action-scale 0.0   # static scene inspection
 
 Checks:
-  * Observation shape == 86 and dtype == float32
+  * Observation shape == config default (89) and dtype == float32
   * Action shape == 13
   * N random steps complete without exceptions
   * env.check_env passes the Gymnasium API contract (with --check)
@@ -49,7 +49,9 @@ def main() -> int:
     print(f"[smoke] observation_space={env.observation_space}")
 
     obs, info = env.reset(seed=args.seed)
-    assert obs.shape == (86,), f"obs shape {obs.shape} != (86,)"
+    assert obs.shape == (cfg.obs.dim,), (
+        f"obs shape {obs.shape} != ({cfg.obs.dim},)"
+    )
     assert obs.dtype == np.float32, f"obs dtype {obs.dtype} != float32"
     print(f"[smoke] reset OK — obs[:6]={obs[:6]}, target_bolt={info['target_bolt_idx']}")
 
