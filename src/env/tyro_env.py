@@ -6,12 +6,13 @@ Two robots, one centralized policy:
     along the bolt axis.
 
 Action: 13-d in [-1, 1]  → (Δpose_A 6, Δpose_B 6, gripper_A 1)
-Observation: 86-d (see spec §2.1)
+Observation: 89-d (spec §2.1 base + 3-d hub–tire mating diagnostics).
 Reward: sum of alignment / reach / cooperation / success / penalties (spec §4)
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
+import math
 
 import gymnasium as gym
 import numpy as np
@@ -86,6 +87,13 @@ class TyroEnv(gym.Env):
         self._grasp_constraint = None
         p.setGravity(*self.cfg.gravity, physicsClientId=self.client)
         p.setTimeStep(1.0 / self.cfg.sim_freq_hz, physicsClientId=self.client)
+        # PyBullet expects ``globalCFM`` (solver-wide CFM); there is no ``contactCFM`` kwarg.
+        p.setPhysicsEngineParameter(
+            numSubSteps=self.cfg.physics_num_sub_steps,
+            contactERP=self.cfg.contact_erp,
+            globalCFM=self.cfg.contact_cfm,
+            physicsClientId=self.client,
+        )
 
         # Build scene first; robots are placed independently of the scene origin.
         self.scene = Scene(self.client, self.cfg, self._np_random)
@@ -156,14 +164,20 @@ class TyroEnv(gym.Env):
         #  weight was 0 — see the design-spec review).
         in_collision = self._in_bad_collision()
         out_of_ws = self._out_of_workspace()
+        cforce_max = self._max_contact_normal_force()
+        damaged = (
+            self.cfg.contact_force_terminate_above > 0.0
+            and cforce_max >= self.cfg.contact_force_terminate_above
+        )
         obs = self._compute_obs()
         reward, breakdown = self._compute_reward(action, in_collision, out_of_ws)
         terminated, truncated, term_info = self._check_termination(
-            breakdown, in_collision, out_of_ws)
+            breakdown, in_collision, out_of_ws, damaged)
 
         info: Dict[str, Any] = {
             "reward_terms": breakdown.__dict__,
             "step": self._step_count,
+            "contact_force_max": float(cforce_max),
             **term_info,
         }
         self._prev_action = action.copy()
@@ -186,7 +200,7 @@ class TyroEnv(gym.Env):
         # Bit kept in obs as previous_action so the policy can still output it.
 
     # ------------------------------------------------------------------
-    # Observation (spec §2.1: 86-d)
+    # Observation (spec §2.1 base + mating scalars ⇒ 89-d)
     # ------------------------------------------------------------------
     def _compute_obs(self) -> np.ndarray:
         obs_cfg = self.cfg.obs
@@ -215,6 +229,20 @@ class TyroEnv(gym.Env):
         rel_eb_pos = eeB_pos - bolt_pos
         rel_eb_rot = relative_axisangle(eeB_orn, bolt_orn)
 
+        axial_th, lateral_th, lug_spin = self.scene.tire_hub_mount_residuals()
+        ax_t = self.cfg.reward.success_axial_dot_target
+        n_b = max(3, int(self.cfg.n_bolts))
+        lug_scale = max((math.pi / float(n_b)), 1e-6)
+        lug_ch = float(np.clip(lug_spin / lug_scale, 0.0, 1.0))
+        mount_tail = np.array(
+            [
+                (axial_th - ax_t) / ws,
+                lateral_th / ws,
+                lug_ch,
+            ],
+            dtype=np.float64,
+        )
+
         obs = np.concatenate([
             qA_n, dqA_n,                          # 12
             qB_n, dqB_n,                          # 14
@@ -226,6 +254,7 @@ class TyroEnv(gym.Env):
             rel_th_pos / ws, rel_th_rot / np.pi,  # 6
             rel_eb_pos / ws, rel_eb_rot / np.pi,  # 6
             self._prev_action.astype(np.float64),  # 13
+            mount_tail,                           # 3
         ]).astype(np.float32)
 
         assert obs.shape[0] == obs_cfg.dim, f"obs dim {obs.shape[0]} != {obs_cfg.dim}"
@@ -244,8 +273,9 @@ class TyroEnv(gym.Env):
         hub_pos, _ = self.scene.hub_pose()
         tire_axis = self.scene.tire_axis()
         hub_axis = self.scene.hub_axis()
+        _, dqA = self.robot_A.joint_state()
         eeB_pos, eeB_orn = self.robot_B.ee_pose()
-        bolt_pos, _ = self.scene.bolt_pose()
+        bolt_pos, _bolt_orn = self.scene.bolt_pose()
         bolt_axis = self.scene.bolt_axis()
         eeB_z = quat_axis(eeB_orn, "z")
 
@@ -253,9 +283,16 @@ class TyroEnv(gym.Env):
             tire_pos, hub_pos, tire_axis, hub_axis, rcfg)
         b.reach_B, b.d_B, b.theta_B = rewards.reach_reward(
             eeB_pos, bolt_pos, eeB_z, bolt_axis, rcfg)
+        ax_th, lat_th, lug_e = self.scene.tire_hub_mount_residuals()
+        b.axial_dot_th = float(ax_th)
+        b.lateral_th = float(lat_th)
+        b.lug_spin_err_rad = float(lug_e)
         b.coop = rewards.coop_reward(b.d_A, b.d_B, rcfg)
+        b.sync_joint_A = rewards.sync_joint_a_penalty(dqA, rcfg)
         b.success, b.is_success = rewards.success_bonus(
-            b.d_A, b.theta_A, b.d_B, b.theta_B, rcfg)
+            b.d_A, b.theta_A, b.d_B, b.theta_B, rcfg,
+            mount=(ax_th, lat_th, lug_e),
+        )
         b.collision = rewards.collision_penalty(in_collision, rcfg)
         b.workspace = rewards.workspace_penalty(out_of_workspace, rcfg)
         b.action = rewards.action_penalty(action, rcfg)
@@ -263,7 +300,16 @@ class TyroEnv(gym.Env):
         b.shape_A = rewards.shaping_reward(self._prev_d_A, b.d_A, rcfg.w_shape_A)
         b.shape_B = rewards.shaping_reward(self._prev_d_B, b.d_B, rcfg.w_shape_B)
 
-        b.total = rewards.aggregate(b.__dict__, use_shaping=self.cfg.use_shaping)
+        # Dense subtotal before sparse/dense mix (for logging).
+        common = ("coop", "sync_joint_A", "collision", "workspace", "action", "jerk")
+        if self.cfg.use_shaping:
+            dense_core = b.shape_A + b.shape_B
+        else:
+            dense_core = b.align_A + b.reach_B
+        b.dense_total_pre_mix = float(
+            dense_core + sum(getattr(b, k) for k in common))
+
+        b.total = rewards.aggregate(b.__dict__, use_shaping=self.cfg.use_shaping, rcfg=rcfg)
         return b.total, b
 
     # ------------------------------------------------------------------
@@ -283,10 +329,31 @@ class TyroEnv(gym.Env):
                                  physicsClientId=self.client)
         if len(cps) > 0:
             return True
+        if self.handles.vehicle is not None:
+            for robot in (self.robot_A, self.robot_B):
+                cpsv = p.getContactPoints(
+                    bodyA=robot.uid, bodyB=self.handles.vehicle,
+                    physicsClientId=self.client,
+                )
+                for cp in cpsv:
+                    if cp[3] > 1 or cp[4] > 1:
+                        return True
         return False
 
+    def _max_contact_normal_force(self) -> float:
+        mx = 0.0
+        pts = p.getContactPoints(physicsClientId=self.client)
+        for cp in pts:
+            if len(cp) > 9:
+                try:
+                    mx = max(mx, abs(float(cp[9])))
+                except (TypeError, ValueError):
+                    pass
+        return mx
+
     def _check_termination(self, b: rewards.RewardBreakdown,
-                           in_collision: bool, out_of_workspace: bool
+                           in_collision: bool, out_of_workspace: bool,
+                           contact_damage: bool,
                            ) -> Tuple[bool, bool, Dict[str, Any]]:
         info: Dict[str, Any] = {"is_success": b.is_success}
         if b.is_success:
@@ -298,6 +365,8 @@ class TyroEnv(gym.Env):
             return True, False, {**info, "termination": "collision"}
         if out_of_workspace:
             return True, False, {**info, "termination": "workspace"}
+        if contact_damage:
+            return True, False, {**info, "termination": "contact_force"}
         if self._step_count >= self.cfg.max_steps:
             return False, True, {**info, "termination": "max_steps"}
         return False, False, info
