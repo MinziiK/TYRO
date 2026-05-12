@@ -1,0 +1,354 @@
+<?xml version="1.0"?>
+<robot name="truck_wheel_station">
+
+<!-- Base = hub flange; local +Z protrudes bolts (toward mating tire). -->
+  <link name="hub_mount">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="75.0"/>
+      <inertia ixx="0.8493749966024997" ixy="0.0" ixz="0.0" iyy="0.8493749966024997" iyz="0.0" izz="1.6537499999999998" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.21" length="0.06"/>
+      </geometry>
+      <material name="steel"><color rgba="0.4 0.4 0.45 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.21" length="0.06"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="bolt_0">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_0_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_0"/>
+    <origin xyz="0.1675 0 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_1">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_1_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_1"/>
+    <origin xyz="0.13551035 0.09845403 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_2">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_2_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_2"/>
+    <origin xyz="0.051760347 0.15930197 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_3">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_3_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_3"/>
+    <origin xyz="-0.051760347 0.15930197 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_4">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_4_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_4"/>
+    <origin xyz="-0.13551035 0.09845403 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_5">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_5_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_5"/>
+    <origin xyz="-0.1675 0 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_6">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_6_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_6"/>
+    <origin xyz="-0.13551035 -0.09845403 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_7">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_7_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_7"/>
+    <origin xyz="-0.051760347 -0.15930197 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_8">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_8_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_8"/>
+    <origin xyz="0.051760347 -0.15930197 0.08" rpy="0 0 0"/>
+            </joint>
+  <link name="bolt_9">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="4.3179166493950016e-05" ixy="0.0" ixz="0.0" iyy="4.3179166493950016e-05" iyz="0.0" izz="3.025e-06" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.011" length="0.1"/>
+      </geometry>
+      <material name="bolt"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.01045" length="0.1"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="bolt_9_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="bolt_9"/>
+    <origin xyz="0.13551035 -0.09845403 0.08" rpy="0 0 0"/>
+            </joint>
+  <!-- Pilot boss: tire center bore slides over this; studs pass through wheel holes. -->
+  <link name="hub_pilot">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="0.05"/>
+      <inertia ixx="0.00012" ixy="0.0" ixz="0.0" iyy="0.00012" iyz="0.0" izz="0.00012"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.16" length="0.046"/>
+      </geometry>
+      <material name="pilot_steel"><color rgba="0.55 0.55 0.58 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.1568" length="0.046"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="hub_pilot_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="hub_pilot"/>
+    <origin xyz="0 0 0.053" rpy="0 0 0"/>
+  </joint>
+  <!-- Aft flange: coarse rotor + sided caliper proxies (keep tire from clipping through brakes). -->
+  <link name="brake_rotor_proxy">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="2.5"/>
+      <inertia ixx="0.04" ixy="0.0" ixz="0.0" iyy="0.04" iyz="0.0" izz="0.06"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.3" length="0.022"/>
+      </geometry>
+      <material name="rotor_gray"><color rgba="0.35 0.35 0.37 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.297" length="0.022"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="brake_rotor_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="brake_rotor_proxy"/>
+    <origin xyz="0 0 -0.053" rpy="0 0 0"/>
+  </joint>
+  <link name="brake_caliper_proxy">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="1.2"/>
+      <inertia ixx="0.015" ixy="0.0" ixz="0.0" iyy="0.015" iyz="0.0" izz="0.015"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.26 0.11 0.16"/>
+      </geometry>
+      <material name="caliper_paint"><color rgba="0.45 0.48 0.52 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.2574 0.1089 0.1584"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="brake_caliper_joint" type="fixed">
+    <parent link="hub_mount"/>
+    <child link="brake_caliper_proxy"/>
+    <origin xyz="0 0.27 -0.15" rpy="0 0 0"/>
+  </joint>
+
+</robot>
