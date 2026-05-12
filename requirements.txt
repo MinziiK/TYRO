@@ -6,3 +6,4 @@ stable-baselines3>=2.3.0
 torch>=2.4
 tensorboard>=2.15
 wandb>=0.16
+optuna>=4.0
