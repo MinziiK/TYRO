@@ -60,6 +60,7 @@ class Robot:
         )
 
         self.arm: JointGroup = self._build_joint_group(self._arm_joint_indices())
+        self._disable_non_arm_motors()
         self.reset_to_home()
 
     # ------------------------------------------------------------------
@@ -71,10 +72,28 @@ class Robot:
     # ------------------------------------------------------------------
     # Joint utilities
     # ------------------------------------------------------------------
+    def _disable_non_arm_motors(self) -> None:
+        """Disable default velocity controllers on non-arm joints so they don't
+        fight against position targets we send."""
+        n = p.getNumJoints(self.uid, physicsClientId=self.client)
+        non_arm = [j for j in range(n) if j not in self.arm.indices]
+        if non_arm:
+            p.setJointMotorControlArray(
+                self.uid, non_arm,
+                controlMode=p.VELOCITY_CONTROL,
+                forces=[0.0] * len(non_arm),
+                physicsClientId=self.client,
+            )
+
     def _build_joint_group(self, indices: List[int]) -> JointGroup:
         lower, upper, rest = [], [], []
         for j in indices:
             info = p.getJointInfo(self.uid, j, physicsClientId=self.client)
+            if info[2] == p.JOINT_FIXED:
+                raise ValueError(
+                    f"{self.NAME}: joint index {j} ('{info[1]}') is JOINT_FIXED "
+                    f"but was selected as an arm joint"
+                )
             ll, ul = info[8], info[9]
             if ll >= ul:        # no limit declared — use a wide range
                 ll, ul = -np.pi, np.pi
@@ -166,17 +185,6 @@ class UR10Robot(Robot):
             urdf_path=cfg.ur10_urdf,
             search_path=cfg.ur10_search_path,
         )
-        # Disable default velocity controllers on non-arm joints so they don't
-        # fight against position targets we send.
-        n = p.getNumJoints(self.uid, physicsClientId=client)
-        non_arm = [j for j in range(n) if j not in self.arm.indices]
-        if non_arm:
-            p.setJointMotorControlArray(
-                self.uid, non_arm,
-                controlMode=p.VELOCITY_CONTROL,
-                forces=[0.0] * len(non_arm),
-                physicsClientId=client,
-            )
 
     def _arm_joint_indices(self) -> List[int]:
         # joints 1..6 from URDF inspection; verify by joint type.

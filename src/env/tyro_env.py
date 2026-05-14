@@ -169,8 +169,13 @@ class TyroEnv(gym.Env):
             self.cfg.contact_force_terminate_above > 0.0
             and cforce_max >= self.cfg.contact_force_terminate_above
         )
-        obs = self._compute_obs()
-        reward, breakdown = self._compute_reward(action, in_collision, out_of_ws)
+        # tire_hub_mount_residuals() is needed by both the observation and the
+        # reward — compute it once per step and share it so the two paths can
+        # not diverge and we avoid the duplicate scene query.
+        mount_residuals = self.scene.tire_hub_mount_residuals()
+        obs = self._compute_obs(mount_residuals)
+        reward, breakdown = self._compute_reward(
+            action, in_collision, out_of_ws, mount_residuals)
         terminated, truncated, term_info = self._check_termination(
             breakdown, in_collision, out_of_ws, damaged)
 
@@ -202,7 +207,7 @@ class TyroEnv(gym.Env):
     # ------------------------------------------------------------------
     # Observation (spec §2.1 base + mating scalars ⇒ 89-d)
     # ------------------------------------------------------------------
-    def _compute_obs(self) -> np.ndarray:
+    def _compute_obs(self, mount_residuals=None) -> np.ndarray:
         obs_cfg = self.cfg.obs
         ws = obs_cfg.workspace_radius
         vmax = obs_cfg.max_joint_vel
@@ -229,7 +234,9 @@ class TyroEnv(gym.Env):
         rel_eb_pos = eeB_pos - bolt_pos
         rel_eb_rot = relative_axisangle(eeB_orn, bolt_orn)
 
-        axial_th, lateral_th, lug_spin = self.scene.tire_hub_mount_residuals()
+        if mount_residuals is None:
+            mount_residuals = self.scene.tire_hub_mount_residuals()
+        axial_th, lateral_th, lug_spin = mount_residuals
         ax_t = self.cfg.reward.success_axial_dot_target
         n_b = max(3, int(self.cfg.n_bolts))
         lug_scale = max((math.pi / float(n_b)), 1e-6)
@@ -264,7 +271,7 @@ class TyroEnv(gym.Env):
     # Reward
     # ------------------------------------------------------------------
     def _compute_reward(self, action: np.ndarray, in_collision: bool,
-                        out_of_workspace: bool
+                        out_of_workspace: bool, mount_residuals=None
                         ) -> Tuple[float, rewards.RewardBreakdown]:
         rcfg = self.cfg.reward
         b = rewards.RewardBreakdown()
@@ -283,7 +290,9 @@ class TyroEnv(gym.Env):
             tire_pos, hub_pos, tire_axis, hub_axis, rcfg)
         b.reach_B, b.d_B, b.theta_B = rewards.reach_reward(
             eeB_pos, bolt_pos, eeB_z, bolt_axis, rcfg)
-        ax_th, lat_th, lug_e = self.scene.tire_hub_mount_residuals()
+        if mount_residuals is None:
+            mount_residuals = self.scene.tire_hub_mount_residuals()
+        ax_th, lat_th, lug_e = mount_residuals
         b.axial_dot_th = float(ax_th)
         b.lateral_th = float(lat_th)
         b.lug_spin_err_rad = float(lug_e)
