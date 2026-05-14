@@ -295,40 +295,37 @@ def main() -> int:
     net_arch = [int(w) for w in args.net_arch.split(",") if w]
     policy_kwargs = dict(net_arch=net_arch)
 
+    # Always build a fresh PPO with the requested hyperparameters so SB3's
+    # internal state (rollout buffer size, LR/clip schedules, optimizer) stays
+    # consistent. On resume we only transfer the policy weights: mutating a
+    # loaded model's hyperparameters in place corrupts those schedules — e.g.
+    # clip_range/learning_rate are stored as callables and a bare-float assign
+    # either crashes the next update or is silently ignored.
+    model = PPO(
+        "MlpPolicy", vec,
+        learning_rate=args.lr,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_range=args.clip_range,
+        ent_coef=args.ent_coef,
+        vf_coef=args.vf_coef,
+        max_grad_norm=args.max_grad_norm,
+        verbose=1,
+        device=args.device,
+        seed=args.seed,
+        tensorboard_log=str(out_dir / "tb"),
+        policy_kwargs=policy_kwargs,
+    )
+
     if args.resume:
-        print(f"[train] loading weights from {args.resume}")
-        model = PPO.load(args.resume, env=vec, device=args.device)
-        # Override hyperparams in case stage changes between resumes.
-        model.learning_rate = args.lr
-        model.n_steps = args.n_steps
-        model.batch_size = args.batch_size
-        model.n_epochs = args.n_epochs
-        model.gamma = args.gamma
-        model.gae_lambda = args.gae_lambda
-        model.clip_range = args.clip_range
-        model.ent_coef = args.ent_coef
-        model.vf_coef = args.vf_coef
-        model.max_grad_norm = args.max_grad_norm
-        model.tensorboard_log = str(out_dir / "tb")
-    else:
-        model = PPO(
-            "MlpPolicy", vec,
-            learning_rate=args.lr,
-            n_steps=args.n_steps,
-            batch_size=args.batch_size,
-            n_epochs=args.n_epochs,
-            gamma=args.gamma,
-            gae_lambda=args.gae_lambda,
-            clip_range=args.clip_range,
-            ent_coef=args.ent_coef,
-            vf_coef=args.vf_coef,
-            max_grad_norm=args.max_grad_norm,
-            verbose=1,
-            device=args.device,
-            seed=args.seed,
-            tensorboard_log=str(out_dir / "tb"),
-            policy_kwargs=policy_kwargs,
-        )
+        print(f"[train] loading policy weights from {args.resume}")
+        ckpt = PPO.load(args.resume, device=args.device)
+        model.policy.load_state_dict(ckpt.policy.state_dict())
+        model.num_timesteps = ckpt.num_timesteps
+        del ckpt
 
     # ------------------------------------------------------------------
     # Train
