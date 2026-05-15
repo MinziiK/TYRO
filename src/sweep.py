@@ -89,6 +89,8 @@ def suggest_hparams(trial: optuna.Trial) -> Dict[str, Any]:
         clip_range=trial.suggest_float("clip_range", 0.1, 0.3),
         ent_coef=trial.suggest_float("ent_coef", 1e-8, 1e-2, log=True),
         gae_lambda=trial.suggest_float("gae_lambda", 0.9, 0.99),
+        # Discount: centered on train default 0.995 so sweep results transfer.
+        gamma=trial.suggest_float("gamma", 0.98, 0.999),
         # Cooperation reward (spec §4.1.3): r_coop = w_c · exp(-α d_A) · exp(-β d_B)
         w_c=trial.suggest_float("w_c", 0.5, 5.0),
         alpha=trial.suggest_float("alpha", 5.0, 20.0),
@@ -143,7 +145,7 @@ def make_objective(args: argparse.Namespace) -> Callable[[optuna.Trial], float]:
             n_steps=params["n_steps"],
             batch_size=params["batch_size"],
             n_epochs=params["n_epochs"],
-            gamma=0.99,
+            gamma=params["gamma"],
             gae_lambda=params["gae_lambda"],
             clip_range=params["clip_range"],
             ent_coef=params["ent_coef"],

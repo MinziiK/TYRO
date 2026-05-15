@@ -224,6 +224,18 @@ def main() -> int:
     ap.add_argument("--run-name", type=str, default=None)
     ap.add_argument("--resume", type=str, default=None,
                     help="Path to a .zip checkpoint to load weights from.")
+    ap.add_argument(
+        "--resume-mode",
+        type=str,
+        default="policy-only",
+        choices=("policy-only", "full"),
+        help=(
+            "policy-only: load weights only (Adam/LR schedule/value head reset; "
+            "use this for stage transitions, e.g. stage1→stage3). "
+            "full: restore the entire PPO state (optimizer, schedules, "
+            "num_timesteps, RMS stats); CLI PPO hparams are then ignored."
+        ),
+    )
 
     # Logging
     ap.add_argument("--wandb", type=str, default=None,
@@ -295,37 +307,50 @@ def main() -> int:
     net_arch = [int(w) for w in args.net_arch.split(",") if w]
     policy_kwargs = dict(net_arch=net_arch)
 
-    # Always build a fresh PPO with the requested hyperparameters so SB3's
-    # internal state (rollout buffer size, LR/clip schedules, optimizer) stays
-    # consistent. On resume we only transfer the policy weights: mutating a
-    # loaded model's hyperparameters in place corrupts those schedules — e.g.
-    # clip_range/learning_rate are stored as callables and a bare-float assign
-    # either crashes the next update or is silently ignored.
-    model = PPO(
-        "MlpPolicy", vec,
-        learning_rate=args.lr,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        n_epochs=args.n_epochs,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_range=args.clip_range,
-        ent_coef=args.ent_coef,
-        vf_coef=args.vf_coef,
-        max_grad_norm=args.max_grad_norm,
-        verbose=1,
-        device=args.device,
-        seed=args.seed,
-        tensorboard_log=str(out_dir / "tb"),
-        policy_kwargs=policy_kwargs,
-    )
+    if args.resume and args.resume_mode == "full":
+        # Full resume: restore optimizer, LR/clip schedules, num_timesteps, and
+        # rollout buffer config from the checkpoint. CLI PPO hparam args are
+        # IGNORED in this mode — the checkpoint is the source of truth.
+        print(f"[train] full resume from {args.resume} "
+              f"(CLI PPO hyperparameters will be ignored)")
+        model = PPO.load(
+            args.resume,
+            env=vec,
+            device=args.device,
+            tensorboard_log=str(out_dir / "tb"),
+        )
+    else:
+        # Build a fresh PPO with the requested hyperparameters so SB3's internal
+        # state (rollout buffer size, LR/clip schedules, optimizer) stays
+        # consistent with CLI args. policy-only resume then transfers only the
+        # weights — mutating a loaded model's hyperparameters in place corrupts
+        # those schedules (clip_range/learning_rate are stored as callables, a
+        # bare-float assign either crashes the next update or is silently ignored).
+        model = PPO(
+            "MlpPolicy", vec,
+            learning_rate=args.lr,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            n_epochs=args.n_epochs,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            clip_range=args.clip_range,
+            ent_coef=args.ent_coef,
+            vf_coef=args.vf_coef,
+            max_grad_norm=args.max_grad_norm,
+            verbose=1,
+            device=args.device,
+            seed=args.seed,
+            tensorboard_log=str(out_dir / "tb"),
+            policy_kwargs=policy_kwargs,
+        )
 
-    if args.resume:
-        print(f"[train] loading policy weights from {args.resume}")
-        ckpt = PPO.load(args.resume, device=args.device)
-        model.policy.load_state_dict(ckpt.policy.state_dict())
-        model.num_timesteps = ckpt.num_timesteps
-        del ckpt
+        if args.resume:
+            print(f"[train] policy-only resume from {args.resume}")
+            ckpt = PPO.load(args.resume, device=args.device)
+            model.policy.load_state_dict(ckpt.policy.state_dict())
+            model.num_timesteps = ckpt.num_timesteps
+            del ckpt
 
     # ------------------------------------------------------------------
     # Train

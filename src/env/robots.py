@@ -60,6 +60,11 @@ class Robot:
         )
 
         self.arm: JointGroup = self._build_joint_group(self._arm_joint_indices())
+        # Cache: position of each arm joint within calculateInverseKinematics()'s
+        # output, which spans all controllable (non-fixed) joints in PyBullet's
+        # enumeration order. Avoids the fragile assumption that arm joints occupy
+        # the first len(arm) slots.
+        self._ik_arm_slots: List[int] = self._compute_ik_arm_slots()
         self._disable_non_arm_motors()
         self.reset_to_home()
 
@@ -72,6 +77,50 @@ class Robot:
     # ------------------------------------------------------------------
     # Joint utilities
     # ------------------------------------------------------------------
+    def _joints_by_name(self, suffixes: Sequence[str]) -> List[int]:
+        """Resolve PyBullet joint indices by matching name (full or suffix).
+
+        Robust to URDF re-ordering and library version drift, unlike hard-coded
+        positional indices.
+        """
+        n = p.getNumJoints(self.uid, physicsClientId=self.client)
+        all_names: List[str] = []
+        for j in range(n):
+            raw = p.getJointInfo(self.uid, j, physicsClientId=self.client)[1]
+            all_names.append(
+                raw.decode("utf8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            )
+        out: List[int] = []
+        for sfx in suffixes:
+            match = -1
+            for j, name in enumerate(all_names):
+                if name == sfx or name.endswith(sfx):
+                    match = j
+                    break
+            if match < 0:
+                raise RuntimeError(
+                    f"{self.NAME}: joint matching '{sfx}' not found; available: {all_names}"
+                )
+            out.append(match)
+        return out
+
+    def _compute_ik_arm_slots(self) -> List[int]:
+        """For each arm joint, its position in calculateInverseKinematics()'s output."""
+        n = p.getNumJoints(self.uid, physicsClientId=self.client)
+        controllable: List[int] = []
+        for j in range(n):
+            info = p.getJointInfo(self.uid, j, physicsClientId=self.client)
+            if info[2] != p.JOINT_FIXED:
+                controllable.append(j)
+        try:
+            return [controllable.index(j) for j in self.arm.indices]
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{self.NAME}: arm joint not in controllable set "
+                f"(arm={self.arm.indices}, controllable={controllable})"
+            ) from exc
+
+
     def _disable_non_arm_motors(self) -> None:
         """Disable default velocity controllers on non-arm joints so they don't
         fight against position targets we send."""
@@ -153,9 +202,15 @@ class Robot:
             physicsClientId=self.client,
         )
         # IK returns a target for every controllable joint of the body, in the
-        # order PyBullet enumerates them. Pick out the arm slots.
+        # order PyBullet enumerates them. Index each arm joint's slot explicitly
+        # — assuming arm joints occupy [0:n] silently breaks when the URDF has
+        # a non-arm controllable joint (gripper, tool) ahead of them.
         ik = np.asarray(ik, dtype=np.float64)
-        arm_targets = ik[: self.arm.n] if len(ik) >= self.arm.n else self._fallback_targets()
+        max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+        if len(ik) > max_slot:
+            arm_targets = ik[self._ik_arm_slots]
+        else:
+            arm_targets = self._fallback_targets()
         # Clamp to limits before sending.
         arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
 
@@ -187,8 +242,16 @@ class UR10Robot(Robot):
         )
 
     def _arm_joint_indices(self) -> List[int]:
-        # joints 1..6 from URDF inspection; verify by joint type.
-        return [1, 2, 3, 4, 5, 6]
+        # Match by URDF joint name — robust to non-arm joints (Robotiq gripper,
+        # robot_ee_fixed_joint) appearing in PyBullet's enumeration.
+        return self._joints_by_name([
+            "shoulder_pan_joint",
+            "shoulder_lift_joint",
+            "elbow_joint",
+            "wrist_1_joint",
+            "wrist_2_joint",
+            "wrist_3_joint",
+        ])
 
 
 class PandaRobot(Robot):
@@ -207,4 +270,4 @@ class PandaRobot(Robot):
         )
 
     def _arm_joint_indices(self) -> List[int]:
-        return [0, 1, 2, 3, 4, 5, 6]
+        return self._joints_by_name([f"panda_joint{i}" for i in range(1, 8)])
