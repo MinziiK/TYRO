@@ -39,12 +39,16 @@ class RewardConfig:
 
     # Sparse success bonus
     R_success: float = 100.0
+    #: Legacy Euclidean ||tire − hub|| gate. Only used when
+    #: ``use_lug_aligned_success`` is False — otherwise ``eps_A_mounted`` applies.
     eps_A: float = 0.01     # 1 cm — tire-hub position threshold (legacy tight bound)
     delta_A: float = np.deg2rad(5.0)  # 5° — tire-hub angle threshold
     eps_B: float = 0.01     # 1 cm — gripper_B-bolt position threshold
     delta_B: float = np.deg2rad(5.0)  # 5° — gripper-bolt axis threshold
 
     # Mounting-aligned success (tire coaxial projection + lug spin vs bolt_0 ray).
+    #: Default True ⇒ ``eps_A`` is unused; success uses ``eps_A_mounted`` /
+    #: ``success_axial_tolerance`` / ``success_lateral_tolerance`` / ``lug_spin_tolerance_rad``.
     use_lug_aligned_success: bool = True
     #: ``dot(t_center - hub_center, û_hub)`` when seated (often near 0; tune with scene scale).
     success_axial_dot_target: float = 0.0
@@ -126,6 +130,15 @@ class EnvConfig:
     hub_thickness: float = 0.06
 
     # Tire 295/80R22.5-ish; visuals = outer cylinder; collision = hollow annulus (scene).
+    #: Tire base mass (kg). Real truck tyres are ~50–80 kg but the assembly
+    #: is rigidly grasped to the UR10 EE — high mass loads every joint torque
+    #: command and slows reactive control. Empirically 0.5 kg is the sweet
+    #: spot for the current PD tuning: d_A baseline matches the bare-arm home
+    #: pose (no controller overshoot during the constraint-creation transient
+    #: on step 1), while keeping enough inertia for "tyre-aware" policy
+    #: dynamics. Avoid 1.0–3.0 kg — that range hits an underdamped resonance
+    #: with PyBullet's default position-control gains. Tune via ``--tire-mass``.
+    tire_mass: float = 0.5
     tire_outer_radius: float = 0.525
     #: Tread ring inner radius (wheel-well cavity); keep > hub pilot & flange for slide fit.
     tire_inner_radius: float = 0.282

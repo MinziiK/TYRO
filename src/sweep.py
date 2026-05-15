@@ -61,15 +61,22 @@ class OptunaPruningCallback(BaseCallback):
         super().__init__(verbose)
         self.trial = trial
         self.eval_cb = eval_cb
-        self._last_seen: float = -np.inf
+        self._reported_evals: int = 0
 
     def _on_step(self) -> bool:
-        last = float(self.eval_cb.last_mean_reward)
-        # last_mean_reward is updated in-place by EvalCallback after each eval.
-        # Detect "new evaluation completed" by checking for a change.
-        if last != self._last_seen and np.isfinite(last):
-            self._last_seen = last
-            self.trial.report(last, step=int(self.num_timesteps))
+        # ``EvalCallback`` appends a row to ``evaluations_results`` (and
+        # ``evaluations_timesteps``) once per evaluation. Triggering off the
+        # row count is robust to two consecutive evals returning identical
+        # mean rewards — the previous "value changed" check could miss those.
+        n_evals = len(getattr(self.eval_cb, "evaluations_timesteps", []))
+        while self._reported_evals < n_evals:
+            i = self._reported_evals
+            last = float(self.eval_cb.last_mean_reward)
+            ts = int(self.eval_cb.evaluations_timesteps[i])
+            self._reported_evals += 1
+            if not np.isfinite(last):
+                continue
+            self.trial.report(last, step=ts)
             if self.trial.should_prune():
                 raise optuna.TrialPruned()
         return True

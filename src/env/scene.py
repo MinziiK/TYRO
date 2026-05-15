@@ -64,6 +64,8 @@ class Scene:
         self.np_random = np_random
         self.handles: Optional[SceneHandles] = None
         self._hub_orn_world: np.ndarray = np.array([0.0, 0.0, 0.0, 1.0])
+        # ``False`` after a tire-build fallback — disables lug-spin residual.
+        self.has_wheel_disk: bool = True
 
     # ------------------------------------------------------------------
     def build(self) -> SceneHandles:
@@ -201,8 +203,10 @@ class Scene:
           about û_hub modulo ``2π/n_bolts``.
         """
         assert self.handles is not None
-        ht = np.asarray(self.hub_pose()[0], dtype=np.float64)
-        tt = np.asarray(self.tire_pose()[0], dtype=np.float64)
+        tt_pos, t_orn = self.tire_pose()
+        ht_pos, _ = self.hub_pose()
+        ht = np.asarray(ht_pos, dtype=np.float64)
+        tt = np.asarray(tt_pos, dtype=np.float64)
         ah = self.hub_axis()
         nh = np.linalg.norm(ah)
         if nh < 1e-9:
@@ -211,6 +215,13 @@ class Scene:
         dh = tt - ht
         axial = float(np.dot(dh, ah))
         lateral = float(np.linalg.norm(dh - axial * ah))
+
+        # No wheel-disk geometry (tire fell back to a solid cylinder) → there
+        # is nothing whose lug holes can mis-align with the studs, so the
+        # rotational residual is meaningless. Return 0 to avoid biasing reward
+        # / success gates with a phantom signal.
+        if not self.has_wheel_disk:
+            return axial, lateral, 0.0
 
         nbolt = max(3, int(self.cfg.n_bolts))
         period = 2.0 * math.pi / float(nbolt)
@@ -223,7 +234,6 @@ class Scene:
             phi0 = float(self.cfg.wheel_disk_bolt_phase_rad)
         else:
             phi0 = float(self.cfg.wheel_disk_bolt_phase_rad + period * 0.5)
-        t_orn = self.tire_pose()[1]
         R = np.array(
             p.getMatrixFromQuaternion(list(t_orn)), dtype=np.float64
         ).reshape(3, 3)
@@ -434,18 +444,28 @@ class Scene:
         tire_pos = base_pos_A + np.asarray(self.cfg.tire_spawn_offset_from_robot_a,
                                               dtype=np.float64)
         tire_orn = rpy_to_quat([0.0, -np.pi / 2, 0.0])
-        return models.create_tire_wheel_multibody(
+        uid, has_disk = models.create_tire_wheel_multibody(
             self.client,
             self.cfg,
             base_position=tire_pos.tolist(),
             base_orientation=tire_orn.tolist(),
             visual_primitive_cap=_PYB_COMPOUND_SHAPE_CAP,
         )
+        self.has_wheel_disk = bool(has_disk)
+        return uid
 
     def _sample_offset_xyz(self) -> np.ndarray:
+        """Hub spatial DR: XY only, Z held fixed.
+
+        A vertical hub jitter would risk the tire (radius ~0.525 m) clipping
+        the floor or floating off contact, which is a physics artefact rather
+        than a policy-relevant perturbation. Robustness to vertical hub
+        positioning is better tested via cargo / floor-height experiments.
+        """
         ranges_cm = self.cfg.curriculum.phase_ranges_cm
         idx = max(0, min(len(ranges_cm) - 1, self.cfg.curriculum.phase - 1))
         r_m = ranges_cm[idx] / 100.0
         if r_m <= 0:
             return np.zeros(3)
-        return self.np_random.uniform(-r_m, r_m, size=3)
+        xy = self.np_random.uniform(-r_m, r_m, size=2)
+        return np.array([float(xy[0]), float(xy[1]), 0.0], dtype=np.float64)

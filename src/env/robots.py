@@ -65,6 +65,10 @@ class Robot:
         # enumeration order. Avoids the fragile assumption that arm joints occupy
         # the first len(arm) slots.
         self._ik_arm_slots: List[int] = self._compute_ik_arm_slots()
+        # Most recent IK target EE position (set by ``apply_delta_ee``). The env
+        # compares this to the post-step achieved EE pose to log IK tracking
+        # residual — useful for catching reach-saturation in DR rollouts.
+        self.last_target_pos: Optional[np.ndarray] = None
         self._disable_non_arm_motors()
         self.reset_to_home()
 
@@ -189,6 +193,7 @@ class Robot:
         target_pos = cur_pos + np.asarray(delta_pos, dtype=np.float64)
         d_quat = axisangle3_to_quat(delta_axisangle)
         target_orn = quat_multiply(d_quat, cur_orn)
+        self.last_target_pos = target_pos
 
         ik = p.calculateInverseKinematics(
             self.uid, self.EE_LINK_INDEX,

@@ -109,6 +109,17 @@ class TyroEnv(gym.Env):
         # Snap the tire to Robot A's EE and bind it with a fixed constraint —
         # this is the Tier-1 simplification (spec §1: alignment task, gripping
         # not part of training scope).
+        # Note: we do NOT add settle steps after the attach. Tried two variants:
+        #   (a) settle without re-engaging position control → arm sags under
+        #       tire weight (no PD active between resetJointState and first
+        #       step), shifting the d_A baseline by ~50 cm.
+        #   (b) settle WITH explicit setJointMotorControlArray(POSITION) →
+        #       resonates and diverges at certain masses (notably ~1 kg) —
+        #       controller gain/damping interacts badly with the constraint
+        #       impulse before the IK target is "real".
+        # The unsettled approach leaves a one-time large IK residual on step 1
+        # (constraint impulse), which only inflates the diagnostic log
+        # ``env/ik_residual_A_mean`` slightly — not a policy-relevant signal.
         self._attach_tire_to_robot_A()
 
         self._step_count = 0
@@ -179,16 +190,32 @@ class TyroEnv(gym.Env):
         terminated, truncated, term_info = self._check_termination(
             breakdown, in_collision, out_of_ws, damaged)
 
+        # IK tracking residual = ||target_pos - achieved_pos|| after physics
+        # settled. A persistent gap means IK saturated (joint limits or
+        # unreachable target) and the policy's Δ command isn't being executed.
+        ik_res_A = self._ik_residual(self.robot_A)
+        ik_res_B = self._ik_residual(self.robot_B)
+
         info: Dict[str, Any] = {
             "reward_terms": breakdown.__dict__,
             "step": self._step_count,
             "contact_force_max": float(cforce_max),
+            "ik_residual_A": ik_res_A,
+            "ik_residual_B": ik_res_B,
             **term_info,
         }
         self._prev_action = action.copy()
         self._prev_d_A = breakdown.d_A
         self._prev_d_B = breakdown.d_B
         return obs, reward, terminated, truncated, info
+
+    def _ik_residual(self, robot) -> float:
+        """Norm of (last IK target EE position − achieved EE position)."""
+        target = robot.last_target_pos
+        if target is None:
+            return 0.0
+        achieved, _ = robot.ee_pose()
+        return float(np.linalg.norm(achieved - target))
 
     def _apply_action(self, action: np.ndarray) -> None:
         ps = self.cfg.action.pos_scale
@@ -207,7 +234,11 @@ class TyroEnv(gym.Env):
     # ------------------------------------------------------------------
     # Observation (spec §2.1 base + mating scalars ⇒ 89-d)
     # ------------------------------------------------------------------
-    def _compute_obs(self, mount_residuals=None) -> np.ndarray:
+    def _compute_obs(self,
+                     mount_residuals: Optional[Tuple[float, float, float]] = None,
+                     ) -> np.ndarray:
+        # ``mount_residuals`` may be ``None`` only on the first call from
+        # ``reset()`` (before ``step()`` shares its precomputed value).
         obs_cfg = self.cfg.obs
         ws = obs_cfg.workspace_radius
         vmax = obs_cfg.max_joint_vel
@@ -260,7 +291,7 @@ class TyroEnv(gym.Env):
             bolt_pos / ws, bolt_orn,              # 7
             rel_th_pos / ws, rel_th_rot / np.pi,  # 6
             rel_eb_pos / ws, rel_eb_rot / np.pi,  # 6
-            self._prev_action.astype(np.float64),  # 13
+            self._prev_action,                     # 13
             mount_tail,                           # 3
         ]).astype(np.float32)
 
@@ -271,7 +302,8 @@ class TyroEnv(gym.Env):
     # Reward
     # ------------------------------------------------------------------
     def _compute_reward(self, action: np.ndarray, in_collision: bool,
-                        out_of_workspace: bool, mount_residuals=None
+                        out_of_workspace: bool,
+                        mount_residuals: Tuple[float, float, float],
                         ) -> Tuple[float, rewards.RewardBreakdown]:
         rcfg = self.cfg.reward
         b = rewards.RewardBreakdown()
@@ -290,8 +322,6 @@ class TyroEnv(gym.Env):
             tire_pos, hub_pos, tire_axis, hub_axis, rcfg)
         b.reach_B, b.d_B, b.theta_B = rewards.reach_reward(
             eeB_pos, bolt_pos, eeB_z, bolt_axis, rcfg)
-        if mount_residuals is None:
-            mount_residuals = self.scene.tire_hub_mount_residuals()
         ax_th, lat_th, lug_e = mount_residuals
         b.axial_dot_th = float(ax_th)
         b.lateral_th = float(lat_th)

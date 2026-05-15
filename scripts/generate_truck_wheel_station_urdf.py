@@ -34,12 +34,12 @@ def _fmt(x: float) -> str:
     return s
 
 
-def inertia_cylinder_about_z(mass: float, radius: float, half_length: float) -> tuple[float, float, float]:
-    """Rough diagonal inertia — matches prior assets’ small numeric template."""
+def inertia_cylinder_about_z(mass: float, radius: float, half_length: float) -> tuple[float, float]:
+    """Rough diagonal inertia for a cylinder — returns ``(ixx == iyy, izz)``."""
     h = half_length * 2
     ixx = 0.083333333 * mass * (3 * radius ** 2 + h ** 2)
     izz = 0.5 * mass * radius ** 2
-    return ixx, ixx, izz
+    return ixx, izz
 
 
 def main() -> int:
@@ -106,7 +106,7 @@ def main() -> int:
     bl = args.bolt_length
     r_col = max(br * args.bolt_collision_radius_factor, 1e-4)
     z_joint = args.hub_thickness / 2 + bl / 2
-    bx, _, bz = inertia_cylinder_about_z(0.05, br, bl / 2)
+    bx, bz = inertia_cylinder_about_z(0.05, br, bl / 2)
 
     phase_rad = math.radians(args.bolt_pattern_phase_deg)
     bolts_xml: list[str] = []

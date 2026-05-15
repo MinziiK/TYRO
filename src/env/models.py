@@ -7,6 +7,7 @@ shape array limit (~16), while modelling ~10 lug holes via three boxes per hole.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Iterable, Iterator, Optional, Sequence, Tuple
 
 import numpy as np
@@ -219,8 +220,15 @@ def create_tire_wheel_multibody(
     base_position: PyVec3,
     base_orientation: PyVec3,
     visual_primitive_cap: int = 16,
-) -> int:
-    """Integrated tyre+tread ring + silver wheel-disk (compound or multi-link)."""
+) -> Tuple[int, bool]:
+    """Integrated tyre+tread ring + silver wheel-disk (compound or multi-link).
+
+    Returns
+    -------
+    (uid, has_wheel_disk)
+        ``has_wheel_disk`` is False when we fall back to a solid cylinder; the
+        caller should disable lug-spin reward terms in that case.
+    """
 
     rout = cfg.tire_outer_radius
     rin = (
@@ -229,6 +237,7 @@ def create_tire_wheel_multibody(
         else float(cfg.tire_inner_radius)
     )
     half_axial = 0.5 * cfg.tire_thickness
+    tire_mass = float(cfg.tire_mass)
     tire_rgba = [0.08, 0.08, 0.09, 1.0]
     disk_rgba = [0.72, 0.73, 0.76, 1.0]
 
@@ -308,7 +317,7 @@ def create_tire_wheel_multibody(
             )
             if col >= 0 and vis >= 0:
                 uid = p.createMultiBody(
-                    baseMass=5.0,
+                    baseMass=tire_mass,
                     baseCollisionShapeIndex=col,
                     baseVisualShapeIndex=vis,
                     basePosition=list(base_position),
@@ -319,12 +328,14 @@ def create_tire_wheel_multibody(
                     uid, -1, linearDamping=0.5, angularDamping=0.5,
                     physicsClientId=client,
                 )
-                return uid
+                return uid, (disk_prims is not None and len(disk_prims[0]) > 0)
 
     # Multi-link: tread on base, wheel disk split into ≤cap box arrays per link
     if tread_prims is None or disk_prims is None or len(disk_prims[0]) == 0:
-        return _fallback_solid_tire(
+        return _fallback_solid_tire_with_warning(
             client, rout, cfg.tire_thickness, base_position, base_orientation,
+            mass=tire_mass,
+            reason="tread or disk primitive build returned None/empty",
         )
 
     the, tpo, tor = tread_prims
@@ -332,8 +343,10 @@ def create_tire_wheel_multibody(
     tr_rgbs = [list(tire_rgba)] * ncol_tr
     t_col, t_vis = _create_box_compound_or_none(client, the, tpo, tor, tr_rgbs)
     if t_col < 0 or t_vis < 0:
-        return _fallback_solid_tire(
+        return _fallback_solid_tire_with_warning(
             client, rout, cfg.tire_thickness, base_position, base_orientation,
+            mass=tire_mass,
+            reason="tread compound creation failed in PyBullet",
         )
 
     d_he, d_po, d_ori = disk_prims
@@ -345,8 +358,10 @@ def create_tire_wheel_multibody(
         drg = [list(disk_rgba)] * nk
         dc, dv = _create_box_compound_or_none(client, che, cpo, cor, drg)
         if dc < 0 or dv < 0:
-            return _fallback_solid_tire(
+            return _fallback_solid_tire_with_warning(
                 client, rout, cfg.tire_thickness, base_position, base_orientation,
+                mass=tire_mass,
+                reason="wheel-disk compound chunk creation failed in PyBullet",
             )
         disk_cols.append(dc)
         disk_vis.append(dv)
@@ -363,7 +378,7 @@ def create_tire_wheel_multibody(
     joint_axis = [[0.0, 0.0, 1.0]] * n_links
 
     uid = p.createMultiBody(
-        baseMass=5.0,
+        baseMass=tire_mass,
         baseCollisionShapeIndex=t_col,
         baseVisualShapeIndex=t_vis,
         basePosition=list(base_position),
@@ -383,11 +398,25 @@ def create_tire_wheel_multibody(
     p.changeDynamics(
         uid, -1, linearDamping=0.5, angularDamping=0.5, physicsClientId=client,
     )
-    return uid
+    return uid, True
+
+
+def _fallback_solid_tire_with_warning(
+    client: int, radius: float, height: float, pos: PyVec3, orn: PyVec3,
+    *, mass: float, reason: str,
+) -> Tuple[int, bool]:
+    warnings.warn(
+        f"create_tire_wheel_multibody: falling back to solid cylinder ({reason}). "
+        "Lug-spin reward terms must be disabled — has_wheel_disk=False is returned.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return _fallback_solid_tire(client, radius, height, pos, orn, mass=mass), False
 
 
 def _fallback_solid_tire(
     client: int, radius: float, height: float, pos: PyVec3, orn: PyVec3,
+    *, mass: float = 1.0,
 ) -> int:
     col = p.createCollisionShape(
         p.GEOM_CYLINDER, radius=radius, height=height, physicsClientId=client,

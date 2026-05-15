@@ -52,7 +52,13 @@ def make_env(rank: int, cfg_factory: Callable[[], EnvConfig], seed: int):
 
 
 class RewardBreakdownCallback(BaseCallback):
-    """Logs per-term reward means + success rate + physics metrics each rollout."""
+    """Logs per-term reward means + success rate + physics metrics each rollout.
+
+    Note: ``reward/{term}`` values are **per-step means** across the rollout
+    (sum of term values / number of steps observed), not per-episode means.
+    Cross-reference with ``rollout/success_rate`` (per-episode) and
+    ``env/contact_force_mean`` (per-step) accordingly.
+    """
 
     def __init__(self, verbose: int = 0):
         super().__init__(verbose)
@@ -62,6 +68,9 @@ class RewardBreakdownCallback(BaseCallback):
         self._total_episodes: int = 0
         self._cf_sum: float = 0.0
         self._cf_n: int = 0
+        self._ik_a_sum: float = 0.0
+        self._ik_b_sum: float = 0.0
+        self._ik_n: int = 0
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
@@ -69,6 +78,10 @@ class RewardBreakdownCallback(BaseCallback):
             if "contact_force_max" in info:
                 self._cf_sum += float(info["contact_force_max"])
                 self._cf_n += 1
+            if "ik_residual_A" in info:
+                self._ik_a_sum += float(info["ik_residual_A"])
+                self._ik_b_sum += float(info.get("ik_residual_B", 0.0))
+                self._ik_n += 1
             terms = info.get("reward_terms")
             if terms:
                 for k, v in terms.items():
@@ -90,12 +103,24 @@ class RewardBreakdownCallback(BaseCallback):
                                self._success_episodes / self._total_episodes)
         if self._cf_n > 0:
             self.logger.record("env/contact_force_mean", self._cf_sum / self._cf_n)
+        if self._ik_n > 0:
+            # Each episode contributes one inflated step-1 sample (~0.5 m) from
+            # the tire-grasp constraint impulse — see ``TyroEnv.reset()``. The
+            # rollout-mean partially absorbs it; what matters is the trend over
+            # training. Sustained mean > 0.01–0.02 m on a long rollout signals
+            # IK saturation (UR10 near reach limit, joint clamp); inspect the
+            # layout / DR ranges.
+            self.logger.record("env/ik_residual_A_mean", self._ik_a_sum / self._ik_n)
+            self.logger.record("env/ik_residual_B_mean", self._ik_b_sum / self._ik_n)
         self._term_sums = {}
         self._term_count = 0
         self._success_episodes = 0
         self._total_episodes = 0
         self._cf_sum = 0.0
         self._cf_n = 0
+        self._ik_a_sum = 0.0
+        self._ik_b_sum = 0.0
+        self._ik_n = 0
 
 
 def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
@@ -218,6 +243,8 @@ def main() -> int:
     ap.add_argument("--contact-cfm", type=float, default=None)
     ap.add_argument("--contact-force-done", type=float, default=None,
                     help="Terminate if normal force exceeds this (N); ≤0 disables.")
+    ap.add_argument("--tire-mass", type=float, default=None,
+                    help="Tire base mass in kg (default: EnvConfig.tire_mass = 1.0).")
 
     # IO
     ap.add_argument("--out", type=str, default=str(PROJECT_ROOT / "runs"))
@@ -275,6 +302,8 @@ def main() -> int:
             overrides["contact_cfm"] = args.contact_cfm
         if args.contact_force_done is not None:
             overrides["contact_force_terminate_above"] = args.contact_force_done
+        if args.tire_mass is not None:
+            overrides["tire_mass"] = args.tire_mass
         if args.use_truck_hub_urdf.strip():
             s = args.use_truck_hub_urdf.strip().lower()
             overrides["use_truck_hub_urdf"] = s in ("1", "true", "t", "yes", "y")
@@ -298,8 +327,13 @@ def main() -> int:
     vec = VecMonitor(vec, filename=str(out_dir / "monitor.csv"),
                      info_keywords=("is_success", "termination"))
 
-    eval_env = DummyVecEnv([make_env(0, cfg_factory, args.seed + 10_000)])
-    eval_env = VecMonitor(eval_env, info_keywords=("is_success", "termination"))
+    # Skip the eval env entirely when EvalCallback is disabled — PyBullet
+    # connect + URDF load is non-trivial and otherwise wasted.
+    if args.no_eval_callback:
+        eval_env = None
+    else:
+        eval_env = DummyVecEnv([make_env(0, cfg_factory, args.seed + 10_000)])
+        eval_env = VecMonitor(eval_env, info_keywords=("is_success", "termination"))
 
     # ------------------------------------------------------------------
     # Model
@@ -373,7 +407,8 @@ def main() -> int:
         print(f"[train] saved final to {final_path}  ({(time.time() - t0)/60:.1f} min)")
         try:
             vec.close()
-            eval_env.close()
+            if eval_env is not None:
+                eval_env.close()
         except Exception:
             pass
     return 0
