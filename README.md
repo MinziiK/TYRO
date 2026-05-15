@@ -17,8 +17,6 @@ cd TYRO
 conda create -n tyro python=3.10 -y
 conda activate tyro
 
-# On Windows etc., if pip-built pybullet fails, prefer conda-forge:
-conda install -c conda-forge pybullet -y
 pip install -r requirements.txt
 ```
 
