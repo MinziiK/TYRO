@@ -26,6 +26,8 @@ regardless of stage. Vertical pose violations beyond ``vertical_tol_rad``
 trigger an immediate penalty termination.
 
 Action: 13-d in [-1, 1]  → (Δpose_A 6, Δpose_B 6, gripper_A 1)
+        Phase 1 collapses to 6-d (Δpose_A only) — gripper_A is a sim-side
+        no-op under the auto-grasp constraint, Panda is frozen at HOME.
 Observation: 89-d (spec §2.1 base + 3-d hub–tire mating diagnostics).
 """
 from __future__ import annotations
@@ -205,10 +207,9 @@ class TyroEnv(gym.Env):
 
         Two regimes:
 
-        * Phase 1 — ``freeze_robot_b=True`` ⇒ ``action.dim == 7``.
-          The Panda block has been *sliced out* of the action space, so
-          the mask is simply ``ones(7)``. The gripper_A channel sits at
-          ``action[6]``.
+        * Phase 1 — ``freeze_robot_b=True`` ⇒ ``action.dim == 6``.
+          Δpose_A only; gripper_A and the Panda block are sliced out of
+          the action space entirely. Mask is ``ones(6)``.
 
         * Phase 2/3 — ``freeze_robot_b=False`` ⇒ ``action.dim == 13``.
           Mask is ``ones(13)``. (When a caller manually freezes Panda
@@ -232,7 +233,7 @@ class TyroEnv(gym.Env):
         Layout follows ``_compute_obs``'s concatenation order. The first
         73 entries and the trailing 3 ``mount_tail`` scalars are dim-
         independent; only the ``prev_action`` slice between them changes
-        length with the action space (7 in Phase 1, 13 in Phase 2/3).
+        length with the action space (6 in Phase 1, 13 in Phase 2/3).
 
           [0:6]    qA_n            — UR10 joints
           [6:12]   dqA_n           — UR10 joint vels
@@ -644,27 +645,35 @@ class TyroEnv(gym.Env):
     def _apply_action(self, action: np.ndarray) -> None:
         ps = self.cfg.action.pos_scale
         rs = self.cfg.action.rot_scale
-        # Robot A: 6 — always the leading slice regardless of action dim.
+        # Robot A: Δpos[0:3] drives translation. When
+        # ``EnvConfig.ur10_lock_tool_up`` is True (Phase 1 default),
+        # ``UR10Robot.apply_delta_ee`` pins IK ``targetOrientation`` to
+        # ``UR10Robot.FINAL_LOCK_QUATERNION`` — palm faces world +Z and
+        # gripper closure axis stays parallel to world −X for *every*
+        # control step. The Δrot channels ``action[3:6]`` are zeroed at
+        # this layer (defence-in-depth) so even an off-policy action that
+        # claims a non-zero rotation cannot leak through to wrist_3.
         d_pos_A = action[0:3] * ps
-        d_rot_A = action[3:6] * rs
+        if bool(getattr(self.cfg, "ur10_lock_tool_up", True)):
+            d_rot_A = np.zeros(3, dtype=np.float64)
+        else:
+            d_rot_A = action[3:6] * rs
         self.robot_A.apply_delta_ee(d_pos_A, d_rot_A)
-        # Robot B: 6 channels live at ``action[6:12]`` only when the env
-        # is in the full 13-d action layout (Phase 2/3). In Phase 1 the
-        # action space is sliced to 7-d so the Panda block is *not in
-        # the action vector at all* — we just pin Panda at HOME.
-        # ``reset_to_home`` only seeds joint positions; without a motor
-        # target the arm would slowly droop under gravity over the 500-
-        # step episode, so we re-seed every control tick.
+        # Robot B: in Phase 1 (``action.dim == 6``) Panda is frozen and the
+        # action vector has no Panda block; ``reset_to_home`` re-seeds the
+        # motor target every step (otherwise the arm slowly droops under
+        # gravity over the 500-step episode). In Phase 2/3 ``action[6:12]``
+        # carries Δpose_B which is forwarded to IK.
         if self.cfg.freeze_robot_b:
             self.robot_B.reset_to_home()
         else:
             d_pos_B = action[6:9] * ps
             d_rot_B = action[9:12] * rs
             self.robot_B.apply_delta_ee(d_pos_B, d_rot_B)
-        # Gripper A (Tier-1: ignored at sim level, the constraint holds the
-        # tire). Lives at ``action[-1]`` in both layouts (index 6 for 7-d,
-        # index 12 for 13-d). Kept in obs as ``prev_action`` so the policy
-        # can still emit the binary intent.
+        # Gripper A: sim-side no-op (auto-grasp constraint holds the tire).
+        # In Phase 1 the channel is dropped from the action vector entirely;
+        # in Phase 2/3 it lives at ``action[12]`` and only feeds back into
+        # the obs via ``prev_action`` so the policy can still emit intent.
 
     # ------------------------------------------------------------------
     # Observation (spec §2.1 base + mating scalars ⇒ 89-d)
@@ -778,17 +787,25 @@ class TyroEnv(gym.Env):
         tire_axis = self.scene.tire_axis()
         hub_axis = self.scene.hub_axis()
         _, dqA = self.robot_A.joint_state()
-        eeB_pos, eeB_orn = self.robot_B.ee_pose()
-        bolt_pos, _bolt_orn = self.scene.bolt_pose()
-        bolt_axis = self.scene.bolt_axis()
-        eeB_z = quat_axis(eeB_orn, "z")
 
-        # Align term is computed in every stage for diagnostic logging, but
-        # only injected into the dense reward for the carrying stage (1).
+        # Align term: tire ↔ hub geometry. Computed in every stage for
+        # diagnostic logging, only injected into the dense reward in
+        # Stage 1 (carry).
         b.align_A, b.d_A, b.theta_A = rewards.align_reward(
             tire_pos, hub_pos, tire_axis, hub_axis, rcfg)
-        b.reach_B, b.d_B, b.theta_B = rewards.reach_reward(
-            eeB_pos, bolt_pos, eeB_z, bolt_axis, rcfg)
+
+        # Panda-side terms (reach_B) only matter when Robot B is active.
+        # Phase 1 freezes Panda at HOME and zeroes ``w_d_B`` / ``w_theta_B``
+        # in ``make_reward_config`` — skip the bolt/EE queries entirely.
+        if not bool(getattr(self.cfg, "freeze_robot_b", False)):
+            eeB_pos, eeB_orn = self.robot_B.ee_pose()
+            bolt_pos, _bolt_orn = self.scene.bolt_pose()
+            bolt_axis = self.scene.bolt_axis()
+            eeB_z = quat_axis(eeB_orn, "z")
+            b.reach_B, b.d_B, b.theta_B = rewards.reach_reward(
+                eeB_pos, bolt_pos, eeB_z, bolt_axis, rcfg)
+        # else: ``b.reach_B`` / ``b.d_B`` / ``b.theta_B`` stay at 0.0.
+
         ax_th, lat_th, lug_e = mount_residuals
         b.axial_dot_th = float(ax_th)
         b.lateral_th = float(lat_th)
@@ -814,7 +831,19 @@ class TyroEnv(gym.Env):
             grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
             d_approach = float(np.linalg.norm(ee_pos - grasp_target))
             decay = max(float(rcfg.approach_decay), 1e-3)
-            b.approach_A = float(rcfg.w_approach) * float(np.exp(-d_approach / decay))
+            # Wide kernel — non-vanishing gradient across the full reach.
+            far_term = float(rcfg.w_approach) * float(np.exp(-d_approach / decay))
+            # Close-range bonus — explodes inside ~0.3 m so the policy is
+            # forcibly pulled through the relaxed 0.55 m pickup gate. Only
+            # active when ``w_approach_close`` is set (default 2.0); safe to
+            # zero out via RewardConfig if a future curriculum needs to roll
+            # this back without code edits.
+            close_w = float(getattr(rcfg, "w_approach_close", 0.0))
+            close_decay = max(
+                float(getattr(rcfg, "approach_close_decay", 0.2)), 1e-3,
+            )
+            close_term = close_w * float(np.exp(-d_approach / close_decay))
+            b.approach_A = far_term + close_term
             b.d_approach = d_approach
             if self._prev_d_approach is not None and rcfg.w_pb_approach > 0.0:
                 pb_step = float(rcfg.w_pb_approach) * float(
@@ -872,12 +901,10 @@ class TyroEnv(gym.Env):
         # Always-on penalties --------------------------------------------
         b.coop = rewards.coop_reward(b.d_A, b.d_B, rcfg)
         b.sync_joint_A = rewards.sync_joint_a_penalty(dqA, rcfg)
-        # Legacy sparse success path still produces a separate dense bonus
-        # for back-compat (e.g. analytics). It does not drive Phase-1 done.
-        b.success, _legacy_succ = rewards.success_bonus(
-            b.d_A, b.theta_A, b.d_B, b.theta_B, rcfg,
-            mount=(ax_th, lat_th, lug_e),
-        )
+        # Legacy ``success_bonus`` removed (2026-05-28). Phase 1 success is
+        # decided by the FSM ``landed`` event in ``_try_stage_transitions``;
+        # the lug-aligned predicate is no longer evaluated to save compute.
+        b.success = 0.0
         b.collision = rewards.collision_penalty(in_collision, rcfg)
         b.workspace = rewards.workspace_penalty(out_of_workspace, rcfg)
         # Phase 1 action/jerk mask — when Robot B is frozen, the policy

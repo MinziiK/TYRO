@@ -32,13 +32,27 @@ class RewardConfig:
     #: bounded in ``[0, w_approach]`` instead of growing unbounded-negative
     #: with distance — this removes the per-step negative baseline that
     #: previously incentivised the policy to self-terminate early.
-    #: Tuned for the X=-1.50 pickup layout (d_initial ~1.79 m): decay was
-    #: lifted from 0.5 m → 1.5 m so the gradient is non-vanishing across
-    #: the whole reach.  At d=1.79 the kernel now reads exp(-1.19) ≈ 0.30
-    #: instead of exp(-3.58) ≈ 0.028, giving the policy a learnable signal
-    #: while the EE is still far away.
+    #: **2026-05-28 emergency sharpening**: the 1.5 m e-fold was so flat
+    #: across d ∈ [0.6, 0.8] (kernel 0.66 → 0.59, only ~10 % drop) that
+    #: the 450 k policy locked into a hover at d ≈ 0.69 m without any
+    #: gradient to keep closing. Decay slashed to **0.4 m** — kernel now
+    #: reads 0.22 → 0.13 across the same band (40 % drop), restoring a
+    #: strong "keep descending" gradient. Combined with the new close-range
+    #: bonus below (see ``w_approach_close`` / ``approach_close_decay``).
     w_approach: float = 3.0
-    approach_decay: float = 1.5  # m, e-fold radius of the approach kernel
+    approach_decay: float = 0.4  # m, e-fold radius of the approach kernel
+    #: **Stage-0 close-range bonus** — a second, much narrower exponential
+    #: that ignites only when the EE is within ~30 cm of the grasp target.
+    #: Stacks additively on ``w_approach * exp(-d / approach_decay)`` to
+    #: deliver an overwhelming "land it now" signal in the final approach.
+    #: Total Stage-0 dense ceiling becomes ``w_approach + w_approach_close``
+    #: = 3.0 + 2.0 = 5.0 (only at d=0). At d=0.5 the bonus is 2 · e⁻²·⁵
+    #: ≈ 0.16; at d=0.2 it is 2 · e⁻¹ ≈ 0.74; at d=0 it is 2.0. Together
+    #: with the hard-cap relaxation to 0.55 m, the close-range slope
+    #: should now pull the policy through the gate within the first
+    #: ~100 k global timesteps.
+    w_approach_close: float = 2.0
+    approach_close_decay: float = 0.2  # m, e-fold of the close-range kernel
     #: Stage 2 — tire COM → original floor pickup point (positive exp form).
     w_return: float = 3.0
     return_decay: float = 0.8  # m  (was 0.3 — same rationale as approach)
@@ -93,9 +107,12 @@ class RewardConfig:
     delta_B: float = np.deg2rad(5.0)  # 5° — gripper-bolt axis threshold
 
     # Mounting-aligned success (tire coaxial projection + lug spin vs bolt_0 ray).
-    #: Default True ⇒ ``eps_A`` is unused; success uses ``eps_A_mounted`` /
-    #: ``success_axial_tolerance`` / ``success_lateral_tolerance`` / ``lug_spin_tolerance_rad``.
-    use_lug_aligned_success: bool = True
+    #: **2026-05-28**: Phase 1 success is decided by the FSM ``landed`` event
+    #: (see ``_try_stage_transitions``), so the legacy ``success_bonus``
+    #: predicate is no longer evaluated. Field kept for Phase 2/3 forward
+    #: compatibility but pinned to ``False`` — the dead lug/axial/lateral
+    #: branch in ``rewards.success_bonus`` is now skipped entirely.
+    use_lug_aligned_success: bool = False
     #: ``dot(t_center - hub_center, û_hub)`` when seated (often near 0; tune with scene scale).
     success_axial_dot_target: float = 0.0
     success_axial_tolerance: float = 0.08
@@ -132,14 +149,13 @@ class ActionConfig:
     rot_scale: float = 0.05   # rad per step
     # ``dim`` is set by ``make_env_config`` (or ``EnvConfig.__post_init__``)
     # based on ``EnvConfig.freeze_robot_b``:
-    #   Phase 1 (Robot B frozen)  →  7  (Δpose_A 6 + gripper_A 1)
+    #   Phase 1 (Robot B frozen)  →  6  (Δpose_A 6)         ← gripper_A dropped
     #   Phase 2/3 (Robot B active) → 13 (Δpose_A 6 + Δpose_B 6 + gripper_A 1)
-    # Slicing the Panda channels out of ``action_space`` in Phase 1 shrinks
-    # PPO's exploration manifold by 6 dimensions, which (a) lowers the
-    # actor entropy floor and (b) removes the dead-channel noise on
-    # action / jerk regularisation — both compound to faster Phase 1
-    # convergence. Phase 2 entry restores the full 13-d space; the actor
-    # head is re-initialised then (see docstring).
+    # The gripper_A channel is a no-op at the sim layer (the JOINT_FIXED
+    # constraint at the auto-grasp gate holds the tire), so emitting it in
+    # Phase 1 only wastes a search dimension. PPO now solves a clean 6-d
+    # delta-EE-pose problem during pickup; gripper_A is re-introduced at
+    # the Phase 2 transition (see ``make_env_config``).
     dim: int = 13
 
 
@@ -152,10 +168,10 @@ class ObsConfig:
     # the active ``ActionConfig.dim`` — the obs layout always ends with
     # ``prev_action`` (length = action.dim) followed by 3 mount tail
     # scalars, so the total dim tracks ``action.dim``:
-    #   action.dim = 7  → obs.dim = 76 + 7 + 3 = 83  (Phase 1)
-    #   action.dim = 13 → obs.dim = 76 + 13 + 3 = 89 (Phase 2/3)
-    # The remaining 73 entries (joints, EE/tire/hub/bolt poses, deltas)
-    # are independent of action dim and shared across all phases.
+    #   action.dim = 6  → obs.dim = 73 + 6 + 3 = 82  (Phase 1)
+    #   action.dim = 13 → obs.dim = 73 + 13 + 3 = 89 (Phase 2/3)
+    # The 73 base entries (joints, EE/tire/hub/bolt poses, deltas) are
+    # independent of action dim and shared across all phases.
     dim: int = 89                   # §2.1 base + mounting (ax·lat·lug) diagnostics
 
 
@@ -326,25 +342,35 @@ class EnvConfig:
     #: actually gates Stage 0 → 1 and is updated by SB3's
     #: ``ApproachTolCurriculumCallback`` (or stays at ``approach_radius_tol``
     #: when no callback is wired, e.g. during eval / render).
-    #: Tighten back toward 5–15 cm once ``success_rate`` stabilises.
-    approach_radius_tol: float = 0.50
-    #: Soft starting value used by the timestep curriculum. The HOME-pose
-    #: EE↔grasp distance is 57 cm under the raised-rack layout; setting
-    #: the soft floor at 58 cm means the pre-trained policy's hover band
-    #: (~0.55–0.60 m, see ``phase1_fsm_1M_pbshape``) still trips the
-    #: grasp gate from the *first* episodes, restoring the R_pickup
-    #: signal that the 50 cm hard cap had silenced.
-    approach_tol_soft: float = 0.58
+    #: **2026-05-28 (palm-up HOME + curriculum widening)**: previous soft
+    #: gate of 0.15 m left a 36 cm dead band against HOME EE↔grasp ≈ 51 cm,
+    #: i.e. the policy saw zero pickup signal for the first ~5k steps.
+    #: ``approach_tol_soft`` raised to **0.35 m** so even the initial
+    #: random-policy exploration cone (Δpos ≤ 0.02 m/step × 500 steps =
+    #: 10 m envelope) reliably trips Stage 0 → 1 within an episode. The
+    #: hard cap stays at **0.08 m** (physical fingertip contact) for the
+    #: final converged policy.
+    approach_radius_tol: float = 0.08
+    approach_tol_soft: float = 0.35
     #: First N (global PPO) timesteps where the gate is pinned to
     #: ``approach_tol_soft``. Past this point the linear ramp begins.
-    approach_tol_curriculum_steps: int = 100_000
+    #: **Aggressively shortened** from 100 k → **5 k env-steps** (~40 k
+    #: global timesteps under 12-env vec). The diagnostic hover already
+    #: emerged after 450 k global, so the soft hold doesn't need a 100 k
+    #: pre-roll any more.
+    approach_tol_curriculum_steps: int = 5_000
     #: Linear ramp length (global PPO timesteps) after the soft hold
     #: during which the gate is interpolated from ``approach_tol_soft``
     #: down to ``approach_radius_tol``.
-    approach_tol_ramp_steps: int = 200_000
+    #: Shortened from 200 k → **5 k env-steps** so the curriculum fully
+    #: lands inside the first ~80 k global timesteps.
+    approach_tol_ramp_steps: int = 5_000
     #: Stage 1 → 2 trigger: ‖tire − hub‖ < ``mount_radius_tol`` AND tire axis
     #: aligned with hub axis (≤ ``RewardConfig.delta_A`` rad).
-    mount_radius_tol: float = 0.01
+    #: **2026-05-28**: relaxed from 0.01 m → **0.04 m** so Stage 1 has a
+    #: realistic completion gate. Required mount precision is enforced
+    #: separately by the lug-aligned tolerances (``eps_A_mounted`` etc.).
+    mount_radius_tol: float = 0.04
     #: Stage 2 → success: ‖tire − pickup‖ < ``return_radius_tol`` AND tire
     #: descent speed < ``landing_speed_max`` (soft landing).
     return_radius_tol: float = 0.05
@@ -486,6 +512,12 @@ class EnvConfig:
     #: step of every episode, removing it from the learning problem.
     #: ``make_env_config`` wires this to ``True`` for Phase 1.
     freeze_robot_b: bool = False
+    #: When True, UR10 IK pins the EE orientation to ``HOME_POSE`` FK and
+    #: clamps wrist joints — used previously for the palm-up cradle and
+    #: vertical-pillar experiments. Default off: PPO drives the full
+    #: 6-DOF EE pose (Δpos + Δrot) so the policy can solve approach
+    #: orientation on its own. Re-enable per-run if needed.
+    ur10_lock_tool_up: bool = False
 
     # ------------------------------------------------------------------
     # Domain randomization (Phase 1 → Sim2Real bridge)
@@ -608,11 +640,12 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     # Action / observation dims follow ``freeze_robot_b`` — the Panda
     # action block is dropped from ``action_space`` when frozen so PPO
     # doesn't search a 6-d dead manifold, and the matching ``prev_action``
-    # slot inside ``obs`` shrinks accordingly. See ``ActionConfig`` /
-    # ``ObsConfig`` docstrings for the exact layout.
+    # slot inside ``obs`` shrinks accordingly. The Phase-1 gripper_A
+    # channel is also dropped (sim-side no-op under the auto-grasp
+    # constraint). See ``ActionConfig`` / ``ObsConfig`` docstrings.
     if cfg.freeze_robot_b:
-        cfg.action.dim = 7
-        cfg.obs.dim = 83  # 73 base + 7 prev_action + 3 mount tail
+        cfg.action.dim = 6
+        cfg.obs.dim = 82  # 73 base + 6 prev_action + 3 mount tail
     else:
         cfg.action.dim = 13
         cfg.obs.dim = 89  # 73 base + 13 prev_action + 3 mount tail

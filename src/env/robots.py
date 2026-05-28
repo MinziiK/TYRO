@@ -7,6 +7,7 @@ servos which the env then steps through `decimation` sim sub-steps.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -244,33 +245,140 @@ class Robot:
 class UR10Robot(Robot):
     NAME = "ur10"
     EE_LINK_INDEX = 7  # robot_ee_link
-    # Dual-block-rack layout (hub at origin, base at (−0.40, −0.80, −0.62),
-    # pickup COM at (−1.50, −0.80, −0.145), 6 o'clock outer point at
-    # (−1.50, −0.80, −0.67)):
+    # 2026-05-28 (post-laydown): the previous HOME_POSE was designed for
+    # a vertical-tire layout. After ``tire_spawn_rpy = (0, π/2, 0)`` was
+    # adopted (bore along +X to face Robot A), that HOME parked the EE at
+    # (−1.90, 0.00, +0.27) — *inside* the tire bore (YZ dist = 4.5 cm <
+    # bore radius 28.2 cm, X mid-thickness), so the gripper was born
+    # impaled on the tire and every episode terminated on contact_force.
     #
-    # HOME places the EE at (−1.50, −0.80, −0.05) — 62 cm directly above
-    # the grasp target, centred in the 20 cm-wide X gap between the two
-    # support blocks. Tool +Z is aligned to world +Z to within 0.00°
-    # (EE RPY = (0°, 0°, −90°)), so the gripper cup points at the sky.
-    # The Stage-0 task is reduced to a pure −Z descent through the gap;
-    # no wrist twist is needed to capture the 6 o'clock tread point.
+    # New compact tool-up HOME (Robot B-centric coords, robot_A_base at
+    # (−0.80, 0, −0.30); tire COM (−1.90, 0, +0.225), bore axis +X,
+    # outer radius 0.525 m, inner 0.282 m, thickness 0.30 m):
     #
-    # The 62 cm clearance exceeds ``approach_radius_tol`` (60 cm) so the
-    # FSM does *not* trigger Stage 0 → 1 on env-step 0. wrist_3 = +0.2327
-    # is the (−6.0505 mod 2π) wrap of the IK output, equivalent under
-    # joint kinematics but kept inside [−π, π] for readability.
+    #   EE world pose = (−1.55, −0.05, +0.55), tool +Z ‖ world +Z.
     #
-    # Re-run scripts/calibrate_home_pose.py to refresh after any change
-    # to the base position, rack geometry, or approach radius tolerance.
-    HOME_POSE = (2.9089, -0.0246, -0.5518, -2.5652, 0.2327, 0.0000)
+    # That places the gripper +33 cm above the tire equator and +35 cm
+    # in front of the tire's front face (X = −1.75), entirely clear of:
+    #   * tire AABB         X ∈ [−2.05, −1.75]
+    #   * rack rail AABBs   X ∈ [−2.05, −1.75], |Y| ∈ [0.05, 0.35]
+    #   * vehicle / cargo   Y > +0.60
+    # AABB overlap with every blocker was verified zero by
+    # scripts/find_compact_home.py.
+    #
+    # EE↔grasp_target = 92.1 cm at HOME, comfortably OUTSIDE both the
+    # soft gate (62 cm) and hard cap (55 cm) of the approach_tol
+    # curriculum — the policy now has room to learn an active descent.
+    #
+    # 2026-05-29 — tool-up "palms-up cradle" HOME:
+    # The previous compact HOME let the gripper face an angled direction
+    # rather than world +Z; for an underhand cradle pickup the gripper
+    # cup must look straight up. New joint vector (rad):
+    #
+    #   shoulder_pan  = π        ( +180° — rotate 0° toward −X, facing tire)
+    #   shoulder_lift = −1.1344  ( ≈ −65° — shoulder tipped up)
+    #   elbow         = +1.1344  ( ≈ +65° — elbow folded, avoids singularity)
+    #   shoulder_pan  = +180°   shoulder_lift = −65°   elbow = +130°
+    #   wrist_1 = −155°   wrist_2 = +180°   wrist_3 = +90°
+    HOME_POSE = (3.1416, -1.1345, 2.2689, -2.7053, 3.1416, 1.5708)
+
+    #: ``FINAL_LOCK_QUATERNION`` — the FULL 3-D EE orientation that IK is
+    #: pinned to when ``EnvConfig.ur10_lock_tool_up`` is True. Equal to the
+    #: FK of ``HOME_POSE`` so a reset-then-step round-trip is a fixed point
+    #: of IK (no wrist drift). Re-measure with ``scripts/verify_home.py``
+    #: if ``HOME_POSE`` changes. ``TOOL_UP_QUATERNION`` kept as an alias.
+    FINAL_LOCK_QUATERNION = (
+        +3.082280e-02, -3.082257e-02, -7.064321e-01, +7.064372e-01,
+    )
+    TOOL_UP_QUATERNION = FINAL_LOCK_QUATERNION
 
     def __init__(self, client: int, cfg: EnvConfig):
+        self._lock_tool_up = bool(getattr(cfg, "ur10_lock_tool_up", True))
         super().__init__(
             client=client,
             base_pos=cfg.robot_A_base_pos,
             base_orn=rpy_to_quat(cfg.robot_A_base_rpy),
             urdf_path=cfg.ur10_urdf,
             search_path=cfg.ur10_search_path,
+        )
+
+    def apply_delta_ee(self, delta_pos: np.ndarray, delta_axisangle: np.ndarray) -> None:
+        """Δpos drives EE translation. When ``ur10_lock_tool_up`` is True the
+        UR10 is constrained to a **vertical parallel link** topology:
+
+        * IK is run **position-only** (no ``targetOrientation``).
+        * ``elbow_target = π/2 − shoulder_lift_target`` is forced from the IK
+          output so the forearm pillar stays vertical (world +Z) at every
+          control step.
+        * ``wrist_1 = wrist_2 = wrist_3 = 0`` strictly, holding the gripper
+          palm flat against world +Z with no cluster twist.
+
+        Effectively the arm becomes a 2-DOF (shoulder_pan, shoulder_lift)
+        SCARA-on-a-stick — the policy's Δpos commands the EE in cylindrical
+        coordinates around the UR10 base, while the wrist + forearm remain
+        a rigid vertical T. ``delta_axisangle`` is ignored in lock mode
+        (env also zeroes it; defence-in-depth)."""
+        cur_pos, cur_orn = self.ee_pose()
+        target_pos = cur_pos + np.asarray(delta_pos, dtype=np.float64)
+        self.last_target_pos = target_pos
+
+        if self._lock_tool_up:
+            ik = p.calculateInverseKinematics(
+                self.uid, self.EE_LINK_INDEX,
+                list(target_pos),
+                lowerLimits=self.arm.lower.tolist(),
+                upperLimits=self.arm.upper.tolist(),
+                jointRanges=self.arm.range.tolist(),
+                restPoses=self.arm.rest.tolist(),
+                maxNumIterations=50,
+                residualThreshold=1e-3,
+                physicsClientId=self.client,
+            )
+        else:
+            d_quat = axisangle3_to_quat(delta_axisangle)
+            target_orn = list(quat_multiply(d_quat, cur_orn))
+            ik = p.calculateInverseKinematics(
+                self.uid, self.EE_LINK_INDEX,
+                list(target_pos), target_orn,
+                lowerLimits=self.arm.lower.tolist(),
+                upperLimits=self.arm.upper.tolist(),
+                jointRanges=self.arm.range.tolist(),
+                restPoses=self.arm.rest.tolist(),
+                maxNumIterations=50,
+                residualThreshold=1e-3,
+                physicsClientId=self.client,
+            )
+        ik = np.asarray(ik, dtype=np.float64)
+        max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+        if len(ik) > max_slot:
+            arm_targets = ik[self._ik_arm_slots]
+        else:
+            arm_targets = self._fallback_targets()
+        if self._lock_tool_up:
+            # Clamp every wrist joint back to its HOME_POSE value at every
+            # step so the wrist cluster moves as a rigid block in world
+            # frame. (Elbow is left to IK — earlier "elbow = π/2 − lift"
+            # vertical-pillar rule was removed because it conflicted with
+            # generic HOME poses.)
+            arm_targets[3] = float(self.HOME_POSE[3])
+            arm_targets[4] = float(self.HOME_POSE[4])
+            arm_targets[5] = float(self.HOME_POSE[5])
+        arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
+        n = self.arm.n
+        forces = [150.0] * n
+        pgains = [1.0] * n
+        vgains = [1.0] * n
+        if self._lock_tool_up:
+            for i in (3, 4, 5):
+                forces[i] = 1500.0  # stiff wrist hold
+        p.setJointMotorControlArray(
+            self.uid, self.arm.indices,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=arm_targets.tolist(),
+            forces=forces,
+            positionGains=pgains,
+            velocityGains=vgains,
+            physicsClientId=self.client,
         )
 
     def _arm_joint_indices(self) -> List[int]:

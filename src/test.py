@@ -101,9 +101,9 @@ def main() -> int:
             action = env.action_space.sample().astype(np.float32)
         elif args.action_scale > 0:
             action = rng.uniform(-args.action_scale, args.action_scale,
-                                 size=(13,)).astype(np.float32)
+                                 size=env.action_space.shape).astype(np.float32)
         else:
-            action = np.zeros(13, dtype=np.float32)
+            action = np.zeros(env.action_space.shape, dtype=np.float32)
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward += float(reward)
         actual_steps = t + 1
