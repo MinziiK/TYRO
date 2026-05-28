@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -49,6 +49,10 @@ class SceneHandles:
     truck_uid: Optional[int]
     vehicle: Optional[int]
     target_bolt_idx: int
+    #: Body UIDs of the two static support blocks that cradle the
+    #: vertical tire during Stage 0 (front + rear). Empty when
+    #: ``spawn_tire_rack`` is False.
+    tire_rack: List[int] = field(default_factory=list)
 
     @property
     def target_bolt(self) -> BodyLinkRef:
@@ -58,7 +62,15 @@ class SceneHandles:
 class Scene:
     """Manages tire + hub + bolt creation, randomization, and queries."""
 
-    def __init__(self, client: int, cfg: EnvConfig, np_random: np.random.Generator):
+    def __init__(
+        self,
+        client: int,
+        cfg: EnvConfig,
+        np_random: np.random.Generator,
+        *,
+        hub_xy_offset: Tuple[float, float] = (0.0, 0.0),
+        cargo_xy_offset: Tuple[float, float] = (0.0, 0.0),
+    ):
         self.client = client
         self.cfg = cfg
         self.np_random = np_random
@@ -66,16 +78,41 @@ class Scene:
         self._hub_orn_world: np.ndarray = np.array([0.0, 0.0, 0.0, 1.0])
         # ``False`` after a tire-build fallback — disables lug-spin residual.
         self.has_wheel_disk: bool = True
+        # Static-pose domain randomization offsets (XY only). Z stays
+        # pinned to the nominal config value so the tire never floats off
+        # contact or clips the floor.  ``TyroEnv._maybe_apply_domain_-
+        # randomization`` samples these once per ``reset()`` and forwards
+        # them here; when DR is off they default to (0, 0) and the build
+        # path is bit-identical to the pre-DR scene.
+        self._hub_xy_offset: np.ndarray = np.array(
+            [float(hub_xy_offset[0]), float(hub_xy_offset[1]), 0.0],
+            dtype=np.float64,
+        )
+        self._cargo_xy_offset: np.ndarray = np.array(
+            [float(cargo_xy_offset[0]), float(cargo_xy_offset[1]), 0.0],
+            dtype=np.float64,
+        )
 
     # ------------------------------------------------------------------
     def build(self) -> SceneHandles:
         p.setAdditionalSearchPath(
             pybullet_data.getDataPath(), physicsClientId=self.client
         )
-        plane = p.loadURDF("plane.urdf", physicsClientId=self.client)
+        floor_z = float(getattr(self.cfg, "floor_z", 0.0))
+        plane = p.loadURDF(
+            "plane.urdf",
+            basePosition=[0.0, 0.0, floor_z],
+            physicsClientId=self.client,
+        )
 
         hub_pos = np.array(self.cfg.hub_pos_nominal, dtype=np.float64)
+        # ``_sample_offset_xyz`` = the legacy curriculum-phase XY noise
+        # (config.curriculum.phase_ranges_cm). ``_hub_xy_offset`` = the
+        # new static-pose DR (cfg.USE_DOMAIN_RANDOMIZATION). The two
+        # paths are additive; both default to zero so behaviour is
+        # unchanged unless explicitly enabled.
         hub_pos += self._sample_offset_xyz()
+        hub_pos += self._hub_xy_offset
         hub_rpy = tuple(float(x) for x in self.cfg.hub_base_rpy)
         hub_orn = rpy_to_quat(hub_rpy)
         self._hub_orn_world = hub_orn
@@ -131,7 +168,23 @@ class Scene:
                 physicsClientId=self.client,
             )
 
+        # Inline (Y-split) dual-block tire rack — must be created *before*
+        # ``_spawn_tire`` so the tire's static world-pin (mass=0 at
+        # COM = rack_top + R) already sees the cradle rails underneath it
+        # on step 1. The 10 cm Y-gap between the rails is what makes
+        # Stage 0 grasp geometrically legal: the UR10 gripper threads
+        # along the shared robot-tire Y=-0.80 centerline straight to the
+        # 6 o'clock outer point without colliding with either rail.
+        rack_uids = self._make_split_tire_rack()
+
         tire = self._spawn_tire()
+
+        # Visual support pillars for any robot base mounted above the floor
+        # (e.g. the sandwich layout where UR10@Z=0.20 and Panda@Z=0.60 both
+        # sit on plinths). Each call is a no-op when its base z≈0 or the
+        # corresponding ``*_stand_radius`` config is non-positive.
+        self._make_ur10_stand()
+        self._make_panda_stand()
 
         self.handles = SceneHandles(
             plane=plane,
@@ -141,6 +194,7 @@ class Scene:
             truck_uid=truck_uid,
             vehicle=vehicle_id,
             target_bolt_idx=target_idx,
+            tire_rack=rack_uids,
         )
         return self.handles
 
@@ -320,15 +374,28 @@ class Scene:
     def _make_vehicle_box(self, hub_center: np.ndarray) -> int:
         he = np.asarray(self.cfg.vehicle_half_extents, dtype=np.float64)
         nom = np.asarray(self.cfg.hub_pos_nominal, dtype=np.float64)
+        # ``drift`` already absorbs both the curriculum-phase noise and
+        # the new ``_hub_xy_offset`` because ``hub_center`` is the
+        # post-offset hub position. We add ``_cargo_xy_offset`` on top
+        # so cargo can be perturbed *independently* of the hub (the spec
+        # treats them as separate randomized objects).
         drift = hub_center - nom
-        pos = np.asarray(self.cfg.vehicle_center_world, dtype=np.float64) + drift
+        pos = (
+            np.asarray(self.cfg.vehicle_center_world, dtype=np.float64)
+            + drift
+            + self._cargo_xy_offset
+        )
+        cargo_rpy = tuple(float(x) for x in getattr(
+            self.cfg, "vehicle_base_rpy", (0.0, 0.0, 0.0)
+        ))
+        cargo_orn = rpy_to_quat(cargo_rpy)
 
         if not self.cfg.cargo_use_wheel_well_cutout:
-            return self._make_vehicle_box_solid(pos, he)
+            return self._make_vehicle_box_solid(pos, he, cargo_orn)
 
-        cells = self._cargo_keep_cells(hub_center, pos, he)
+        cells = self._cargo_keep_cells(hub_center, pos, cargo_orn, he)
         if not cells:
-            return self._make_vehicle_box_solid(pos, he)
+            return self._make_vehicle_box_solid(pos, he, cargo_orn)
 
         half_extents: list[list[float]] = []
         positions: list[list[float]] = []
@@ -357,17 +424,18 @@ class Scene:
             physicsClientId=self.client,
         )
         if col < 0 or vis < 0:
-            return self._make_vehicle_box_solid(pos, he)
+            return self._make_vehicle_box_solid(pos, he, cargo_orn)
         return p.createMultiBody(
             baseMass=0.0,
             baseCollisionShapeIndex=col,
             baseVisualShapeIndex=vis,
             basePosition=pos.tolist(),
-            baseOrientation=[0.0, 0.0, 0.0, 1.0],
+            baseOrientation=cargo_orn.tolist(),
             physicsClientId=self.client,
         )
 
-    def _make_vehicle_box_solid(self, pos: np.ndarray, he: np.ndarray) -> int:
+    def _make_vehicle_box_solid(self, pos: np.ndarray, he: np.ndarray,
+                                 orn: Optional[np.ndarray] = None) -> int:
         col = p.createCollisionShape(
             p.GEOM_BOX,
             halfExtents=he.tolist(),
@@ -379,71 +447,253 @@ class Scene:
             rgbaColor=(0.25, 0.35, 0.5, 0.35),
             physicsClientId=self.client,
         )
+        if orn is None:
+            orn = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
         return p.createMultiBody(
             baseMass=0.0,
             baseCollisionShapeIndex=col,
             baseVisualShapeIndex=vis,
             basePosition=pos.tolist(),
-            baseOrientation=[0.0, 0.0, 0.0, 1.0],
+            baseOrientation=np.asarray(orn, dtype=np.float64).tolist(),
             physicsClientId=self.client,
         )
 
     def _cargo_keep_cells(
-        self, hub_center: np.ndarray, cargo_center: np.ndarray, he: np.ndarray,
+        self,
+        hub_center: np.ndarray,
+        cargo_center: np.ndarray,
+        cargo_orn: np.ndarray,
+        he: np.ndarray,
     ) -> list[tuple[np.ndarray, np.ndarray]]:
-        """Return list of (half_extents, offset_from_cargo_center) for sub-boxes outside wheel well."""
+        """Return (half_extents, offset_from_cargo_center) for sub-boxes outside the wheel-well.
+
+        Sub-box offsets are expressed in the cargo's **local frame** (so they
+        sit correctly when the body carries a non-identity ``baseOrientation``).
+        The wheel-well cylinder is defined in the **world frame** at
+        ``hub_center`` along ``cargo_wheel_well_axis`` (world X or Y) — each
+        local cell centre is rotated into world coordinates before the cutout
+        test, so the arch always opens on the side of the truck the hub
+        actually protrudes from.
+        """
         hx, hy, hz = float(he[0]), float(he[1]), float(he[2])
-        cx, cy, cz = float(cargo_center[0]), float(cargo_center[1]), float(cargo_center[2])
-        xmin, xmax = cx - hx, cx + hx
-        ymin, ymax = cy - hy, cy + hy
-        zmin, zmax = cz - hz, cz + hz
-
         nx, ny, nz = self.cfg.cargo_collision_subdiv
-        dx = (xmax - xmin) / float(nx)
-        dy = (ymax - ymin) / float(ny)
-        dz = (zmax - zmin) / float(nz)
+        dx = (2.0 * hx) / float(nx)
+        dy = (2.0 * hy) / float(ny)
+        dz = (2.0 * hz) / float(nz)
 
-        x_lo = float(hub_center[0]) + float(self.cfg.cargo_wheel_well_x_range_from_hub[0])
-        x_hi = float(hub_center[0]) + float(self.cfg.cargo_wheel_well_x_range_from_hub[1])
-        R = float(self.cfg.cargo_wheel_well_radius_yz)
+        Rcargo = np.array(
+            p.getMatrixFromQuaternion(list(cargo_orn)), dtype=np.float64
+        ).reshape(3, 3)
+
+        axis = str(getattr(self.cfg, "cargo_wheel_well_axis", "x")).lower()
+        R = float(getattr(self.cfg, "cargo_wheel_well_radius",
+                          self.cfg.cargo_wheel_well_radius_yz))
         r_sq = R * R
-        hy0, hz0 = float(hub_center[1]), float(hub_center[2])
+        if axis == "y":
+            along_range = getattr(
+                self.cfg, "cargo_wheel_well_along_range_from_hub", (-1.05, 1.05),
+            )
+            a_lo = float(hub_center[1]) + float(along_range[0])
+            a_hi = float(hub_center[1]) + float(along_range[1])
+            h_perp_a = float(hub_center[0])
+            h_perp_b = float(hub_center[2])
+        else:
+            along_range = getattr(
+                self.cfg, "cargo_wheel_well_x_range_from_hub", (-0.65, 0.42),
+            )
+            a_lo = float(hub_center[0]) + float(along_range[0])
+            a_hi = float(hub_center[0]) + float(along_range[1])
+            h_perp_a = float(hub_center[1])
+            h_perp_b = float(hub_center[2])
 
         out: list[tuple[np.ndarray, np.ndarray]] = []
         for ix in range(nx):
             for iy in range(ny):
                 for iz in range(nz):
-                    x0 = xmin + ix * dx
-                    y0 = ymin + iy * dy
-                    z0 = zmin + iz * dz
-                    pcx = x0 + 0.5 * dx
-                    pcy = y0 + 0.5 * dy
-                    pcz = z0 + 0.5 * dz
-                    off = np.array([pcx - cx, pcy - cy, pcz - cz], dtype=np.float64)
+                    # Sub-box centre in cargo LOCAL frame (relative to cargo
+                    # centre). Local AABB spans (-hx..+hx, -hy..+hy, -hz..+hz).
+                    off_local = np.array([
+                        -hx + (ix + 0.5) * dx,
+                        -hy + (iy + 0.5) * dy,
+                        -hz + (iz + 0.5) * dz,
+                    ], dtype=np.float64)
                     half = np.array([0.5 * dx, 0.5 * dy, 0.5 * dz], dtype=np.float64)
-                    if self._cargo_cell_in_wheel_well(
-                        pcx, pcy, pcz, x_lo, x_hi, hy0, hz0, r_sq,
-                    ):
+                    # Rotate to world to evaluate the wheel-well cylinder.
+                    p_world = cargo_center + Rcargo @ off_local
+                    pcx, pcy, pcz = float(p_world[0]), float(p_world[1]), float(p_world[2])
+                    if axis == "y":
+                        in_well = self._cell_in_cylinder(
+                            pcy, pcx, pcz, a_lo, a_hi, h_perp_a, h_perp_b, r_sq,
+                        )
+                    else:
+                        in_well = self._cell_in_cylinder(
+                            pcx, pcy, pcz, a_lo, a_hi, h_perp_a, h_perp_b, r_sq,
+                        )
+                    if in_well:
                         continue
-                    out.append((half, off))
+                    out.append((half, off_local))
         return out
+
+    @staticmethod
+    def _cell_in_cylinder(
+        p_along: float, p_perp_a: float, p_perp_b: float,
+        a_lo: float, a_hi: float,
+        h_perp_a: float, h_perp_b: float,
+        r_sq: float,
+    ) -> bool:
+        """Is the point inside a finite cylinder coaxial with ``p_along``?"""
+        if not (a_lo <= p_along <= a_hi):
+            return False
+        da = p_perp_a - h_perp_a
+        db = p_perp_b - h_perp_b
+        return (da * da + db * db) < r_sq
 
     @staticmethod
     def _cargo_cell_in_wheel_well(
         pcx: float, pcy: float, pcz: float,
         x_lo: float, x_hi: float, hy0: float, hz0: float, r_sq: float,
     ) -> bool:
+        """Legacy alias retained for backward-compat. Uses axis=x semantics."""
         if not (x_lo <= pcx <= x_hi):
             return False
         dy = pcy - hy0
         dz = pcz - hz0
         return (dy * dy + dz * dz) < r_sq
 
+    def _make_robot_stand(
+        self,
+        base_pos: Tuple[float, float, float],
+        radius: float,
+        rgba: Tuple[float, float, float, float],
+    ) -> Optional[int]:
+        """Fixed flange+column under a robot base so it is not visually floating.
+
+        Skipped when ``radius <= 0`` or the base sits flush with the floor.
+        Stand height = ``base_z − floor_z`` so it spans from the ground plane
+        up to the robot mount whatever the world Z reference is (e.g. with
+        the hub-centric origin the floor is at Z=−0.82, not Z=0).
+        """
+        r = float(radius)
+        floor_z = float(getattr(self.cfg, "floor_z", 0.0))
+        h = float(base_pos[2]) - floor_z
+        if r <= 0.0 or h <= 1e-3:
+            return None
+        orn = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        bx, by = float(base_pos[0]), float(base_pos[1])
+        flange_r = r * 1.55
+        # Flange sits flush on the floor.
+        self._make_cylinder(
+            radius=flange_r,
+            height=0.04,
+            mass=0.0,
+            base_pos=np.array([bx, by, floor_z + 0.02], dtype=np.float64),
+            base_orn=orn,
+            rgba=tuple(min(1.0, c + 0.08) for c in rgba[:3]) + (rgba[3],),
+        )
+        col_h = max(h - 0.04, 0.1)
+        return self._make_cylinder(
+            radius=r,
+            height=col_h,
+            mass=0.0,
+            base_pos=np.array(
+                [bx, by, floor_z + 0.04 + 0.5 * col_h], dtype=np.float64,
+            ),
+            base_orn=orn,
+            rgba=rgba,
+        )
+
+    def _make_panda_stand(self) -> Optional[int]:
+        return self._make_robot_stand(
+            base_pos=self.cfg.robot_B_base_pos,
+            radius=float(getattr(self.cfg, "panda_stand_radius", 0.0)),
+            rgba=tuple(getattr(self.cfg, "panda_stand_rgba", (0.4, 0.4, 0.45, 1.0))),
+        )
+
+    def _make_ur10_stand(self) -> Optional[int]:
+        return self._make_robot_stand(
+            base_pos=self.cfg.robot_A_base_pos,
+            radius=float(getattr(self.cfg, "ur10_stand_radius", 0.0)),
+            rgba=tuple(getattr(self.cfg, "ur10_stand_rgba", (0.4, 0.4, 0.45, 1.0))),
+        )
+
+    def _make_split_tire_rack(self) -> List[int]:
+        """Build the inline (Y-split) dual-block tire cradle (Inner + Outer rails).
+
+        Two static rails (mass=0) parallel to the X axis, flanking the
+        tire bore (world −Y) on opposite sides of the Y=-0.80 centerline.
+        They support the vertical tire's tread on both Y faces while
+        leaving a hollow Y-gap between them so the UR10 gripper can
+        thread straight along the robot-tire Y centerline to the 6
+        o'clock outer point and grasp it without clipping either rail.
+
+        Returns a list of PyBullet body UIDs (empty when disabled).
+
+        Geometry contract — must hold whenever the rack is enabled:
+          * ``inner_y - he_y ≥ tire_com_y + gap_half``
+          * ``outer_y + he_y ≤ tire_com_y − gap_half``
+          * ``floor_z + 2·he_z == tire_com_z − tire_outer_radius``
+          * ``|inner_x - outer_x| < 1e-9`` (rails share the same X line)
+        Failing any of these means the rack either collides with the
+        tire's bore region or leaves no straight-line corridor for the
+        gripper — both fatal for Stage 0.
+        """
+        if not bool(getattr(self.cfg, "spawn_tire_rack", True)):
+            return []
+        he = tuple(float(x) for x in self.cfg.tire_rack_half_extents)
+        rgba = tuple(float(x) for x in self.cfg.tire_rack_rgba)
+        centers = (
+            tuple(float(x) for x in self.cfg.tire_rack_inner_center),
+            tuple(float(x) for x in self.cfg.tire_rack_outer_center),
+        )
+        uids: List[int] = []
+        for cx, cy, cz in centers:
+            col = p.createCollisionShape(
+                p.GEOM_BOX,
+                halfExtents=list(he),
+                physicsClientId=self.client,
+            )
+            vis = p.createVisualShape(
+                p.GEOM_BOX,
+                halfExtents=list(he),
+                rgbaColor=list(rgba),
+                physicsClientId=self.client,
+            )
+            uid = p.createMultiBody(
+                baseMass=0.0,
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=vis,
+                basePosition=[cx, cy, cz],
+                baseOrientation=[0.0, 0.0, 0.0, 1.0],
+                physicsClientId=self.client,
+            )
+            # Higher friction so the cradle keeps the tread from slipping
+            # off when the gripper bumps the tire on approach. Spinning
+            # friction stays mild — we don't want grip-induced torque
+            # spikes from a phantom contact.
+            p.changeDynamics(
+                uid,
+                -1,
+                lateralFriction=1.0,
+                spinningFriction=0.005,
+                physicsClientId=self.client,
+            )
+            uids.append(uid)
+        return uids
+
     def _spawn_tire(self) -> int:
-        base_pos_A = np.asarray(self.cfg.robot_A_base_pos, dtype=np.float64)
-        tire_pos = base_pos_A + np.asarray(self.cfg.tire_spawn_offset_from_robot_a,
-                                              dtype=np.float64)
-        tire_orn = rpy_to_quat([0.0, -np.pi / 2, 0.0])
+        # Phase 1 FSM: tire starts on the dual-block rack next to UR10,
+        # standing vertically. The env will pin/release this body through
+        # FSM transitions (Stage 0 = pinned to rack, Stage 1/2 = grasped).
+        tire_pos = np.asarray(self.cfg.tire_pickup_pos, dtype=np.float64)
+        # Spawn orientation comes from ``cfg.tire_spawn_rpy`` (default
+        # (0, π/2, 0) → bore axis = world +X, facing robot A). The grasp
+        # constraint reproduces this exact orientation when Stage 0 → 1
+        # fires.
+        spawn_rpy = tuple(float(x) for x in self.cfg.tire_spawn_rpy)
+        tire_orn = np.asarray(
+            p.getQuaternionFromEuler(list(spawn_rpy)),
+            dtype=np.float64,
+        )
         uid, has_disk = models.create_tire_wheel_multibody(
             self.client,
             self.cfg,

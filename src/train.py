@@ -25,7 +25,7 @@ from __future__ import annotations
 import argparse
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -123,9 +123,93 @@ class RewardBreakdownCallback(BaseCallback):
         self._ik_n = 0
 
 
+class ApproachTolCurriculumCallback(BaseCallback):
+    """Schedules the Stage 0 → 1 pickup gate ``approach_tol`` over training.
+
+    Layout — three regimes keyed on the PPO ``num_timesteps`` counter:
+
+      ``t ≤ soft_steps``                       → tol = ``soft``
+      ``soft_steps < t ≤ soft + ramp``         → tol = linear(soft → hard)
+      ``t  > soft + ramp``                      → tol = ``hard``
+
+    The schedule re-broadcasts the current tol to **all** sub-envs at
+    every rollout boundary via ``env_method``. Using ``num_timesteps``
+    (the global PPO step counter, summed across ``num_envs`` workers)
+    keeps the schedule independent of vec-env parallelism and exactly
+    matches the CLI / config view of "total timesteps".
+
+    Logged scalars (TensorBoard / monitor):
+      - ``curriculum/approach_tol``       — current scheduled tol (m)
+      - ``curriculum/approach_tol_frac``  — interpolation progress 0..1
+    """
+
+    def __init__(
+        self,
+        soft: float,
+        hard: float,
+        soft_steps: int,
+        ramp_steps: int,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._soft = float(soft)
+        self._hard = float(hard)
+        self._soft_steps = int(max(0, soft_steps))
+        self._ramp_steps = int(max(1, ramp_steps))
+        self._last_pushed: Optional[float] = None
+
+    def _scheduled_tol(self, t: int) -> Tuple[float, float]:
+        if t <= self._soft_steps:
+            return self._soft, 0.0
+        frac = (t - self._soft_steps) / float(self._ramp_steps)
+        if frac >= 1.0:
+            return self._hard, 1.0
+        return self._soft * (1.0 - frac) + self._hard * frac, frac
+
+    def _broadcast(self, tol: float) -> None:
+        try:
+            self.training_env.env_method("set_approach_tol", tol)
+        except AttributeError:
+            # DummyVecEnv path (num_envs == 1) supports env_method too;
+            # fall back silently if a wrapper hides it.
+            pass
+
+    def _on_training_start(self) -> None:
+        tol, _ = self._scheduled_tol(int(self.model.num_timesteps))
+        self._last_pushed = tol
+        self._broadcast(tol)
+        if self.verbose:
+            print(f"[curriculum] approach_tol init = {tol:.3f} m "
+                  f"(t={self.model.num_timesteps})")
+
+    def _on_step(self) -> bool:
+        # Cheap to call every rollout step — env_method is a no-op when
+        # the value hasn't changed (we guard with ``_last_pushed``).
+        return True
+
+    def _on_rollout_end(self) -> None:
+        t = int(self.model.num_timesteps)
+        tol, frac = self._scheduled_tol(t)
+        if self._last_pushed is None or abs(tol - self._last_pushed) > 1e-6:
+            self._broadcast(tol)
+            self._last_pushed = tol
+            if self.verbose:
+                print(f"[curriculum] approach_tol = {tol:.3f} m "
+                      f"(t={t}, frac={frac:.3f})")
+        self.logger.record("curriculum/approach_tol", float(tol))
+        self.logger.record("curriculum/approach_tol_frac", float(frac))
+
+
 def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
     cbs: list[BaseCallback] = []
     cbs.append(RewardBreakdownCallback())
+    cbs.append(ApproachTolCurriculumCallback(
+        soft=args.approach_tol_soft,
+        hard=args.approach_tol_hard,
+        soft_steps=args.approach_tol_curriculum_steps,
+        ramp_steps=args.approach_tol_ramp_steps,
+        verbose=1,
+    ))
     cbs.append(CheckpointCallback(
         save_freq=max(args.save_freq // max(args.num_envs, 1), 1),
         save_path=str(out_dir / "ckpts"),
@@ -211,6 +295,28 @@ def main() -> int:
                     help="Weight on dense process reward branch (override ``RewardConfig.mix_dense``).")
     ap.add_argument("--mix-sparse-success", type=float, default=None,
                     help="Weight on sparse success (override ``RewardConfig.mix_sparse_success``).")
+    ap.add_argument(
+        "--dense-baseline-with-shaping",
+        type=str,
+        default="",
+        metavar="BOOL",
+        help=(
+            "true/false: when shaping is on (stage 4), keep the absolute "
+            "distance penalty (align_A+reach_B) as a baseline so the policy is "
+            "not driven by per-step state diffs alone. Empty = RewardConfig "
+            "default (True)."
+        ),
+    )
+    ap.add_argument(
+        "--dense-baseline-scale",
+        type=float,
+        default=None,
+        help=(
+            "Scale on the absolute-distance baseline when blended with shaping "
+            "(override ``RewardConfig.w_dense_baseline_scale``). 1.0 keeps the "
+            "same magnitude as stages 1–3; lower it to let shaping dominate."
+        ),
+    )
     ap.add_argument("--save-freq", type=int, default=50_000,
                     help="Checkpoint every N global env steps.")
     ap.add_argument("--eval-freq", type=int, default=25_000,
@@ -236,6 +342,44 @@ def main() -> int:
     ap.add_argument("--max-grad-norm", type=float, default=0.5)
     ap.add_argument("--net-arch", type=str, default="256,256",
                     help="Comma-separated hidden layer widths for MlpPolicy.")
+
+    # Pickup-gate curriculum (Stage 0 → 1 trigger) — defaults follow EnvConfig.
+    _cfg_defaults = EnvConfig()
+    ap.add_argument(
+        "--approach-tol-soft",
+        type=float,
+        default=_cfg_defaults.approach_tol_soft,
+        help=(
+            "Soft / lenient pickup-gate radius (m) used until "
+            "``--approach-tol-curriculum-steps`` global steps elapse. "
+            "Lets a pre-trained hover policy still pay R_pickup early "
+            "in the new raised-rack layout."
+        ),
+    )
+    ap.add_argument(
+        "--approach-tol-hard",
+        type=float,
+        default=_cfg_defaults.approach_radius_tol,
+        help=(
+            "Final / strict pickup-gate radius (m) the curriculum "
+            "asymptotes to. Defaults to ``EnvConfig.approach_radius_tol``."
+        ),
+    )
+    ap.add_argument(
+        "--approach-tol-curriculum-steps",
+        type=int,
+        default=_cfg_defaults.approach_tol_curriculum_steps,
+        help="Hold ``--approach-tol-soft`` for this many global PPO steps.",
+    )
+    ap.add_argument(
+        "--approach-tol-ramp-steps",
+        type=int,
+        default=_cfg_defaults.approach_tol_ramp_steps,
+        help=(
+            "Linear ramp length (global PPO steps) from soft to hard "
+            "after the hold phase."
+        ),
+    )
 
     # Physics overrides (Bulleted defaults live in EnvConfig)
     ap.add_argument("--physics-num-sub-steps", type=int, default=None)
@@ -315,6 +459,13 @@ def main() -> int:
             cfg.reward.mix_dense = float(args.mix_dense)
         if args.mix_sparse_success is not None:
             cfg.reward.mix_sparse_success = float(args.mix_sparse_success)
+        if args.dense_baseline_with_shaping.strip():
+            s = args.dense_baseline_with_shaping.strip().lower()
+            cfg.reward.use_dense_baseline_with_shaping = s in (
+                "1", "true", "t", "yes", "y"
+            )
+        if args.dense_baseline_scale is not None:
+            cfg.reward.w_dense_baseline_scale = float(args.dense_baseline_scale)
         return cfg
 
     if args.num_envs > 1:

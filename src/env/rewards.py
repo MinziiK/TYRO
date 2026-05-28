@@ -39,6 +39,17 @@ class RewardBreakdown:
     axial_dot_th: float = 0.0
     lateral_th: float = 0.0
     lug_spin_err_rad: float = 0.0
+    # Phase 1 FSM additions
+    approach_A: float = 0.0   # Stage 0 dense term (w_approach * exp(-d/τ))
+    return_A: float = 0.0     # Stage 2 dense term (w_return   * exp(-d/τ))
+    landing: float = 0.0      # Stage 2 soft-landing term
+    vertical_pen: float = 0.0 # Always-on tire vertical-pose penalty
+    fsm_bonus: float = 0.0    # Sum of pickup / mount / return one-shot bonuses
+    fail_pen: float = 0.0     # One-shot failure penalty on early termination
+    pb_shape: float = 0.0     # Potential-based shaping (Δd_approach / Δd_return)
+    d_approach: float = 0.0
+    d_return: float = 0.0
+    d_v_descend: float = 0.0
 
 
 def align_reward(tire_pos, hub_pos, tire_axis, hub_axis,
@@ -118,14 +129,40 @@ def workspace_penalty(out_of_workspace: bool, cfg: RewardConfig) -> float:
     return -cfg.w_workspace if out_of_workspace else 0.0
 
 
-def action_penalty(action: np.ndarray, cfg: RewardConfig) -> float:
-    a = np.asarray(action, dtype=np.float64)
+def _action_mask(action: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+    """Multiply action by ``mask`` when provided.
+
+    ``mask`` is a 1-D array of the same length as ``action``. The env
+    builds it once with ``np.ones(13)`` and zeros out the Panda slice
+    ``[6:12]`` whenever ``cfg.freeze_robot_b`` is True (Phase 1). This
+    keeps the **action / observation dimensions unchanged** (13-d /
+    89-d) so checkpoints stay binary-compatible across Phase 1 → 2/3
+    transitions, while removing the Panda channels' contribution to
+    ``action`` / ``jerk`` regularisation so PPO doesn't waste capacity
+    pinning them to zero during Phase 1.
+    """
+    if mask is None:
+        return action
+    return action * mask
+
+
+def action_penalty(
+    action: np.ndarray,
+    cfg: RewardConfig,
+    mask: Optional[np.ndarray] = None,
+) -> float:
+    a = np.asarray(_action_mask(action, mask), dtype=np.float64)
     return -cfg.w_action * float(np.dot(a, a))
 
 
-def jerk_penalty(action: np.ndarray, prev_action: np.ndarray, cfg: RewardConfig) -> float:
-    a = np.asarray(action, dtype=np.float64)
-    pa = np.asarray(prev_action, dtype=np.float64)
+def jerk_penalty(
+    action: np.ndarray,
+    prev_action: np.ndarray,
+    cfg: RewardConfig,
+    mask: Optional[np.ndarray] = None,
+) -> float:
+    a = np.asarray(_action_mask(action, mask), dtype=np.float64)
+    pa = np.asarray(_action_mask(prev_action, mask), dtype=np.float64)
     diff = a - pa
     return -cfg.w_jerk * float(np.dot(diff, diff))
 
@@ -137,13 +174,31 @@ def shaping_reward(prev_d: Optional[float], curr_d: float, weight: float) -> flo
     return weight * (prev_d - curr_d)
 
 
+def dense_core_value(parts: dict, use_shaping: bool, rcfg: RewardConfig) -> float:
+    """Geometric dense core: shaping, absolute-distance penalty, or their sum.
+
+    - ``use_shaping`` False ⇒ classic stages 1–3 behaviour
+      ``dense_core = align_A + reach_B`` (= ``- w_d * d - w_theta * theta``).
+    - ``use_shaping`` True with ``use_dense_baseline_with_shaping`` False ⇒
+      pure potential shaping ``shape_A + shape_B``.
+    - ``use_shaping`` True with ``use_dense_baseline_with_shaping`` True
+      (default, Solution A) ⇒ ``shape_* + w_dense_baseline_scale * align/reach``
+      so the absolute distance penalty acts as a baseline that keeps pulling the
+      policy toward the target even when the shaping increment is ≈ 0.
+    """
+    align = float(parts.get("align_A", 0.0) + parts.get("reach_B", 0.0))
+    shape = float(parts.get("shape_A", 0.0) + parts.get("shape_B", 0.0))
+    if not use_shaping:
+        return align
+    if rcfg.use_dense_baseline_with_shaping:
+        return shape + rcfg.w_dense_baseline_scale * align
+    return shape
+
+
 def aggregate(parts: dict, use_shaping: bool, rcfg: RewardConfig) -> float:
     """Combine dense process reward with sparse success using configured mix."""
     common = ("coop", "sync_joint_A", "collision", "workspace", "action", "jerk")
-    if use_shaping:
-        dense_core = float(parts.get("shape_A", 0.0) + parts.get("shape_B", 0.0))
-    else:
-        dense_core = float(parts.get("align_A", 0.0) + parts.get("reach_B", 0.0))
+    dense_core = dense_core_value(parts, use_shaping, rcfg)
     dense = dense_core + float(sum(parts.get(k, 0.0) for k in common))
     succ = float(parts.get("success", 0.0))
     return (

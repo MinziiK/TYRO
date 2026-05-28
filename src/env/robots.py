@@ -219,11 +219,20 @@ class Robot:
         # Clamp to limits before sending.
         arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
 
+        # Stiffer PD (positionGain 0.1 → 1.0; default velocityGain stays 1.0)
+        # so the arm actually holds the commanded joint posture when a
+        # mass (e.g. the 0.5 kg tire bonded to the UR10 EE) is attached.
+        # Without this the joints visibly droop under gravity, dragging
+        # the tire down and rolling it relative to the world — exactly
+        # the "wobble / sag" symptom we want to eliminate.
+        n = self.arm.n
         p.setJointMotorControlArray(
             self.uid, self.arm.indices,
             controlMode=p.POSITION_CONTROL,
             targetPositions=arm_targets.tolist(),
-            forces=[150.0] * self.arm.n,
+            forces=[150.0] * n,
+            positionGains=[1.0] * n,
+            velocityGains=[1.0] * n,
             physicsClientId=self.client,
         )
 
@@ -235,7 +244,25 @@ class Robot:
 class UR10Robot(Robot):
     NAME = "ur10"
     EE_LINK_INDEX = 7  # robot_ee_link
-    HOME_POSE = (0.0, -1.2, 1.4, -1.7, -1.57, 0.0)
+    # Dual-block-rack layout (hub at origin, base at (−0.40, −0.80, −0.62),
+    # pickup COM at (−1.50, −0.80, −0.145), 6 o'clock outer point at
+    # (−1.50, −0.80, −0.67)):
+    #
+    # HOME places the EE at (−1.50, −0.80, −0.05) — 62 cm directly above
+    # the grasp target, centred in the 20 cm-wide X gap between the two
+    # support blocks. Tool +Z is aligned to world +Z to within 0.00°
+    # (EE RPY = (0°, 0°, −90°)), so the gripper cup points at the sky.
+    # The Stage-0 task is reduced to a pure −Z descent through the gap;
+    # no wrist twist is needed to capture the 6 o'clock tread point.
+    #
+    # The 62 cm clearance exceeds ``approach_radius_tol`` (60 cm) so the
+    # FSM does *not* trigger Stage 0 → 1 on env-step 0. wrist_3 = +0.2327
+    # is the (−6.0505 mod 2π) wrap of the IK output, equivalent under
+    # joint kinematics but kept inside [−π, π] for readability.
+    #
+    # Re-run scripts/calibrate_home_pose.py to refresh after any change
+    # to the base position, rack geometry, or approach radius tolerance.
+    HOME_POSE = (2.9089, -0.0246, -0.5518, -2.5652, 0.2327, 0.0000)
 
     def __init__(self, client: int, cfg: EnvConfig):
         super().__init__(
@@ -262,7 +289,20 @@ class UR10Robot(Robot):
 class PandaRobot(Robot):
     NAME = "panda"
     EE_LINK_INDEX = 11  # panda_grasptarget
-    HOME_POSE = (0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785)
+    # Hub-centric layout (base at (+0.40, −0.80, −0.22)): EE parked at
+    # (+0.15, −0.30, 0.00) with **tool +Z aligned to world +Y** (R_x(−π/2)),
+    # so the wrist already faces the hub bolts head-on with no 90° twist.
+    # Phase 1 freeze pose: standard Franka "ready" config
+    #   (0, -π/4, 0, -3π/4, 0, π/2, π/4)
+    # EE is parked ~0.30 m forward (+X local = +X world) and ~0.49 m
+    # above the panda base, *facing away* from Robot A. With Panda base
+    # at (+1.20, -0.80, -0.22) the EE world pose is roughly
+    # (+1.50, -0.80, +0.27) — completely outside Robot A's carry
+    # envelope (X ∈ [-1.65, +0.15]) so it cannot interfere during
+    # Phase 1 tire transport even if the freeze were lifted.
+    # Phase 2/3 will re-calibrate via scripts/calibrate_home_pose.py
+    # when Panda becomes active for bolt tightening.
+    HOME_POSE = (0.0, -0.7854, 0.0, -2.3562, 0.0, 1.5708, 0.7854)
 
     def __init__(self, client: int, cfg: EnvConfig):
         # panda urdf is shipped with pybullet_data; ensure search path is set.
