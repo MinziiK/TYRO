@@ -165,6 +165,14 @@ class Robot:
         for idx, q in zip(self.arm.indices, self.arm.rest):
             p.resetJointState(self.uid, idx, targetValue=float(q),
                               targetVelocity=0.0, physicsClientId=self.client)
+        # Seed the absolute IK target with the HOME EE forward kinematics.
+        # ``apply_delta_ee`` accumulates Δpos onto this analytical target
+        # rather than rebasing on the (gravity-perturbed) measured EE pose
+        # every step — without this seed, the first ``cur_pos`` read after
+        # reset would already include sub-millimetre sag from the 5-step
+        # settle in ``TyroEnv.reset`` and lock the policy onto a sagging
+        # baseline for the rest of the episode.
+        self.last_target_pos = self.ee_pose()[0].copy()
 
     def joint_state(self) -> Tuple[np.ndarray, np.ndarray]:
         states = p.getJointStates(self.uid, self.arm.indices,
@@ -279,16 +287,21 @@ class UR10Robot(Robot):
     #   shoulder_lift = −1.1344  ( ≈ −65° — shoulder tipped up)
     #   elbow         = +1.1344  ( ≈ +65° — elbow folded, avoids singularity)
     #   shoulder_pan  = +180°   shoulder_lift = −65°   elbow = +130°
-    #   wrist_1 = −155°   wrist_2 = +180°   wrist_3 = +90°
-    HOME_POSE = (3.1416, -1.1345, 2.2689, -2.7053, 3.1416, 1.5708)
+    #   wrist_1 = −155°   wrist_2 = 0°    wrist_3 = −90°
+    HOME_POSE = (3.14159, -1.13446, 2.26893, -2.70526, 0.0, -1.57080)
 
     #: ``FINAL_LOCK_QUATERNION`` — the FULL 3-D EE orientation that IK is
     #: pinned to when ``EnvConfig.ur10_lock_tool_up`` is True. Equal to the
-    #: FK of ``HOME_POSE`` so a reset-then-step round-trip is a fixed point
-    #: of IK (no wrist drift). Re-measure with ``scripts/verify_home.py``
-    #: if ``HOME_POSE`` changes. ``TOOL_UP_QUATERNION`` kept as an alias.
+    #: FK of ``HOME_POSE`` under the palm-up pose
+    #: ``[180, −65, 130, −155, 0, −90]°``: tool +Z ‖ world +Z (palm up),
+    #: tool +X ‖ world −Y (finger-closure points away from the truck),
+    #: tool +Y ‖ world +X. The wrist_2 link still lies flat in XY but
+    #: rotated 180° about world Z vs the previous "+180/+90" variant.
+    #: Re-measure with ``scripts/verify_home.py`` whenever ``HOME_POSE``
+    #: changes. ``TOOL_UP_QUATERNION`` is kept as a backwards-compatible
+    #: alias.
     FINAL_LOCK_QUATERNION = (
-        +3.082280e-02, -3.082257e-02, -7.064321e-01, +7.064372e-01,
+        9.381810e-07, -9.381835e-07, -0.7071077, 0.7071058,
     )
     TOOL_UP_QUATERNION = FINAL_LOCK_QUATERNION
 
@@ -303,74 +316,87 @@ class UR10Robot(Robot):
         )
 
     def apply_delta_ee(self, delta_pos: np.ndarray, delta_axisangle: np.ndarray) -> None:
-        """Δpos drives EE translation. When ``ur10_lock_tool_up`` is True the
-        UR10 is constrained to a **vertical parallel link** topology:
+        """Δpos drives EE translation. When ``ur10_lock_tool_up`` is True:
 
-        * IK is run **position-only** (no ``targetOrientation``).
-        * ``elbow_target = π/2 − shoulder_lift_target`` is forced from the IK
-          output so the forearm pillar stays vertical (world +Z) at every
-          control step.
-        * ``wrist_1 = wrist_2 = wrist_3 = 0`` strictly, holding the gripper
-          palm flat against world +Z with no cluster twist.
+        * IK is run with a **fixed 6-D target** — position from the
+          policy's Δpos, orientation **always** equal to
+          :pyattr:`FINAL_LOCK_QUATERNION` (the FK of ``HOME_POSE`` where
+          tool +Z ‖ world +Z and the wrist_2 link is laid flat in XY).
+        * **No post-IK clamp.** All six joints are free for IK to solve.
+          The wrist_2 joint auto-compensates for ``shoulder_lift +
+          elbow + wrist_1`` motion so that the tool +Z axis stays
+          aligned with world +Z; wrist_3 is whatever satisfies the
+          fixed finger closure direction baked into the quaternion.
+        * Geometric intuition: ``shoulder_pan`` rotation is invisible to
+          tool +Z (rotating about world Z fixes the +Z vector). The
+          ``shoulder_lift / elbow / wrist_1`` chain pitches the wrist
+          cluster up/down; ``wrist_2`` is the one DOF needed to undo
+          that pitch and keep the gripper palm flat.
 
-        Effectively the arm becomes a 2-DOF (shoulder_pan, shoulder_lift)
-        SCARA-on-a-stick — the policy's Δpos commands the EE in cylindrical
-        coordinates around the UR10 base, while the wrist + forearm remain
-        a rigid vertical T. ``delta_axisangle`` is ignored in lock mode
-        (env also zeroes it; defence-in-depth)."""
-        cur_pos, cur_orn = self.ee_pose()
-        target_pos = cur_pos + np.asarray(delta_pos, dtype=np.float64)
-        self.last_target_pos = target_pos
+        ``delta_axisangle`` is ignored in lock mode (the env also zeroes
+        it before calling — defence-in-depth).
+
+        **Drift-free absolute target accumulator.** Δpos is added to
+        ``self.last_target_pos`` (seeded at HOME-EE FK in
+        ``reset_to_home``) rather than to the measured EE pose. Gravity
+        sag, IK numerical jitter, and joint-limit clamping all cause the
+        measured EE to lag the commanded target by 1–30 cm depending on
+        load; rebasing on ``cur_pos`` every step would compound that lag
+        into a runaway drift (~0.3 cm/step under the current PD gains).
+        Using a pure mathematical accumulator means the motor always
+        fights *back* to the original analytical target — sag becomes a
+        bounded steady-state offset instead of an unbounded sink."""
+        if self.last_target_pos is None:
+            self.last_target_pos = self.ee_pose()[0].copy()
+        self.last_target_pos = self.last_target_pos + np.asarray(
+            delta_pos, dtype=np.float64
+        )
+        target_pos = self.last_target_pos
 
         if self._lock_tool_up:
-            ik = p.calculateInverseKinematics(
-                self.uid, self.EE_LINK_INDEX,
-                list(target_pos),
-                lowerLimits=self.arm.lower.tolist(),
-                upperLimits=self.arm.upper.tolist(),
-                jointRanges=self.arm.range.tolist(),
-                restPoses=self.arm.rest.tolist(),
-                maxNumIterations=50,
-                residualThreshold=1e-3,
-                physicsClientId=self.client,
-            )
+            target_orn = list(self.FINAL_LOCK_QUATERNION)
         else:
+            _cur_pos, cur_orn = self.ee_pose()
             d_quat = axisangle3_to_quat(delta_axisangle)
             target_orn = list(quat_multiply(d_quat, cur_orn))
-            ik = p.calculateInverseKinematics(
-                self.uid, self.EE_LINK_INDEX,
-                list(target_pos), target_orn,
-                lowerLimits=self.arm.lower.tolist(),
-                upperLimits=self.arm.upper.tolist(),
-                jointRanges=self.arm.range.tolist(),
-                restPoses=self.arm.rest.tolist(),
-                maxNumIterations=50,
-                residualThreshold=1e-3,
-                physicsClientId=self.client,
-            )
+
+        ik = p.calculateInverseKinematics(
+            self.uid, self.EE_LINK_INDEX,
+            list(target_pos), target_orn,
+            lowerLimits=self.arm.lower.tolist(),
+            upperLimits=self.arm.upper.tolist(),
+            jointRanges=self.arm.range.tolist(),
+            restPoses=self.arm.rest.tolist(),
+            maxNumIterations=200,
+            residualThreshold=1e-4,
+            physicsClientId=self.client,
+        )
         ik = np.asarray(ik, dtype=np.float64)
         max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
         if len(ik) > max_slot:
             arm_targets = ik[self._ik_arm_slots]
         else:
             arm_targets = self._fallback_targets()
-        if self._lock_tool_up:
-            # Clamp every wrist joint back to its HOME_POSE value at every
-            # step so the wrist cluster moves as a rigid block in world
-            # frame. (Elbow is left to IK — earlier "elbow = π/2 − lift"
-            # vertical-pillar rule was removed because it conflicted with
-            # generic HOME poses.)
-            arm_targets[3] = float(self.HOME_POSE[3])
-            arm_targets[4] = float(self.HOME_POSE[4])
-            arm_targets[5] = float(self.HOME_POSE[5])
         arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
-        n = self.arm.n
-        forces = [150.0] * n
-        pgains = [1.0] * n
-        vgains = [1.0] * n
-        if self._lock_tool_up:
-            for i in (3, 4, 5):
-                forces[i] = 1500.0  # stiff wrist hold
+        # Per-joint torque caps (N·m) realistic to the UR10 datasheet, in the
+        # same order as ``_arm_joint_indices`` returns them (shoulder_pan,
+        # shoulder_lift, elbow, wrist_1, wrist_2, wrist_3). The original
+        # uniform 150 N·m was too weak for the large lower joints (real
+        # UR10 shoulder/elbow caps are 150–330 N·m) and overspec'ed for
+        # the wrists (real ≤ 56 N·m), causing visible gravity sag at HOME
+        # while leaving the wrists too "twitchy" to converge against PD.
+        # New caps: 400/400/300 for shoulder/elbow give a healthy buffer
+        # over the worst-case static gravity moment (~120 N·m at HOME
+        # under a 0.5 kg tire load) and 60 for the wrists matches the
+        # real torque-limited region while still beating wrist inertia.
+        forces = [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
+        # ``positionGain`` restored to 1.0 — combined with the new
+        # force caps it gives stiff hold without the 21 cm steady-state
+        # sag that 0.3 produced. The drift-free target accumulator
+        # above means there is no longer a positive feedback loop
+        # between sag and IK target, so we can afford the stiffer PD.
+        pgains = [1.0] * len(forces)
+        vgains = [1.0] * len(forces)
         p.setJointMotorControlArray(
             self.uid, self.arm.indices,
             controlMode=p.POSITION_CONTROL,

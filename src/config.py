@@ -290,31 +290,31 @@ class EnvConfig:
     #: Phase 1 FSM — tire pickup pose (Robot B-centric world frame).
     #: Tire spawns standing vertically with its **bore axis pointing at
     #: robot A (world +X)** so the bore hole is visible from the robot
-    #: side. The dual-block rack is a short Y-split (two 30 cm rails
-    #: along X, **30 cm Y-gap** centred on the bore axis). Geometry
-    #: budget:
+    #: side. The dual-block rack is a Y-split V-cradle (two 30 cm rails
+    #: along X, **50 cm Y-gap**, **45 cm tall** rails — see
+    #: ``tire_rack_*`` below). Geometry budget:
     #:   * X = −1.90: tire thickness 0.30 m along the bore axis → tire
     #:     spans X ∈ [−2.05, −1.75]. Both rack rails span X ∈ [−2.05,
     #:     −1.75] (30 cm long), flush with the tread's front + back
-    #:     faces — the +X end of the rails clears the gripper plunge
-    #:     corridor by exactly tire_thickness/2.
+    #:     faces.
     #:   * Y = 0.00: bore axis world +X, tread plane in Y-Z → tire
     #:     spans Y ∈ [−0.525, +0.525] (1.05 m diameter). Inner rail at
-    #:     Y = +0.20 / outer rail at Y = −0.20 act as a *containment
-    #:     channel* on the bore-axis centreline (30 cm Y-gap at
-    #:     Y ∈ [−0.15, +0.15]). The tread's 6 o'clock line sits
-    #:     directly in this gap; static stability is held by
-    #:     ``_pin_tire_to_world`` (mass = 0 freeze) until Stage 0 → 1.
-    #:   * Z = ``rack_top + tire_outer_radius`` = −0.30 + 0.525 = +0.225.
-    #:     Rail top plane was raised to **match Robot A's base Z = −0.30**
-    #:     (= floor + 0.30 m), so the grasp target sits exactly on the
-    #:     UR10 base plane — the IK has zero Z-offset to the EE and the
-    #:     pickup approach reduces to a planar reach.
-    #: UR10 base ↔ pickup grasp target distance = 1.10 m (~84 % of the
-    #: UR10's 1.30 m max reach — within the dexterous sweet spot). Stage
-    #: 1 trajectory pickup → hub centre is ≈ 2.05 m (dominant carry skill,
-    #: pickup ↔ hub Z gap < 1 cm so the carry is effectively horizontal).
-    tire_pickup_pos: Tuple[float, float, float] = (-1.90, 0.0, 0.225)
+    #:     Y = +0.30 / outer rail at Y = −0.30. The tire's tread rests
+    #:     on the inner-top corners of both rails at (Y = ±0.25,
+    #:     Z = −0.15), forming a stable V-cradle. The 6 o'clock line
+    #:     (Y = 0) sits in the 50 cm Y-gap; static stability is held
+    #:     by ``_pin_tire_to_world`` (mass = 0 freeze) at the cradle
+    #:     equilibrium until Stage 0 → 1 fires.
+    #:   * Z = rail_top + √(R² − 0.25²) = −0.15 + 0.46165 = **+0.3117**.
+    #:     This is the geometric resting COM where the tread surface
+    #:     just touches the rail inner-top corners. The 6 o'clock anchor
+    #:     ends up at Z = COM − R = **−0.2133** (≈ 6.3 cm below the
+    #:     rail top, inside the 50 cm Y-gap).
+    #: UR10 base ↔ pickup grasp target ≈ 1.10 m planar (the 7.7 cm Z
+    #: offset from the UR10 base plane Z = −0.30 to grasp Z = −0.213 is
+    #: well within the IK's reach margin). Stage 1 trajectory pickup
+    #: → hub centre is ≈ 2.05 m (dominant carry skill).
+    tire_pickup_pos: Tuple[float, float, float] = (-1.90, 0.0, 0.3117)
     #: Tire spawn orientation as RPY. (0, π/2, 0) sends the tire's local
     #: +Z (bore axis) to **world +X** so the bore opening faces robot A
     #: directly (the robot sits at +X relative to the tire). The mount
@@ -452,49 +452,56 @@ class EnvConfig:
     # ------------------------------------------------------------------
     #: Two short rails along the X direction (30 cm long each, matching
     #: the tire's bore-axis thickness) flanking the tire in Y with a
-    #: **wide 30 cm Y-gap** centred on the bore axis (Y = 0 — the robot
-    #: bank centreline). The gap is sized so the UR10 forearm + gripper
-    #: assembly can plunge straight down through it without clipping
-    #: either rail.
+    #: **50 cm Y-gap** centred on the bore axis (Y = 0). The rails form
+    #: a V-cradle: the tire (radius 0.525 m) rests with its tread
+    #: surface in contact with the inner-top corners of both rails
+    #: (Y = ±0.25, Z = rail_top). **2026-05-29 (rev 3)**: revised again
+    #: from the 70 cm gap so the tire physically sits on the rack
+    #: instead of floating above it. The 50 cm Y-gap leaves 25 cm of
+    #: tread overhang on each side, enough for a stable cradle while
+    #: still giving the UR10 gripper a comfortable plunge corridor
+    #: (effective free Y at the 6 o'clock contact line ≈ 50 cm).
     #:
     #: NOTE on the bore=+X spawn (``tire_spawn_rpy = (0, π/2, 0)``):
     #: with the tire bore facing robot A in +X, the 6 o'clock outer
-    #: tread point is a *single* line at (X∈[-2.05, -1.75], Y=0,
-    #: Z=-0.30) — i.e. it sits exactly in the middle of the Y-gap with
-    #: no tread surface directly contacting the rail tops. The rails
-    #: function as *visual / containment* guides rather than load-
-    #: bearing supports in this configuration; static stability comes
-    #: from ``_pin_tire_to_world`` (mass=0 freeze) which holds the tire
-    #: at its spawn pose until Stage 0 → 1 fires. The rails still
-    #: define the gripper's safe-entry corridor (Y∈[-0.15, +0.15]).
+    #: tread line at Y = 0 sits **below** the rail top plane (Z =
+    #: -0.213 vs rail top Z = -0.15) — the cradle geometry pulls the
+    #: tire's bottom into the gap. The gripper still approaches from
+    #: above through the gap (Y = 0, gap width 0.50 m) and dives to
+    #: Z ≈ -0.21 to reach the 6 o'clock anchor; no rail clipping since
+    #: the gripper centreline is 25 cm from either rail face.
     #:
-    #: Rail tops are pinned to **Robot A's base plane Z = -0.30** (= floor
-    #: + 0.30 m, the same 30 cm plinth that lifts the UR10 base). With
-    #: the gripper Z target sitting on the UR10 base plane, the pickup
-    #: IK collapses to a planar 1.10 m horizontal reach (Z-offset = 0)
-    #: and the UR10 wrist no longer has to dive below the rail top.
+    #: Static stability is maintained by ``_pin_tire_to_world``
+    #: (mass = 0 freeze) which holds the tire at the cradle equilibrium
+    #: pose until Stage 0 → 1 fires.
     #:
     #: Geometry (Robot B-centric, ``tire_outer_radius = 0.525``,
     #: ``tire_thickness = 0.30``, rails 30 cm long × 10 cm thick ×
-    #: 30 cm tall):
-    #:   * Inner rail Y range = [+0.15, +0.25] (centre +0.20 ± 0.05).
-    #:   * Outer rail Y range = [-0.25, -0.15] (centre -0.20 ± 0.05).
-    #:   * Gap in Y = [-0.15, +0.15], width **0.30 m** ✓
+    #: **45 cm tall**, ≈ 1.5× the original 30 cm height):
+    #:   * Inner rail Y range = [+0.25, +0.35] (centre +0.30 ± 0.05).
+    #:   * Outer rail Y range = [-0.35, -0.25] (centre -0.30 ± 0.05).
+    #:   * Gap in Y = [-0.25, +0.25], width **0.50 m** ✓
     #:   * Both rails X range = [-2.05, -1.75] (centre -1.90 ± 0.15) —
     #:     matches the tire's bore-axis extent X ∈ [-2.05, -1.75]
     #:     exactly, so the +X / −X ends of the rails terminate flush
     #:     with the tread's front and back faces.
-    #:   * Rail top plane = floor_z + 2·he_z = -0.60 + 0.30 = -0.30 ✓
-    #:     (= Robot A base Z, by design)
-    #:   * Tire COM Z = rail_top + R = -0.30 + 0.525 = +0.225 ✓
+    #:   * Rail Z range = [-0.60, -0.15]; centre -0.375, half-ext 0.225
+    #:     (= floor + 0.45 m height). Rail top Z = **-0.15** (was -0.30).
+    #:   * Tire COM Z = rail_top + √(R² − 0.25²)
+    #:                = -0.15 + √(0.275625 − 0.0625)
+    #:                = -0.15 + 0.46165
+    #:                ≈ **+0.3117** ✓ (tire rests on rail corners)
+    #:   * 6 o'clock anchor (Y=0): Z = COM_Z − R = -0.2133 — the gripper
+    #:     dives ≈ 6.3 cm below rail top inside the 50 cm Y-gap.
     spawn_tire_rack: bool = True
     #: Truck-side rail (inner = closer to the truck on the +Y side).
-    tire_rack_inner_center: Tuple[float, float, float] = (-1.90, 0.20, -0.45)
+    tire_rack_inner_center: Tuple[float, float, float] = (-1.90, 0.30, -0.375)
     #: Far-side rail (outer = on the −Y side, away from the truck).
-    tire_rack_outer_center: Tuple[float, float, float] = (-1.90, -0.20, -0.45)
-    #: 30 cm long (X) × 10 cm thick (Y) × **30 cm tall (Z)** rails —
-    #: Z half-extent 0.15 so rail top = floor + 0.30 m = Robot A base.
-    tire_rack_half_extents: Tuple[float, float, float] = (0.15, 0.05, 0.15)
+    tire_rack_outer_center: Tuple[float, float, float] = (-1.90, -0.30, -0.375)
+    #: 30 cm long (X) × 10 cm thick (Y) × **45 cm tall (Z)** rails —
+    #: Z half-extent 0.225 (1.5× the original 0.15) so rail top sits at
+    #: floor + 0.45 m = -0.15 m world.
+    tire_rack_half_extents: Tuple[float, float, float] = (0.15, 0.05, 0.225)
     tire_rack_rgba: Tuple[float, float, float, float] = (0.22, 0.24, 0.28, 1.0)
 
     # Bolt surface properties (helps avoid unrealistic sticking on micro-contacts).
@@ -512,12 +519,18 @@ class EnvConfig:
     #: step of every episode, removing it from the learning problem.
     #: ``make_env_config`` wires this to ``True`` for Phase 1.
     freeze_robot_b: bool = False
-    #: When True, UR10 IK pins the EE orientation to ``HOME_POSE`` FK and
-    #: clamps wrist joints — used previously for the palm-up cradle and
-    #: vertical-pillar experiments. Default off: PPO drives the full
-    #: 6-DOF EE pose (Δpos + Δrot) so the policy can solve approach
-    #: orientation on its own. Re-enable per-run if needed.
-    ur10_lock_tool_up: bool = False
+    #: When True, UR10 IK runs **position-only** and the wrist cluster
+    #: ``wrist_1 / wrist_2 / wrist_3`` is held at its ``HOME_POSE`` value
+    #: every step. The remaining 3 DOFs (``shoulder_pan / shoulder_lift /
+    #: elbow``) drive the EE position. Because ``shoulder_pan`` is the
+    #: world-Z rotation joint and ``R_z(·)(0,0,1) = (0,0,1)``, the tool
+    #: +Z axis stays parallel to world +Z for any pan value — i.e. the
+    #: gripper palm always faces straight up while shoulder/elbow reach
+    #: in the cylindrical XY plane. ``wrist_2 / wrist_3`` HOME values are
+    #: chosen so the wrist_2 link is laid flat in the XY plane and the
+    #: wrist_3 (tool roll) axis aligns with world +Z (see ``HOME_POSE``
+    #: in ``UR10Robot``). Default **True** for Phase 1.
+    ur10_lock_tool_up: bool = True
 
     # ------------------------------------------------------------------
     # Domain randomization (Phase 1 → Sim2Real bridge)
