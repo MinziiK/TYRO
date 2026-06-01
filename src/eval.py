@@ -8,6 +8,10 @@ Examples
     # Watch the policy in GUI, hold window after each episode:
     python -m src.eval <ckpt.zip> --render --episodes 3
 
+    # Phase-1 mount policy with easy-start (matches 75%% mix training):
+    python -m src.eval runs/.../best/best_model.zip --render --phase 1 \\
+        --easy-start --episodes 5
+
     # Evaluate at a different DR phase than training to check transfer:
     python -m src.eval <ckpt.zip> --phase 3
 """
@@ -26,24 +30,127 @@ from src.config import make_env_config
 from src.env import TyroEnv
 
 
+def _layout_overrides_for_checkpoint(model: PPO) -> dict:
+    """Match env action/obs layout to the checkpoint's training era."""
+    obs_d = int(model.observation_space.shape[0])
+    act_d = int(model.action_space.shape[0])
+    if obs_d == 85 and act_d == 6:
+        return {"include_hub_guide_obs": True}
+    if obs_d == 82 and act_d == 6:
+        return {"include_hub_guide_obs": False}
+    if obs_d == 83 and act_d == 7:
+        return {
+            "include_hub_guide_obs": False,
+            "legacy_action_dim": 7,
+            "legacy_obs_dim": 83,
+        }
+    raise ValueError(
+        f"Unsupported checkpoint layout: obs_dim={obs_d}, action_dim={act_d}. "
+        "Known layouts: (85,6) current, (82,6) pre-hub-guide, (83,7) legacy sharp."
+    )
+
+
+def _resolve_model_path(path: str) -> str:
+    """SB3 PPO.load appends '.zip'; strip it if the user passed '*.zip'."""
+    p = Path(path)
+    if not p.exists() and p.suffix.lower() == ".zip":
+        bare = p.with_suffix("")
+        if bare.with_suffix(".zip").exists():
+            return str(bare)
+    if p.suffix.lower() == ".zip" and p.exists():
+        return str(p.with_suffix(""))
+    return path
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("model", type=str, help="Path to .zip checkpoint.")
     ap.add_argument("--episodes", type=int, default=20)
     ap.add_argument("--stage", type=int, default=3, choices=[1, 2, 3, 4])
-    ap.add_argument("--phase", type=int, default=3, choices=[1, 2, 3])
+    ap.add_argument("--phase", type=int, default=1, choices=[1, 2, 3],
+                    help="DR phase (Phase-1 FSM checkpoints use --phase 1).")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--stochastic", action="store_true",
                     help="Sample actions instead of using deterministic mean.")
     ap.add_argument("--no-hold", action="store_true",
                     help="Don't hold the GUI window after the last episode.")
+    ap.add_argument(
+        "--easy-start",
+        action="store_true",
+        help="Force easy spawn every reset (tire near grasp, lift 0.10 m).",
+    )
+    ap.add_argument(
+        "--home-start",
+        action="store_true",
+        help="Force HOME spawn every reset (production eval, no easy mix).",
+    )
+    ap.add_argument(
+        "--mix-easy-prob",
+        type=float,
+        default=None,
+        help="Bernoulli easy probability per reset (mix mode). "
+        "Default: EnvConfig.start_pos_easy_prob (0.75 for v9b).",
+    )
+    ap.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Episode horizon (default: EnvConfig.max_steps).",
+    )
+    ap.add_argument(
+        "--terminate-on",
+        type=str,
+        default=None,
+        choices=("never", "pickup", "mount", "demount"),
+        help="FSM early-success gate (default: EnvConfig.terminate_on, usually 'never').",
+    )
     args = ap.parse_args()
+    if args.easy_start and args.home_start:
+        ap.error("Use only one of --easy-start or --home-start.")
 
-    cfg = make_env_config(stage=args.stage, phase=args.phase, render=args.render)
+    overrides: dict = dict(
+        render=args.render,
+        start_pos_curriculum_enable=True,
+        start_pos_curriculum_mode="mix",
+        contact_force_terminate_above=0.0,
+    )
+    if args.terminate_on is not None:
+        overrides["terminate_on"] = str(args.terminate_on)
+    if args.max_steps is not None:
+        overrides["max_steps"] = int(args.max_steps)
+    if args.mix_easy_prob is not None:
+        overrides["start_pos_easy_prob"] = float(args.mix_easy_prob)
+
+    model_path = _resolve_model_path(args.model)
+    print(f"[eval] loading {model_path}")
+    model = PPO.load(model_path, device="cpu")
+    layout = _layout_overrides_for_checkpoint(model)
+    overrides.update(layout)
+    print(
+        f"[eval] checkpoint layout: obs_dim={model.observation_space.shape[0]} "
+        f"action_dim={model.action_space.shape[0]} "
+        f"hub_guide={layout.get('include_hub_guide_obs', True)}"
+    )
+
+    cfg = make_env_config(stage=args.stage, phase=args.phase, **overrides)
     env = TyroEnv(cfg=cfg, render=args.render, seed=args.seed)
-    print(f"[eval] loading {args.model}")
-    model = PPO.load(args.model, device="cpu")  # CPU is plenty for inference
+    if args.easy_start:
+        # mix mode treats alpha>=1.0 as "use cfg"; 0.999 forces always-easy.
+        env.set_start_pos_easy_prob(0.999)
+        print("[eval] start pose: easy (forced)")
+    elif args.home_start:
+        env.set_start_pos_easy_prob(0.0)
+        print("[eval] start pose: HOME (forced)")
+    elif args.mix_easy_prob is not None:
+        env.set_start_pos_easy_prob(float(args.mix_easy_prob))
+        print(f"[eval] start pose: mix easy_prob={args.mix_easy_prob}")
+    else:
+        print(
+            f"[eval] start pose: mix easy_prob="
+            f"{getattr(cfg, 'start_pos_easy_prob', 0.5)} (EnvConfig default)"
+        )
+    print(f"[eval] terminate_on={cfg.terminate_on!r}  max_steps={cfg.max_steps}")
 
     successes: list[bool] = []
     rewards: list[float] = []

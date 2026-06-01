@@ -41,15 +41,24 @@ class RewardBreakdown:
     lug_spin_err_rad: float = 0.0
     # Phase 1 FSM additions
     approach_A: float = 0.0   # Stage 0 dense term (w_approach * exp(-d/τ))
-    return_A: float = 0.0     # Stage 2 dense term (w_return   * exp(-d/τ))
-    landing: float = 0.0      # Stage 2 soft-landing term
+    return_A: float = 0.0     # Stage 3 dense term (w_return   * exp(-d/τ))
+    landing: float = 0.0      # Stage 3 soft-landing term
     vertical_pen: float = 0.0 # Always-on tire vertical-pose penalty
-    fsm_bonus: float = 0.0    # Sum of pickup / mount / return one-shot bonuses
+    fsm_bonus: float = 0.0    # Sum of pickup / mount / demount / success bonuses
     fail_pen: float = 0.0     # One-shot failure penalty on early termination
     pb_shape: float = 0.0     # Potential-based shaping (Δd_approach / Δd_return)
+    step_alive: float = 0.0   # Per-step "alive" cost (mix-bypassed)
     d_approach: float = 0.0
     d_return: float = 0.0
     d_v_descend: float = 0.0
+    # v6 (4-stage FSM) — Stage 2 demount diagnostics
+    demount: float = 0.0      # Stage 2 dense term (w_pull * (1 - exp(-d/τ)))
+    d_demount: float = 0.0    # ||tire − hub|| during Stage 2 demount
+    stage2_stall_left: int = 0  # Steps remaining in the demount stall
+    # v7 (vector-guided carry) — Stage 1 dense overhaul
+    guide_A: float = 0.0      # Stage 1 EE-vector guide (w_guide * exp(-||hub-ee||/τ))
+    pb_carry: float = 0.0     # Stage 1 PB shaping on Δd_A (w_pb_carry * (prev - curr))
+    d_guide: float = 0.0      # ||hub - ee|| diagnostic (mirrors hub_guide_vector norm)
 
 
 def align_reward(tire_pos, hub_pos, tire_axis, hub_axis,
@@ -136,7 +145,7 @@ def _action_mask(action: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
     builds it once with ``np.ones(13)`` and zeros out the Panda slice
     ``[6:12]`` whenever ``cfg.freeze_robot_b`` is True (Phase 1). This
     keeps the **action / observation dimensions unchanged** (13-d /
-    89-d) so checkpoints stay binary-compatible across Phase 1 → 2/3
+    92-d dual-arm) so checkpoints stay binary-compatible across Phase 1 → 2/3
     transitions, while removing the Panda channels' contribution to
     ``action`` / ``jerk`` regularisation so PPO doesn't waste capacity
     pinning them to zero during Phase 1.

@@ -8,8 +8,8 @@ Run from repo root:
     python -m src.test --render --random-max         # full action_space.sample() — motor-control sanity
 
 Checks:
-  * Observation shape == config default (89) and dtype == float32
-  * Action shape == 13
+  * Observation shape matches ``cfg.obs.dim`` (Phase 1: 85) and dtype == float32
+  * Action shape matches ``cfg.action.dim`` (Phase 1: 6)
   * N random steps complete without exceptions
   * env.check_env passes the Gymnasium API contract (with --check)
 """

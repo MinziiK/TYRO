@@ -407,6 +407,71 @@ class UR10Robot(Robot):
             physicsClientId=self.client,
         )
 
+    def apply_absolute_ee(self, pos, quat) -> None:
+        """Direct absolute (world-frame) EE-pose IK + joint control.
+
+        This is the new API for the **Minimum-Jerk planner + PPO residual**
+        control path (2026-06-01). Unlike :pymeth:`apply_delta_ee`, it does
+        **not** accumulate onto ``last_target_pos`` and it **ignores**
+        ``ur10_lock_tool_up`` — the caller (the planner) is fully
+        responsible for orientation. The legacy lock was a hack for the
+        broken delta path; planner mode supersedes it.
+
+        ``pos`` and ``quat`` are world-frame absolute targets (quat in
+        PyBullet xyzw). The full 6-DOF IK is run against them, joint
+        targets are clamped to limits and pushed to PyBullet via the
+        same stiff PD that the delta path uses.
+
+        IK warm-start uses the **current** joint state as the rest pose
+        (not ``HOME_POSE``) so the solver stays in the same IK branch as
+        the previous step. Falling back to ``HOME_POSE`` lets the IK
+        teleport across branches whenever the arm strays from HOME,
+        producing step-1 spikes of tens of cm even for tiny pose deltas.
+        """
+        target_pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        target_orn = np.asarray(quat, dtype=np.float64).reshape(4)
+        n = float(np.linalg.norm(target_orn))
+        if n > 1e-12:
+            target_orn = target_orn / n
+        else:
+            target_orn = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        self.last_target_pos = target_pos.copy()
+
+        # Warm-start IK from the *current* arm state so the solver picks
+        # the same elbow / wrist branch as the previous step.
+        cur_q, _ = self.joint_state()
+        ik = p.calculateInverseKinematics(
+            self.uid, self.EE_LINK_INDEX,
+            target_pos.tolist(), target_orn.tolist(),
+            lowerLimits=self.arm.lower.tolist(),
+            upperLimits=self.arm.upper.tolist(),
+            jointRanges=self.arm.range.tolist(),
+            restPoses=cur_q.tolist(),
+            maxNumIterations=200,
+            residualThreshold=1e-4,
+            physicsClientId=self.client,
+        )
+        ik = np.asarray(ik, dtype=np.float64)
+        max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+        if len(ik) > max_slot:
+            arm_targets = ik[self._ik_arm_slots]
+        else:
+            arm_targets = self._fallback_targets()
+        arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
+        # UR10 joint torque caps + PD — same tuning as ``apply_delta_ee``.
+        forces = [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
+        pgains = [1.0] * len(forces)
+        vgains = [1.0] * len(forces)
+        p.setJointMotorControlArray(
+            self.uid, self.arm.indices,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=arm_targets.tolist(),
+            forces=forces,
+            positionGains=pgains,
+            velocityGains=vgains,
+            physicsClientId=self.client,
+        )
+
     def _arm_joint_indices(self) -> List[int]:
         # Match by URDF joint name — robust to non-arm joints (Robotiq gripper,
         # robot_ee_fixed_joint) appearing in PyBullet's enumeration.

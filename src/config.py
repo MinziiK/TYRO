@@ -40,7 +40,17 @@ class RewardConfig:
     #: strong "keep descending" gradient. Combined with the new close-range
     #: bonus below (see ``w_approach_close`` / ``approach_close_decay``).
     w_approach: float = 3.0
-    approach_decay: float = 0.4  # m, e-fold radius of the approach kernel
+    #: **2026-05-29 (rev 3 — hover-lockin fix)**: tightened from 0.4 → 0.15 m
+    #: to break the policy-lock observed in v2 around d_approach ≈ 0.20 m.
+    #: With decay = 0.4, the far-term kernel at hover (d=0.20) was 0.61, only
+    #: 33 % below its grasp value (d=0.08) of 0.82 — the policy could harvest
+    #: ~80 % of the dense reward without ever closing the gap. Slashed to
+    #: 0.15 m, the same evaluations become 0.26 (hover) vs 0.59 (grasp), a
+    #: 56 % drop. Combined with the boosted R_pickup and per-step alive
+    #: penalty below, this re-aligns the value gradient toward an active
+    #: descent. The close-range bonus (``w_approach_close``) keeps the
+    #: dense reward grow when the EE actually enters the pickup envelope.
+    approach_decay: float = 0.15  # m, e-fold radius of the approach kernel
     #: **Stage-0 close-range bonus** — a second, much narrower exponential
     #: that ignites only when the EE is within ~30 cm of the grasp target.
     #: Stacks additively on ``w_approach * exp(-d / approach_decay)`` to
@@ -54,15 +64,60 @@ class RewardConfig:
     w_approach_close: float = 2.0
     approach_close_decay: float = 0.2  # m, e-fold of the close-range kernel
     #: Stage 2 — tire COM → original floor pickup point (positive exp form).
+    #: Used in the legacy 3-stage FSM (rename: Stage 3 in v6). The dense
+    #: kernel ``r = w_return * exp(-d_rack / return_decay)`` pulls the
+    #: tire COM toward the cradle pickup pose. v6 tightens the decay so
+    #: the policy gets a strong gradient inside the final 50 cm.
     w_return: float = 3.0
-    return_decay: float = 0.8  # m  (was 0.3 — same rationale as approach)
+    return_decay: float = 0.5  # m (v6: 0.8 → 0.5 for sharper end-game pull)
+    #: **v7 (vector-guided carry)** — Stage 1 dense reward overhaul.
+    #: Legacy stage-1 ``align_A = -w_d_A·d_A - w_theta_A·θ_A`` is a
+    #: *negative-only* kernel: at d_A = 2 m the policy paid -2.5/step
+    #: just for standing still after pickup, so the value function
+    #: prefers a fast collision-suicide over committing to carry.
+    #:
+    #: v7 replaces the Stage 1 dense branch with TWO positive kernels:
+    #:   1. ``guide_A = w_guide * exp(-||hub - ee|| / guide_decay)``
+    #:      — exponential pull on the EE → hub vector (also exposed in
+    #:      the observation as a 3-d ``hub_guide_vector``).
+    #:   2. ``pb_carry = w_pb_carry * (prev_d_A - d_A)`` — potential-based
+    #:      shaping on the tire-to-hub distance, giving a strictly
+    #:      positive increment per progress step (matches the existing
+    #:      Stage-0 PB approach + Stage-2/3 PB return scheme).
+    #:
+    #: align_A stays computed for diagnostics but is multiplied by 0
+    #: inside the Stage-1 dense subtotal — see ``tyro_env._compute_reward``.
+    #: **v9 (2026-05-30)**: 3 → 8 so guide_A stays meaningful at d_A≈2 m
+    #: (3·exp(-4)≈0.055/step was drowned by sync_joint / approach dense).
+    w_guide: float = 8.0
+    guide_decay: float = 0.5  # m (matches return_decay scale)
+    #: **v9b**: 5 → 10 — stronger Δd_A gradient toward hub when guide_A
+    #: alone does not shrink d_A (v9 stuck at d_A≈2.1 m with guide≈0.12).
+    w_pb_carry: float = 10.0
+    #: **v11 (2026-05-31 — backtracking)** — Stage 2 demount PB shaping
+    #: ``w_pb_demount * (d_hub - d_hub_prev)``. Positive when tire moves
+    #: *away* from hub centre (after the demount stall). Larger weight
+    #: (20) than carry so the policy gets a strong "pull-back" gradient
+    #: as soon as Phase A spawns it at the hub.
+    w_pb_demount: float = 20.0
+    #: Stage 2 — demount: tire axial-distance from hub centre. After the
+    #: ``demount_stall_steps`` stall, the dense kernel
+    #: ``r = w_pull * exp(-d_hub / pull_decay)`` *inverts* — the policy is
+    #: rewarded for **growing** ``d_hub`` toward ``demount_axial_distance``.
+    #: Implemented as ``w_pull * (1 - exp(-d_hub / pull_decay))`` in the
+    #: env so the reward asymptotes to ``w_pull`` at the goal distance.
+    w_pull_demount: float = 3.0
+    pull_decay: float = 0.20  # m
     #: Potential-based shaping weight applied per step on Δd_approach
     #: (Stage 0) and Δd_return (Stage 2). Provides a dense gradient even
     #: when the exp kernel is near-flat far from the goal:
     #:   shape_step = w_pb * (prev_d - curr_d)
     #: 0.0 disables. Set to ~5 for Phase 1.
     w_pb_approach: float = 5.0
-    w_pb_return: float = 5.0
+    #: **v11**: 5 → 30 — Stage 3 cradle-return PB shaping must dominate
+    #: any residual hub-side gradient so the policy commits to returning
+    #: instead of drifting around the hub area.
+    w_pb_return: float = 30.0
     #: All stages — penalty on tire rotation away from the prescribed
     #: vertical pose (Euler [0°, -90°, 90°]). Acts before the strict
     #: termination gate triggers.
@@ -72,11 +127,47 @@ class RewardConfig:
 
     # FSM transition / completion bonuses
     #: Stage 0 → 1 (successful grasp).
-    R_pickup: float = 25.0
+    #: **2026-05-29 (rev 3 — hover-lockin fix)**: raised from 25 → 300.
+    #: Empirical budget check in v2 (hover d ≈ 0.20, ep_len ≈ 350): the
+    #: dense kernel paid ≈ 2.5/step × 350 = 875 across an episode (before
+    #: ``mix_dense``), while a single R_pickup paid only 25 before the
+    #: episode immediately ended via ``terminate_on_pickup``. Even
+    #: post-mix (0.3 dense vs 0.7 sparse), the hover return ≈ 262 still
+    #: dwarfed the pickup return ≈ 17.5, so the policy's value function
+    #: rationally chose to hover. R_pickup boosted to **300** so that
+    #: ``R_pickup * mix_sparse_success = 210`` alone exceeds a typical
+    #: post-mix hover return — combined with the tightened approach
+    #: kernel and step alive penalty, hover stops being a Nash equilibrium.
+    R_pickup: float = 300.0
     #: Stage 1 → 2 (tire seated within ``mount_radius_tol`` of hub centre).
-    R_mount: float = 50.0
-    #: Stage 2 → Done (tire placed back on floor pickup zone softly).
-    R_return: float = 100.0
+    #: **2026-05-30 (v6 — 4-stage FSM)**: 200 → **300** so Stage 1 mount
+    #: bonus matches the Stage 0 pickup bonus. Stage 1 is the longest and
+    #: hardest segment (≈ 1.9 m tire travel + 90° tire rotation + 4 cm
+    #: landing tolerance) — a smaller bonus would create a value-gradient
+    #: cliff right after the policy "earns" R_pickup. Equalised bonuses
+    #: keep the per-step expected return roughly flat across pickup → mount.
+    R_mount: float = 300.0
+    #: Stage 2 → 3 (tire pulled axially OUT of the hub by at least
+    #: ``demount_axial_distance`` m after a ``demount_stall_steps``-step
+    #: "virtual fastener release" hold). Stage 2 simulates the gap between
+    #: a real Panda finishing its bolt-down and the UR10 retracting the
+    #: tire safely along the hub axis. The demount bonus is smaller than
+    #: pickup/mount because the motion is shorter (≈ 30 step) and less
+    #: error-prone (axial pull along a known hub axis).
+    R_demount: float = 150.0
+    #: Stage 3 → Done (tire placed back on the cradle pickup pose softly).
+    #: **2026-05-30 (v6)**: previously ``R_return = 200``; renamed
+    #: ``R_success`` semantically because this is the *final* episode-
+    #: terminal bonus. Capped at 300 (not 500 as initially scoped) to
+    #: keep critic-loss variance bounded — total sparse pool now sums
+    #: to 300 + 300 + 150 + 300 = 1050 (×0.7 mix = 735), comfortably
+    #: above the dense ceiling without saturating PPO advantage norm.
+    R_success: float = 300.0
+    #: Legacy alias retained for any consumer still reading ``R_return``;
+    #: kept equal to ``R_success`` so code paths that have not been
+    #: migrated continue to credit the same terminal bonus. Both names
+    #: point at the same Stage-3 episode-terminal bonus.
+    R_return: float = 300.0
     #: One-shot terminal penalty on any *failure* termination (vertical
     #: violation, robot collision, workspace exit, contact-force damage).
     #: Counteracts the "die fast to stop losing reward" exploit when dense
@@ -90,15 +181,20 @@ class RewardConfig:
     beta: float = 10.0
 
     # UR10 cooperative sync — penalize large joint velocity on A so Panda can refine.
-    w_sync_joint_a: float = 0.08
+    #: **v9**: 0.08 → 0.04; **v9b**: 0.04 → 0.02 — v9 still logged
+    #: sync_joint_A ≈ -2.5~-4/step drowning carry dense despite w_guide=8.
+    w_sync_joint_a: float = 0.02
 
     # Sparse / dense balancing (applied to sparse success vs dense process total).
     mix_sparse_success: float = 0.7
     mix_dense: float = 0.3
 
-    # Sparse success bonus (legacy — for Phase 1 FSM, replaced by R_return at
-    # episode close-out but kept for backwards-compatible weight gating).
-    R_success: float = 100.0
+    # Legacy ``R_success`` (Phase 0/legacy success_bonus predicate) duplicate
+    # field removed in v6 — the canonical ``R_success`` (= 300.0) is defined
+    # above next to ``R_demount``. ``make_reward_config`` still writes to
+    # ``rc.R_success`` to gate the legacy lug-aligned success predicate; that
+    # path now toggles the same v6 terminal bonus value, which is fine
+    # because Phase 1 paths don't evaluate ``success_bonus`` anymore.
     #: Legacy Euclidean ||tire − hub|| gate. Only used when
     #: ``use_lug_aligned_success`` is False — otherwise ``eps_A_mounted`` applies.
     eps_A: float = 0.01     # 1 cm — tire-hub position threshold (legacy tight bound)
@@ -122,10 +218,32 @@ class RewardConfig:
     eps_A_mounted: float = 0.22
 
     # Penalties
-    w_collision: float = 5.0
+    #: **v7**: collision penalty raised 5 → 10 to compensate for losing the
+    #: episode-ending consequence (see ``EnvConfig.collision_terminates``).
+    #: The per-step -10 cost accumulates while the policy stays in contact,
+    #: so a sustained collision still hurts; meanwhile, the agent is no
+    #: longer "rewarded" for crashing as a way to short-circuit a bad
+    #: Stage-1 carry rollout.
+    w_collision: float = 10.0
     w_workspace: float = 5.0
     w_action: float = 0.01
     w_jerk: float = 0.01
+    #: **2026-05-29 (rev 3 — hover-lockin fix)** — Per-step "alive" cost
+    #: applied directly to the episode return (bypasses ``mix_dense`` so
+    #: it always bites). Without this, the agent could let the episode
+    #: run to ``max_steps`` because dense+pen ≈ 0 was strictly ≥ pickup
+    #: return. ``-0.05/step`` adds up to ``-25`` over a full 500-step
+    #: timeout, plus an opportunity cost on every hover step — pushing
+    #: the value function toward a short, decisive pickup trajectory.
+    #: Goes through ``b.step_alive`` and is appended to ``b.total``
+    #: AFTER the dense/sparse mix in ``_compute_reward``.
+    #: **v11 (2026-05-31)**: 0.05 → 0.15 (3×). v9b dense floor still ran
+    #: ≈ +0.44/step (approach_A 1.86 + lateral_th 1.91 + axial_dot_th 0.81)
+    #: so -0.05/step alive cost lost the budget race. -0.15/step combined
+    #: with v11 Stage 1 dense gating (lateral/axial masked) makes hover
+    #: cost positive (worse than chance), so the value function is forced
+    #: to value progress, not standing-still.
+    w_step_alive: float = 0.15
 
     # Potential-based shaping (optional; enabled via use_shaping flag in EnvConfig)
     w_shape_A: float = 10.0
@@ -166,13 +284,18 @@ class ObsConfig:
     max_joint_vel: float = 3.15     # rad/s, conservative for both arms
     # Set by ``make_env_config`` / ``EnvConfig.__post_init__`` to match
     # the active ``ActionConfig.dim`` — the obs layout always ends with
-    # ``prev_action`` (length = action.dim) followed by 3 mount tail
-    # scalars, so the total dim tracks ``action.dim``:
-    #   action.dim = 6  → obs.dim = 73 + 6 + 3 = 82  (Phase 1)
-    #   action.dim = 13 → obs.dim = 73 + 13 + 3 = 89 (Phase 2/3)
+    # ``prev_action`` (length = action.dim) + 3 mount tail scalars +
+    # **3 v7 hub_guide_vector** scalars:
+    #   action.dim = 6  → obs.dim = 73 + 6 + 3 + 3 = 85  (Phase 1)
+    #   action.dim = 13 → obs.dim = 73 + 13 + 3 + 3 = 92 (Phase 2/3)
     # The 73 base entries (joints, EE/tire/hub/bolt poses, deltas) are
-    # independent of action dim and shared across all phases.
-    dim: int = 89                   # §2.1 base + mounting (ax·lat·lug) diagnostics
+    # independent of action dim and shared across all phases. The
+    # trailing ``hub_guide_vector = hub_pos - eeA_pos`` (3-d) gives the
+    # policy a direct vector cue for Stage 1 carry — without it the
+    # policy must derive the same direction from the joint/EE/hub
+    # poses, which is information-theoretically equivalent but
+    # empirically much harder for PPO to learn in dense form.
+    dim: int = 92                   # §2.1 base + mounting + hub_guide
 
 
 @dataclass
@@ -187,7 +310,16 @@ class EnvConfig:
     # Simulation
     sim_freq_hz: float = 240.0
     control_freq_hz: float = 20.0   # decimation = sim_freq / control_freq = 12
-    max_steps: int = 500            # ≈ 25 s at 20 Hz
+    #: **2026-05-29 (rev 4 — hover-budget cap)** — shortened from 500 → 200
+    #: (≈ 10 s at 20 Hz) during pickup-only training.
+    #: **2026-05-30 (v5 — full FSM)**: raised back to **400** (≈ 20 s).
+    #: Now that pickup terminates at step ~30 only when ``terminate_on_pickup``
+    #: is True, the v5 run disables that flag and needs budget for the
+    #: full pickup (30) + carry/mount (≈ 150) + return (≈ 100) ≈ 280 step
+    #: cycle plus margin. Hover risk is already contained by the new
+    #: ``w_step_alive`` and the tight ``approach_decay`` (rev-3). Override
+    #: via ``--max-steps`` on the CLI when running pickup-only sweeps.
+    max_steps: int = 600            # ≈ 30 s at 20 Hz (v11c: 400 → 600 to fit full Pickup → Mount → Demount → Return cycle)
     gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
     render: bool = False            # GUI vs DIRECT
 
@@ -199,6 +331,20 @@ class EnvConfig:
     # Terminate when any contact reports excessive normal force (simulated breakage).
     # Set ≤ 0 to disable.
     contact_force_terminate_above: float = 2500.0
+    #: **v7 (collision relaxation)** — when False, an in-bad-collision event
+    #: applies the ``w_collision`` per-step penalty but does NOT terminate
+    #: the episode. This is the cure for the v6 "collision-suicide" failure
+    #: mode where the policy let the arm clip the rack on purpose to escape
+    #: the -2.5/step Stage-1 negative dense baseline; with the new v7
+    #: positive guide+PB carry kernels, ending the episode on contact is
+    #: also a *premature* signal that prevents the policy from
+    #: recovering from a glancing brush against the rack/cargo.
+    #: **2026-06-01 (planner-residual rewrite)**: flipped back to ``True``.
+    #: With the new Min-Jerk planner the nominal trajectory is *guaranteed*
+    #: collision-free for the fixed Phase-1 scene, so any in-collision
+    #: state is unambiguous policy misbehaviour. We end the episode
+    #: immediately and apply ``R_fail = -50`` (auto-paid in ``step``).
+    collision_terminates: bool = True
 
     # Reward shaping toggle (Stage 4 in spec §4.3)
     use_shaping: bool = False
@@ -299,22 +445,22 @@ class EnvConfig:
     #:     faces.
     #:   * Y = 0.00: bore axis world +X, tread plane in Y-Z → tire
     #:     spans Y ∈ [−0.525, +0.525] (1.05 m diameter). Inner rail at
-    #:     Y = +0.30 / outer rail at Y = −0.30. The tire's tread rests
-    #:     on the inner-top corners of both rails at (Y = ±0.25,
-    #:     Z = −0.15), forming a stable V-cradle. The 6 o'clock line
-    #:     (Y = 0) sits in the 50 cm Y-gap; static stability is held
+    #:     Y = +0.40 / outer rail at Y = −0.40. The tire's tread rests
+    #:     on the inner-top corners of both rails at (Y = ±0.35,
+    #:     Z = 0.00), forming a stable V-cradle. The 6 o'clock line
+    #:     (Y = 0) sits in the 70 cm Y-gap; static stability is held
     #:     by ``_pin_tire_to_world`` (mass = 0 freeze) at the cradle
     #:     equilibrium until Stage 0 → 1 fires.
-    #:   * Z = rail_top + √(R² − 0.25²) = −0.15 + 0.46165 = **+0.3117**.
+    #:   * Z = rail_top + √(R² − 0.35²) = 0.00 + 0.39131 = **+0.3913**.
     #:     This is the geometric resting COM where the tread surface
     #:     just touches the rail inner-top corners. The 6 o'clock anchor
-    #:     ends up at Z = COM − R = **−0.2133** (≈ 6.3 cm below the
-    #:     rail top, inside the 50 cm Y-gap).
-    #: UR10 base ↔ pickup grasp target ≈ 1.10 m planar (the 7.7 cm Z
-    #: offset from the UR10 base plane Z = −0.30 to grasp Z = −0.213 is
-    #: well within the IK's reach margin). Stage 1 trajectory pickup
-    #: → hub centre is ≈ 2.05 m (dominant carry skill).
-    tire_pickup_pos: Tuple[float, float, float] = (-1.90, 0.0, 0.3117)
+    #:     ends up at Z = COM − R = **−0.1337** (≈ 13.4 cm below the
+    #:     rail top, inside the 70 cm Y-gap).
+    #: UR10 base ↔ pickup grasp target ≈ 1.10 m planar + 0.167 m up =
+    #: 1.128 m 3-D (within 1.30 m reach, 17.2 cm margin). Grasp anchor
+    #: Z = −0.1337 effectively coincides with the HOME EE Z = −0.1367
+    #: (3 mm apart) — the pickup is now a near-pure planar reach.
+    tire_pickup_pos: Tuple[float, float, float] = (-1.90, 0.0, 0.3913)
     #: Tire spawn orientation as RPY. (0, π/2, 0) sends the tire's local
     #: +Z (bore axis) to **world +X** so the bore opening faces robot A
     #: directly (the robot sits at +X relative to the tire). The mount
@@ -350,27 +496,247 @@ class EnvConfig:
     #: 10 m envelope) reliably trips Stage 0 → 1 within an episode. The
     #: hard cap stays at **0.08 m** (physical fingertip contact) for the
     #: final converged policy.
+    #:
+    #: **2026-05-29 (rev 2) — pathological 1-step episode fix**: with the
+    #: new Stage-0 start-pose curriculum, the easy spawn places the EE
+    #: 0.20 m below the grasp anchor. The previous 0.35 m soft gate was
+    #: *already wider* than that distance, so every easy-mode episode
+    #: terminated as ``pickup_success`` on step 1 without the agent
+    #: moving — PPO collected 24 k identical-reward samples per
+    #: iteration with no gradient signal, and 90 % of wall time was
+    #: spent in URDF-reload heavy ``reset()`` (10 FPS @ 12 envs).
+    #: Tightened to **0.10 m** so easy-mode episodes require the agent
+    #: to actively lift the EE ≥ 10 cm before the gate fires (~5 steps
+    #: minimum at ``pos_scale = 0.02 m/step``). The smoothstep ramp
+    #: now interpolates 0.10 → 0.08 m, a much tighter band; the curve
+    #: still maintains a meaningful "easier early, stricter later"
+    #: shape because the *start-pos* curriculum simultaneously moves
+    #: the spawn from grasp − 0.20 m → HOME (54 cm away).
     approach_radius_tol: float = 0.08
-    approach_tol_soft: float = 0.35
+    approach_tol_soft: float = 0.10
     #: First N (global PPO) timesteps where the gate is pinned to
-    #: ``approach_tol_soft``. Past this point the linear ramp begins.
-    #: **Aggressively shortened** from 100 k → **5 k env-steps** (~40 k
-    #: global timesteps under 12-env vec). The diagnostic hover already
-    #: emerged after 450 k global, so the soft hold doesn't need a 100 k
-    #: pre-roll any more.
-    approach_tol_curriculum_steps: int = 5_000
+    #: ``approach_tol_soft``. Past this point the smoothstep ramp begins.
+    #: **2026-05-29**: synced with ``start_pos_curriculum_steps`` /
+    #: ``start_pos_ramp_steps`` (100 k hold + 500 k smoothstep) so the
+    #: easy-start UR10 EE position and the soft pickup gate fade out
+    #: together — preventing the gate from collapsing to 0.08 m before
+    #: the start position has lifted off the easy zone.
+    approach_tol_curriculum_steps: int = 100_000
     #: Linear ramp length (global PPO timesteps) after the soft hold
     #: during which the gate is interpolated from ``approach_tol_soft``
-    #: down to ``approach_radius_tol``.
-    #: Shortened from 200 k → **5 k env-steps** so the curriculum fully
-    #: lands inside the first ~80 k global timesteps.
-    approach_tol_ramp_steps: int = 5_000
+    #: down to ``approach_radius_tol``. Matches the start-pos ramp.
+    #: **2026-05-29 (rev 4)**: shortened 500k → 300k so the hard regime
+    #: lands by t = 400k. With total = 2M this leaves 1.6M steps of
+    #: pure hard-mode learning (vs 1.4M previously) — more budget for
+    #: the policy to actually master the HOME-pose pickup.
+    approach_tol_ramp_steps: int = 300_000
+
+    # ------------------------------------------------------------------
+    # Stage 0 starting-pose curriculum + early termination.
+    # ------------------------------------------------------------------
+    #: Master switch for the UR10 EE starting-pose curriculum. When True
+    #: (default), every ``reset()`` blends the UR10 joint pose between
+    #:   * easy: grasp_anchor + (0, 0, −``start_pos_easy_lift``)
+    #:   * hard: the analytical ``HOME_POSE`` FK
+    #: using a smoothstep coefficient driven by ``StartPosCurriculumCallback``
+    #: (``src/train.py``). When False, every reset uses HOME as today.
+    #: Eval / render / no-callback paths leave ``_start_pos_alpha = 1.0``
+    #: (full hard) so they always start at the production HOME pose.
+    start_pos_curriculum_enable: bool = True
+    #: +Z distance (m) below the tire 6 o'clock grasp anchor at which the
+    #: easy start pose is computed. **v9**: 0.20 → 0.10 m — shorter lift
+    #: so easy resets fire pickup more often and spend more steps in Stage 1.
+    start_pos_easy_lift: float = 0.10
+    #: First N global PPO timesteps where the start pose stays at full
+    #: easy (alpha = 0). Mirrors ``approach_tol_curriculum_steps``.
+    start_pos_curriculum_steps: int = 100_000
+    #: Smoothstep ramp length (global PPO timesteps) after the easy hold.
+    #: alpha advances from 0 → 1 as ``smoothstep((t − hold) / ramp)``.
+    #: **2026-05-29 (rev 4)**: shortened 500k → 300k so the policy
+    #: locks onto HOME-pose pickups by t = 400k, leaving 1.6M steps
+    #: of converged hard-mode learning.
+    start_pos_ramp_steps: int = 300_000
+    #: **v8 (50% mix)** — start-pos curriculum *operating mode*.
+    #:   * ``"lerp"`` (legacy): the callback smoothsteps a single alpha
+    #:     from 0 (easy) → 1 (HOME) over ``curriculum_steps + ramp_steps``.
+    #:     Every reset uses that same alpha. This is what v4 was trained
+    #:     with, but it had a known weak spot: during the alpha = 0.4–0.7
+    #:     intermediate band, *no* reset produces a reliable pickup
+    #:     trigger and the policy can lose the picking habit
+    #:     (observed in v3 as long Stage-1 dropouts and reward hacking).
+    #:   * ``"mix"`` (v8 default): every reset rolls a Bernoulli(p) and
+    #:     either spawns full-easy (alpha = 0) or full-hard (alpha = 1).
+    #:     The "easy" half guarantees the policy keeps tasting R_pickup
+    #:     and the carry/mount dense reward forever, while the "hard"
+    #:     half forces generalisation to the production HOME start.
+    #:     Probability ``p`` = ``start_pos_easy_prob``.
+    start_pos_curriculum_mode: str = "mix"
+    #: Bernoulli probability of choosing the *easy* spawn each reset
+    #: under ``start_pos_curriculum_mode = "mix"``. v8 used 0.5; v9 was
+    #: 0.75; **2026-06-01 planner-residual rewrite**: forced to **1.0**
+    #: so every reset routes through the new attached-hot-start path
+    #: (``attached_spawn_when_easy=True``) — the policy spawns already
+    #: holding the tire at the cradle pose, ``task_stage == 1``, and
+    #: only has to solve the carry/mount problem. Combined with
+    #: ``terminate_on='mount'`` this yields the fastest possible
+    #: Mount-only training loop. Override on the CLI to mix HOME
+    #: starts back in once mount converges.
+    start_pos_easy_prob: float = 1.0
+
+    # ------------------------------------------------------------------
+    # **v11 (2026-05-31) — Reverse curriculum (backtracking) scheduler.**
+    # ------------------------------------------------------------------
+    # Independent of the legacy ``start_pos_curriculum_mode``. When
+    # ``reverse_curriculum_enable`` is True, the env reset() routes to
+    # one of three phases as a step-function of the global PPO step:
+    #   * Phase A (0 .. reverse_phase_a_steps): hub-aligned hot-start.
+    #     Tire teleported to ``tire_mount_pos`` with bore axis aligned
+    #     to hub axis, UR10 EE on the 6-o'clock grasp anchor of that
+    #     tire pose, grasp constraint attached, ``task_stage = 1``.
+    #     Policy starts within R_mount range every reset.
+    #   * Phase A→B blend (reverse_phase_a_steps .. + a_to_b_overlap):
+    #     Bernoulli mix — keeps ``reverse_phase_a_mix_prob`` of resets
+    #     in Phase A while gradually introducing Phase B. Mitigates
+    #     catastrophic forgetting of mount-endgame skill.
+    #   * Phase B (.. reverse_phase_b_steps): legacy easy-mix start.
+    #     Bernoulli(``start_pos_easy_prob``) on easy vs HOME.
+    #   * Phase C (after reverse_phase_b_steps): pure HOME starts.
+    reverse_curriculum_enable: bool = False
+    #: End of pure-A plateau (global PPO timesteps).
+    reverse_phase_a_steps: int = 250_000
+    #: End of A→B overlap window. Between ``phase_a_steps`` and this
+    #: value resets pick A with probability ``reverse_phase_a_mix_prob``,
+    #: else fall through to Phase B sampling.
+    reverse_phase_a_to_b_overlap: int = 50_000
+    #: Probability of staying in Phase A during the A→B overlap.
+    reverse_phase_a_mix_prob: float = 0.75
+    #: End of Phase B plateau (also start of pure-C HOME).
+    reverse_phase_b_steps: int = 750_000
+    #: Distance budget (m) for the tire spawn perturbation around the
+    #: mount target in Phase A. Sampled uniformly along the hub-axis
+    #: direction inward from the goal, so the policy still has
+    #: a small mount-approach to traverse on every reset.
+    #: **v11c (2026-05-31)**: 0.03 → 0.01. v11 hot-start sampled
+    #: backoff in [0.01, 0.03] m which combined with a 2° angular tilt
+    #: pushed a non-trivial fraction of resets close to the mount-tol
+    #: boundary (radius_soft = 0.30 m, angle_soft = 35°). After the
+    #: first physics decimation step, the policy's untrained Δaction
+    #: could shove the tire out of tol → mount event never fired and
+    #: ``fsm_bonus`` averaged ≈ 0.25/step instead of the expected
+    #: ≈ 1.0/step (one R_mount paid per ep). Tight jitter restores the
+    #: "guaranteed first-step mount fire" assumption.
+    reverse_phase_a_radial_jitter: float = 0.01
+    #: Max angular perturbation (rad) applied to the tire bore axis
+    #: around the hub axis during Phase A spawn.
+    #: **v11c (2026-05-31)**: 2.0° → 0.5° for the same first-step
+    #: mount-fire guarantee. 0.5° ≪ angle_soft = 35° so the tilt never
+    #: pushes the angular check past gate.
+    reverse_phase_a_angular_jitter: float = np.deg2rad(0.5)
+    #: **v11c (2026-05-31)** — Phase A R_mount paid + episode continues.
+    #: When ``True``, the env temporarily switches ``terminate_on`` to
+    #: "mount" while the ``ReverseCurriculumCallback`` reports Phase A;
+    #: Phase B/C revert to the CLI-supplied value (typically "never").
+    #:
+    #: **v11c1 (2026-05-31)** — default flipped to **False** after the
+    #: v11c_balanced_v1 smoke run showed fps = 12 (≈ 1/8 of v11). Root
+    #: cause: 1-step episodes triggered a PyBullet ``reset()`` every env
+    #: step, which dominates wall-clock. Keeping ``terminate_on="never"``
+    #: in Phase A lets the ``_phase_a_force_mount_first_step`` flag still
+    #: pay R_mount on step 1 (sparse signal preserved), then the episode
+    #: continues through Stage 2 (demount) and Stage 3 (return) up to
+    #: ``max_steps`` — which is the actual goal of reverse curriculum:
+    #: collect on-policy trajectories *after* the mount event so PPO can
+    #: also learn demount + return. Set to ``True`` only if the legacy
+    #: 1-step success pattern is desired (e.g. for a Phase A-only
+    #: mount-policy distillation run).
+    reverse_phase_a_terminate_on_mount: bool = False
+    #: **v11c (2026-05-31)** — distance gate (m) on the Stage 0 dense
+    #: ``approach_A`` term. When ``d_approach > approach_A_gate``, the
+    #: dense reward is zeroed for that step so the policy can't farm
+    #: it by sitting just outside the grasp anchor. Reflects the v4 /
+    #: v9b plateau diagnosis (policy collected ~+1.5/step from
+    #: ``approach_A`` while ``d_A`` stayed at 2.0 m). Set to a
+    #: large value (>5 m) to disable.
+    approach_A_gate: float = 0.20
+    #: **v11c2 (2026-05-31)** — master switch for the four "safety"
+    #: termination gates (``vertical_violation``, ``collision``,
+    #: ``workspace``, ``contact_force``). The ``ReverseCurriculumCallback``
+    #: flips this to ``False`` while Phase A is active and restores
+    #: ``True`` for Phase B/C, because Phase A's hot-start produces a
+    #: chaotic first-step physics burst (tire teleported into hub +
+    #: untrained policy action) that would otherwise terminate the
+    #: episode in 1–25 steps before PPO can collect any post-mount
+    #: training data. Eval / render paths keep the default ``True``.
+    safety_terminations_enabled: bool = True
+    #: When False, the trailing 3-d ``hub_guide_vector`` is omitted from
+    #: the observation (legacy checkpoints trained before v7 used
+    #: obs.dim = 73 + action.dim + 3 without this block).
+    include_hub_guide_obs: bool = True
+
+    #: When True, the episode terminates with **success = True** the
+    #: instant the Stage 0 → 1 pickup gate fires (R_pickup paid). Legacy
+    #: 3-stage flag — superseded by ``terminate_on`` in v6 (kept for
+    #: backwards compatibility). If ``terminate_on != "never"``, this
+    #: flag is ignored and ``terminate_on`` wins.
+    terminate_on_pickup: bool = False
+    #: **2026-05-30 (v6 — curriculum brake-lock)** — choose at which FSM
+    #: event the episode short-circuits to ``success = True``. Lets the
+    #: curriculum activate Stage 0 → 1 → 2 → 3 incrementally without
+    #: editing env code. Allowed values:
+    #:   * "never"   — full 4-stage cycle; success at Stage 3 landing.
+    #:   * "pickup"  — success on Stage 0 → 1 (legacy v4/v5 pickup-only).
+    #:   * "mount"   — success on Stage 1 → 2 (v6 first run: master mount).
+    #:   * "demount" — success on Stage 2 → 3 (Stage 2 specialisation).
+    #: Stage 2/3 code stays active in the env regardless; the flag only
+    #: gates the early-termination point so a single ``--terminate-on
+    #: never`` flip turns on the full cycle.
+    #: **2026-06-01 (planner-residual rewrite)**: default changed to
+    #: ``"mount"`` so a fresh-from-scratch run short-circuits the moment
+    #: Stage 1 → 2 fires (R_mount paid + ``is_success = True``). Stage 2/3
+    #: replanning code stays wired but is not exercised under this default
+    #: — flip to ``"never"`` once mount converges.
+    terminate_on: str = "mount"
+    #: Stage 2 demount target — axial distance (m) the tire centre must
+    #: travel *away* from the hub centre to fire the Stage 2 → 3 trigger.
+    #: 30 cm is roughly 1.5× tire thickness (0.30 m / 2 + clearance), so
+    #: the tire fully clears the hub flange + bolts before the policy is
+    #: rewarded for "demounted".
+    demount_axial_distance: float = 0.30
+    #: Stage 2 demount stall — number of env steps the policy must spend
+    #: in Stage 2 after the Stage 1 → 2 transition before the demount
+    #: gate becomes eligible to fire. Simulates the gap between Panda
+    #: completing the bolt-down and UR10 starting its safe-axial-pull.
+    #: 20 step at 20 Hz = 1.0 s. During the stall, UR10 actions still
+    #: physically execute (so the policy is free to start drifting away),
+    #: but the gate stays closed — preventing "drive the tire away
+    #: instantly" exploits that bypass the safety hold.
+    demount_stall_steps: int = 20
+    #: Stage 3 cradle return — Euclidean radius (m) the tire centre must
+    #: land within of the cradle pickup pose for the Stage 3 → done
+    #: gate to consider it a successful landing.
+    rack_return_radius_tol: float = 0.05
     #: Stage 1 → 2 trigger: ‖tire − hub‖ < ``mount_radius_tol`` AND tire axis
     #: aligned with hub axis (≤ ``RewardConfig.delta_A`` rad).
-    #: **2026-05-28**: relaxed from 0.01 m → **0.04 m** so Stage 1 has a
-    #: realistic completion gate. Required mount precision is enforced
-    #: separately by the lug-aligned tolerances (``eps_A_mounted`` etc.).
+    #: **Final hard gate** that the v6 mount curriculum asymptotes to.
     mount_radius_tol: float = 0.04
+    #: v6 mount-gate curriculum — **start radius** (m) used before the
+    #: smoothstep ramp begins. 0.30 m gives the policy a generous
+    #: "anywhere near the hub" entry signal so R_mount fires reliably
+    #: even when carry trajectory is loose. The radius then sweeps
+    #: 0.30 → ``mount_radius_tol`` over ``mount_tol_ramp_steps``.
+    mount_radius_tol_soft: float = 0.30
+    #: v6 mount-gate curriculum — **start axis tolerance** (rad). Default
+    #: 35° lets the tire-bore vs hub-axis angle be very forgiving while
+    #: the policy learns the carry trajectory; the ramp tightens it to
+    #: ``RewardConfig.delta_A`` (5°) at the end.
+    mount_angle_tol_soft_rad: float = np.deg2rad(35.0)
+    #: v6 mount curriculum hold (global PPO steps) — gate stays at the
+    #: soft pair before the smoothstep ramp engages.
+    mount_tol_curriculum_steps: int = 200_000
+    #: v6 mount curriculum ramp (global PPO steps) — smoothstep from
+    #: ``(mount_radius_tol_soft, mount_angle_tol_soft_rad)`` down to
+    #: ``(mount_radius_tol, reward.delta_A)``.
+    mount_tol_ramp_steps: int = 600_000
     #: Stage 2 → success: ‖tire − pickup‖ < ``return_radius_tol`` AND tire
     #: descent speed < ``landing_speed_max`` (soft landing).
     return_radius_tol: float = 0.05
@@ -452,24 +818,23 @@ class EnvConfig:
     # ------------------------------------------------------------------
     #: Two short rails along the X direction (30 cm long each, matching
     #: the tire's bore-axis thickness) flanking the tire in Y with a
-    #: **50 cm Y-gap** centred on the bore axis (Y = 0). The rails form
+    #: **70 cm Y-gap** centred on the bore axis (Y = 0). The rails form
     #: a V-cradle: the tire (radius 0.525 m) rests with its tread
     #: surface in contact with the inner-top corners of both rails
-    #: (Y = ±0.25, Z = rail_top). **2026-05-29 (rev 3)**: revised again
-    #: from the 70 cm gap so the tire physically sits on the rack
-    #: instead of floating above it. The 50 cm Y-gap leaves 25 cm of
-    #: tread overhang on each side, enough for a stable cradle while
-    #: still giving the UR10 gripper a comfortable plunge corridor
-    #: (effective free Y at the 6 o'clock contact line ≈ 50 cm).
+    #: (Y = ±0.35, Z = rail_top). **2026-05-29 (rev 5)**: Y-gap widened
+    #: from 50 cm to **70 cm** so the tire sinks lower into the cradle
+    #: (COM Z 0.461 → 0.391, anchor Z −0.063 → −0.134). The anchor now
+    #: sits within 3 mm of the HOME EE Z = −0.137, reducing pickup to
+    #: an almost pure planar reach.
     #:
     #: NOTE on the bore=+X spawn (``tire_spawn_rpy = (0, π/2, 0)``):
     #: with the tire bore facing robot A in +X, the 6 o'clock outer
     #: tread line at Y = 0 sits **below** the rail top plane (Z =
-    #: -0.213 vs rail top Z = -0.15) — the cradle geometry pulls the
+    #: -0.134 vs rail top Z = 0.00) — the cradle geometry pulls the
     #: tire's bottom into the gap. The gripper still approaches from
-    #: above through the gap (Y = 0, gap width 0.50 m) and dives to
-    #: Z ≈ -0.21 to reach the 6 o'clock anchor; no rail clipping since
-    #: the gripper centreline is 25 cm from either rail face.
+    #: above through the gap (Y = 0, gap width 0.70 m) and dives to
+    #: Z ≈ -0.13 to reach the 6 o'clock anchor; no rail clipping since
+    #: the gripper centreline is 35 cm from either rail face.
     #:
     #: Static stability is maintained by ``_pin_tire_to_world``
     #: (mass = 0 freeze) which holds the tire at the cradle equilibrium
@@ -477,31 +842,31 @@ class EnvConfig:
     #:
     #: Geometry (Robot B-centric, ``tire_outer_radius = 0.525``,
     #: ``tire_thickness = 0.30``, rails 30 cm long × 10 cm thick ×
-    #: **45 cm tall**, ≈ 1.5× the original 30 cm height):
-    #:   * Inner rail Y range = [+0.25, +0.35] (centre +0.30 ± 0.05).
-    #:   * Outer rail Y range = [-0.35, -0.25] (centre -0.30 ± 0.05).
-    #:   * Gap in Y = [-0.25, +0.25], width **0.50 m** ✓
+    #: **60 cm tall**, 2× the original 30 cm height):
+    #:   * Inner rail Y range = [+0.35, +0.45] (centre +0.40 ± 0.05).
+    #:   * Outer rail Y range = [-0.45, -0.35] (centre -0.40 ± 0.05).
+    #:   * Gap in Y = [-0.35, +0.35], width **0.70 m** ✓
     #:   * Both rails X range = [-2.05, -1.75] (centre -1.90 ± 0.15) —
     #:     matches the tire's bore-axis extent X ∈ [-2.05, -1.75]
     #:     exactly, so the +X / −X ends of the rails terminate flush
     #:     with the tread's front and back faces.
-    #:   * Rail Z range = [-0.60, -0.15]; centre -0.375, half-ext 0.225
-    #:     (= floor + 0.45 m height). Rail top Z = **-0.15** (was -0.30).
-    #:   * Tire COM Z = rail_top + √(R² − 0.25²)
-    #:                = -0.15 + √(0.275625 − 0.0625)
-    #:                = -0.15 + 0.46165
-    #:                ≈ **+0.3117** ✓ (tire rests on rail corners)
-    #:   * 6 o'clock anchor (Y=0): Z = COM_Z − R = -0.2133 — the gripper
-    #:     dives ≈ 6.3 cm below rail top inside the 50 cm Y-gap.
+    #:   * Rail Z range = [-0.60, 0.00]; centre -0.30, half-ext 0.30
+    #:     (= floor + 0.60 m height). Rail top Z = **0.00** (world origin).
+    #:   * Tire COM Z = rail_top + √(R² − 0.35²)
+    #:                = 0.00 + √(0.275625 − 0.1225)
+    #:                = 0.00 + 0.39131
+    #:                ≈ **+0.3913** ✓ (tire rests on rail corners)
+    #:   * 6 o'clock anchor (Y=0): Z = COM_Z − R = -0.1337 — the gripper
+    #:     dives ≈ 13.4 cm below rail top inside the 70 cm Y-gap.
     spawn_tire_rack: bool = True
     #: Truck-side rail (inner = closer to the truck on the +Y side).
-    tire_rack_inner_center: Tuple[float, float, float] = (-1.90, 0.30, -0.375)
+    tire_rack_inner_center: Tuple[float, float, float] = (-1.90, 0.40, -0.30)
     #: Far-side rail (outer = on the −Y side, away from the truck).
-    tire_rack_outer_center: Tuple[float, float, float] = (-1.90, -0.30, -0.375)
-    #: 30 cm long (X) × 10 cm thick (Y) × **45 cm tall (Z)** rails —
-    #: Z half-extent 0.225 (1.5× the original 0.15) so rail top sits at
-    #: floor + 0.45 m = -0.15 m world.
-    tire_rack_half_extents: Tuple[float, float, float] = (0.15, 0.05, 0.225)
+    tire_rack_outer_center: Tuple[float, float, float] = (-1.90, -0.40, -0.30)
+    #: 30 cm long (X) × 10 cm thick (Y) × **60 cm tall (Z)** rails —
+    #: Z half-extent 0.30 (2× the original 0.15) so rail top sits at
+    #: floor + 0.60 m = 0.00 m world.
+    tire_rack_half_extents: Tuple[float, float, float] = (0.15, 0.05, 0.30)
     tire_rack_rgba: Tuple[float, float, float, float] = (0.22, 0.24, 0.28, 1.0)
 
     # Bolt surface properties (helps avoid unrealistic sticking on micro-contacts).
@@ -531,6 +896,55 @@ class EnvConfig:
     #: wrist_3 (tool roll) axis aligns with world +Z (see ``HOME_POSE``
     #: in ``UR10Robot``). Default **True** for Phase 1.
     ur10_lock_tool_up: bool = True
+
+    # ------------------------------------------------------------------
+    # **2026-06-01 — Minimum-Jerk planner + PPO residual control.**
+    # ------------------------------------------------------------------
+    # Replaces the raw 6-d Δ-EE-pose action with a hybrid scheme:
+    # every reset (and every FSM stage transition) builds a fresh
+    # nominal trajectory from the current EE pose to the stage's end
+    # pose using a 5th-order min-jerk profile for position + SLERP for
+    # orientation. The PPO action is then a small per-step *residual*
+    # offset added on top of that nominal pose. The policy only has to
+    # learn obstacle-avoidance / fine-alignment corrections, not the
+    # entire motion synthesis problem.
+    #: Master switch. When False, ``_apply_action`` falls back to the
+    #: legacy raw-delta path (``robot_A.apply_delta_ee``) so the same
+    #: env class can still be used by eval scripts that load v11c-era
+    #: checkpoints. Default True for all fresh training runs.
+    use_planner_residual: bool = True
+    #: Per-step residual position offset scale (metres) applied to
+    #: ``action[0:3]`` ∈ [-1, 1] before adding to the nominal pose.
+    #: 0.15 m matches the spec — generous enough for genuine avoidance
+    #: but small enough that the planner remains the dominant signal.
+    planner_pos_offset_scale: float = 0.15
+    #: Per-step residual rotation offset scale (radians, axis-angle).
+    #: Only consumed when ``planner_enable_rot_offset = True``.
+    planner_rot_offset_scale: float = 0.15
+    #: When False (default), ``action[3:6]`` is ignored at the env layer
+    #: and the nominal SLERP-interpolated quaternion drives orientation
+    #: alone. This is the "Q1 — pos_only" choice: maximally stable for
+    #: scratch training because the wrist DOFs are fully managed by the
+    #: planner. Flip to True (and optionally retune ``rot_offset_scale``)
+    #: once the position residual has converged.
+    planner_enable_rot_offset: bool = False
+    #: Nominal trajectory length (control steps). 100 step ≈ 5.0 s at
+    #: 20 Hz control. End-pose is held constant once the index exceeds
+    #: this length so the policy can still operate on a "fix to last
+    #: pose" basis if it has not yet triggered the stage gate.
+    planner_traj_steps: int = 100
+    #: When ``True`` AND the easy-spawn branch is rolled in ``reset``
+    #: (i.e. Bernoulli(``start_pos_easy_prob``) returned True under
+    #: ``start_pos_curriculum_mode == "mix"``), the env performs the
+    #: **attached hot-start**: tire pinned to the cradle pose, UR10 EE
+    #: teleported to the 6-o'clock grasp anchor, grasp constraint
+    #: attached, ``task_stage = 1``, ``_pickup_bonus_paid = True``.
+    #: The policy then immediately starts the mount carry — Stage 0
+    #: (approach / pickup) is skipped entirely. Combined with
+    #: ``terminate_on='mount'`` this gives a clean Mount-only training
+    #: setup. Set to False to retain the legacy "EE teleported below
+    #: grasp anchor but tire still pinned to cradle" easy spawn.
+    attached_spawn_when_easy: bool = True
 
     # ------------------------------------------------------------------
     # Domain randomization (Phase 1 → Sim2Real bridge)
@@ -637,6 +1051,8 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     cf_key = "contact_force_terminate_above"
     cf_user_set = cf_key in overrides
     freeze_b_user_set = "freeze_robot_b" in overrides
+    legacy_action_dim = overrides.pop("legacy_action_dim", None)
+    legacy_obs_dim = overrides.pop("legacy_obs_dim", None)
     cfg = EnvConfig(**overrides)
     cfg.reward = make_reward_config(stage, phase)
     cfg.use_shaping = (stage == 4)
@@ -657,9 +1073,22 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     # channel is also dropped (sim-side no-op under the auto-grasp
     # constraint). See ``ActionConfig`` / ``ObsConfig`` docstrings.
     if cfg.freeze_robot_b:
-        cfg.action.dim = 6
-        cfg.obs.dim = 82  # 73 base + 6 prev_action + 3 mount tail
+        if legacy_action_dim is not None:
+            cfg.action.dim = int(legacy_action_dim)
+        else:
+            cfg.action.dim = 6
+        tail = 73 + int(cfg.action.dim) + 3
+        if bool(getattr(cfg, "include_hub_guide_obs", True)):
+            cfg.obs.dim = tail + 3
+        else:
+            cfg.obs.dim = tail
     else:
         cfg.action.dim = 13
-        cfg.obs.dim = 89  # 73 base + 13 prev_action + 3 mount tail
+        tail = 73 + 13 + 3
+        if bool(getattr(cfg, "include_hub_guide_obs", True)):
+            cfg.obs.dim = tail + 3
+        else:
+            cfg.obs.dim = tail
+    if legacy_obs_dim is not None:
+        cfg.obs.dim = int(legacy_obs_dim)
     return cfg
