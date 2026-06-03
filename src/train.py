@@ -279,6 +279,88 @@ class StartPosCurriculumCallback(BaseCallback):
         self.logger.record("curriculum/start_pos_alpha_frac", float(frac))
 
 
+class StartPosEasyProbCurriculumCallback(BaseCallback):
+    """Schedules Bernoulli easy-spawn probability in ``mix`` mode (v5 / Q3).
+
+    Piecewise smoothstep schedule on global PPO ``num_timesteps``:
+
+      ``t ≤ mid_steps``     → prob = smoothstep(start → mid)
+      ``mid < t ≤ end``     → prob = smoothstep(mid → end)
+      ``t > end_steps``     → prob = end (held)
+
+    Broadcasts via ``env_method("set_start_pos_easy_prob", p)`` so every
+    sub-env's next ``reset()`` uses the updated mix weight.
+    """
+
+    def __init__(
+        self,
+        prob_start: float,
+        prob_mid: float,
+        prob_end: float,
+        mid_steps: int,
+        end_steps: int,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._p0 = float(prob_start)
+        self._p1 = float(prob_mid)
+        self._p2 = float(prob_end)
+        self._mid_steps = int(max(1, mid_steps))
+        self._end_steps = int(max(self._mid_steps + 1, end_steps))
+        self._last_pushed: Optional[float] = None
+
+    @staticmethod
+    def _smoothstep(x: float) -> float:
+        x = float(np.clip(x, 0.0, 1.0))
+        return x * x * (3.0 - 2.0 * x)
+
+    def _scheduled_prob(self, t: int) -> Tuple[float, float]:
+        t = int(max(0, t))
+        if t <= self._mid_steps:
+            frac = t / float(self._mid_steps)
+            s = self._smoothstep(frac)
+            p = self._p0 * (1.0 - s) + self._p1 * s
+            return p, frac * 0.5
+        if t <= self._end_steps:
+            span = float(self._end_steps - self._mid_steps)
+            frac = (t - self._mid_steps) / span
+            s = self._smoothstep(frac)
+            p = self._p1 * (1.0 - s) + self._p2 * s
+            return p, 0.5 + frac * 0.5
+        return self._p2, 1.0
+
+    def _broadcast(self, prob: float) -> None:
+        try:
+            self.training_env.env_method(
+                "set_start_pos_easy_prob", float(prob),
+            )
+        except AttributeError:
+            pass
+
+    def _on_training_start(self) -> None:
+        p, _ = self._scheduled_prob(int(self.model.num_timesteps))
+        self._last_pushed = p
+        self._broadcast(p)
+        if self.verbose:
+            print(f"[curriculum] start_pos_easy_prob init = {p:.3f} "
+                  f"(t={self.model.num_timesteps})")
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        t = int(self.model.num_timesteps)
+        p, frac = self._scheduled_prob(t)
+        if self._last_pushed is None or abs(p - self._last_pushed) > 1e-5:
+            self._broadcast(p)
+            self._last_pushed = p
+            if self.verbose:
+                print(f"[curriculum] start_pos_easy_prob = {p:.3f} "
+                      f"(t={t}, frac={frac:.3f})")
+        self.logger.record("curriculum/start_pos_easy_prob", float(p))
+        self.logger.record("curriculum/start_pos_easy_prob_frac", float(frac))
+
+
 class MountTolCurriculumCallback(BaseCallback):
     """Schedules the Stage 1 → 2 mount gate (radius, angle) over training.
 
@@ -632,6 +714,18 @@ def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
             ramp_steps=args.start_pos_ramp_steps,
             verbose=1,
         ))
+    if (
+        bool(getattr(args, "start_pos_easy_prob_curriculum", False))
+        and str(args.start_pos_mode) == "mix"
+    ):
+        cbs.append(StartPosEasyProbCurriculumCallback(
+            prob_start=float(args.start_pos_easy_prob_schedule_start),
+            prob_mid=float(args.start_pos_easy_prob_schedule_mid),
+            prob_end=float(args.start_pos_easy_prob_schedule_end),
+            mid_steps=int(args.start_pos_easy_prob_schedule_mid_steps),
+            end_steps=int(args.start_pos_easy_prob_schedule_end_steps),
+            verbose=1,
+        ))
     cbs.append(CheckpointCallback(
         save_freq=max(args.save_freq // max(args.num_envs, 1), 1),
         save_path=str(out_dir / "ckpts"),
@@ -861,6 +955,41 @@ def main() -> int:
             "Bernoulli probability of an easy spawn each reset when "
             "--start-pos-mode=mix. Default from EnvConfig (v9: 0.75 easy / 0.25 HOME)."
         ),
+    )
+    ap.add_argument(
+        "--start-pos-easy-prob-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=_cfg_defaults.start_pos_easy_prob_curriculum_enable,
+        help=(
+            "In mix mode, schedule easy-spawn probability over training "
+            "(0.9→0.5 @ 1M steps →0.3 @ 2M by default). "
+            "Disable with --no-start-pos-easy-prob-curriculum."
+        ),
+    )
+    ap.add_argument(
+        "--start-pos-easy-prob-schedule-start",
+        type=float,
+        default=_cfg_defaults.start_pos_easy_prob_schedule_start,
+    )
+    ap.add_argument(
+        "--start-pos-easy-prob-schedule-mid",
+        type=float,
+        default=_cfg_defaults.start_pos_easy_prob_schedule_mid,
+    )
+    ap.add_argument(
+        "--start-pos-easy-prob-schedule-end",
+        type=float,
+        default=_cfg_defaults.start_pos_easy_prob_schedule_end,
+    )
+    ap.add_argument(
+        "--start-pos-easy-prob-schedule-mid-steps",
+        type=int,
+        default=_cfg_defaults.start_pos_easy_prob_schedule_mid_steps,
+    )
+    ap.add_argument(
+        "--start-pos-easy-prob-schedule-end-steps",
+        type=int,
+        default=_cfg_defaults.start_pos_easy_prob_schedule_end_steps,
     )
     # **v11 (2026-05-31) — Reverse curriculum.** Independent of the
     # legacy start-pos curriculum; toggles per-env reset routing
@@ -1123,6 +1252,9 @@ def main() -> int:
         overrides["start_pos_ramp_steps"] = int(args.start_pos_ramp_steps)
         overrides["start_pos_curriculum_mode"] = str(args.start_pos_mode)
         overrides["start_pos_easy_prob"] = float(args.start_pos_easy_prob)
+        overrides["start_pos_easy_prob_curriculum_enable"] = bool(
+            args.start_pos_easy_prob_curriculum
+        )
         overrides["reverse_curriculum_enable"] = bool(
             getattr(args, "reverse_curriculum", False)
         )

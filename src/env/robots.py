@@ -307,6 +307,20 @@ class UR10Robot(Robot):
 
     def __init__(self, client: int, cfg: EnvConfig):
         self._lock_tool_up = bool(getattr(cfg, "ur10_lock_tool_up", True))
+        # 2026-06-03 — commanded-joint-target motion smoothing (see
+        # ``EnvConfig.ur10_joint_target_smooth_alpha`` / ``..._max_step_rad``).
+        self._smooth_alpha = float(
+            getattr(cfg, "ur10_joint_target_smooth_alpha", 1.0)
+        )
+        self._max_step = float(getattr(cfg, "ur10_joint_max_step_rad", 0.0))
+        self._pgain = float(getattr(cfg, "ur10_position_gain", 1.0))
+        self._vgain = float(getattr(cfg, "ur10_velocity_gain", 1.0))
+        self._joint_slew_max = float(
+            getattr(cfg, "ur10_joint_slew_max_rad", 0.08),
+        )
+        # Last commanded joint vector (post-smoothing). ``None`` ⇒ seed from
+        # the current measured state on the next drive call (and after reset).
+        self._cmd_q: Optional[np.ndarray] = None
         super().__init__(
             client=client,
             base_pos=cfg.robot_A_base_pos,
@@ -314,6 +328,39 @@ class UR10Robot(Robot):
             urdf_path=cfg.ur10_urdf,
             search_path=cfg.ur10_search_path,
         )
+
+    def reset_to_home(self) -> None:
+        super().reset_to_home()
+        # Re-seed the smoothing filter at the HOME pose so the first
+        # post-reset command doesn't slew from a stale target.
+        self._cmd_q = None
+
+    def _smooth_arm_targets(self, arm_targets: np.ndarray) -> np.ndarray:
+        """Low-pass the raw IK joint targets before they hit the motors.
+
+        ``q_cmd = alpha·q_ik + (1-alpha)·q_cmd_prev`` (EMA), then an
+        optional hard per-step slew clamp. A no-op when ``alpha == 1.0``
+        and ``max_step == 0.0`` (the training default), so trained
+        policies are unaffected. The filter state seeds from the current
+        measured joint vector on the first call after a reset.
+        """
+        alpha = self._smooth_alpha
+        max_step = self._max_step
+        if alpha >= 1.0 and max_step <= 0.0:
+            return arm_targets
+        if self._cmd_q is None:
+            self._cmd_q, _ = self.joint_state()
+        prev = self._cmd_q
+        if alpha < 1.0:
+            cmd = alpha * arm_targets + (1.0 - alpha) * prev
+        else:
+            cmd = arm_targets.astype(np.float64, copy=True)
+        if max_step > 0.0:
+            delta = np.clip(cmd - prev, -max_step, max_step)
+            cmd = prev + delta
+        cmd = np.clip(cmd, self.arm.lower, self.arm.upper)
+        self._cmd_q = cmd.copy()
+        return cmd
 
     def apply_delta_ee(self, delta_pos: np.ndarray, delta_axisangle: np.ndarray) -> None:
         """Δpos drives EE translation. When ``ur10_lock_tool_up`` is True:
@@ -395,8 +442,8 @@ class UR10Robot(Robot):
         # sag that 0.3 produced. The drift-free target accumulator
         # above means there is no longer a positive feedback loop
         # between sag and IK target, so we can afford the stiffer PD.
-        pgains = [1.0] * len(forces)
-        vgains = [1.0] * len(forces)
+        pgains = [self._pgain] * len(forces)
+        vgains = [self._vgain] * len(forces)
         p.setJointMotorControlArray(
             self.uid, self.arm.indices,
             controlMode=p.POSITION_CONTROL,
@@ -406,6 +453,284 @@ class UR10Robot(Robot):
             velocityGains=vgains,
             physicsClientId=self.client,
         )
+
+    def drive_arm_targets_toward(
+        self,
+        target_q: np.ndarray,
+        max_step_rad: float,
+    ) -> None:
+        """Slew measured joints toward ``target_q`` (caps per-step jump)."""
+        cap = float(max_step_rad)
+        if cap <= 0.0:
+            self.drive_arm_targets(target_q)
+            return
+        cur_q, _ = self.joint_state()
+        delta = np.clip(
+            np.asarray(target_q, dtype=np.float64) - cur_q,
+            -cap, cap,
+        )
+        self.drive_arm_targets(cur_q + delta)
+
+    def drive_arm_targets(self, arm_targets: np.ndarray) -> None:
+        """Send (optionally smoothed) joint targets to the arm motors."""
+        arm_targets = np.clip(
+            np.asarray(arm_targets, dtype=np.float64),
+            self.arm.lower, self.arm.upper,
+        )
+        arm_targets = self._smooth_arm_targets(arm_targets)
+        forces = [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
+        p.setJointMotorControlArray(
+            self.uid, self.arm.indices,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=arm_targets.tolist(),
+            forces=forces,
+            positionGains=[self._pgain] * len(forces),
+            velocityGains=[self._vgain] * len(forces),
+            physicsClientId=self.client,
+        )
+
+    def solve_arm_joints_in_snapshot(
+        self,
+        pos: np.ndarray,
+        quat: np.ndarray,
+        warm_q: np.ndarray,
+    ) -> np.ndarray:
+        """IK only (caller owns save/restore). Chained warm-start for baking."""
+        target_pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        target_orn = np.asarray(quat, dtype=np.float64).reshape(4)
+        n = float(np.linalg.norm(target_orn))
+        if n > 1e-12:
+            target_orn = target_orn / n
+        else:
+            target_orn = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        warm = np.clip(
+            np.asarray(warm_q, dtype=np.float64).reshape(-1),
+            self.arm.lower, self.arm.upper,
+        )
+        ik = p.calculateInverseKinematics(
+            self.uid, self.EE_LINK_INDEX,
+            target_pos.tolist(), target_orn.tolist(),
+            lowerLimits=self.arm.lower.tolist(),
+            upperLimits=self.arm.upper.tolist(),
+            jointRanges=self.arm.range.tolist(),
+            restPoses=warm.tolist(),
+            maxNumIterations=200,
+            residualThreshold=1e-4,
+            physicsClientId=self.client,
+        )
+        ik = np.asarray(ik, dtype=np.float64)
+        max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+        if len(ik) > max_slot:
+            arm_targets = ik[self._ik_arm_slots]
+        else:
+            arm_targets = self._fallback_targets()
+        return np.clip(arm_targets, self.arm.lower, self.arm.upper)
+
+    def apply_palm_up_locked(self, pos) -> None:
+        """**Iterative palm-up IK** with save/restore state isolation.
+
+        2026-06-02 (path B — closed-form-style). Runs PyBullet's IK in
+        a state-snapshot, projects the result onto the palm-up manifold
+
+            wrist_1 = -pi/2 - shoulder_lift - elbow
+            wrist_2 = 0
+            wrist_3 = -pi/2
+
+        re-seeds the next pass from the projected joint vector, and
+        repeats until the position error is small or 5 passes elapse.
+        The state-snapshot keeps the rest of the simulation (notably
+        the ``JOINT_FIXED`` tire bond) frozen during iteration, so the
+        intermediate ``resetJointState`` calls don't shock the bond
+        with phantom impulses.
+
+        The converged joint vector is then driven via stiff PD —
+        because the IK target is a smooth function of ``pos`` and the
+        previous step's converged state, consecutive control steps
+        produce smooth joint trajectories (no sudden wrist snaps),
+        which keeps bond reaction forces in the physically expected
+        range (a few N for the 0.5 kg tire).
+
+        The post-step ``enforce_palm_up_wrists`` safety net (called
+        from ``TyroEnv.step``) handles the rare case where PD
+        undershoots and the achieved wrist values drift off the
+        palm-up manifold.
+        """
+        target_pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        target_orn = list(self.FINAL_LOCK_QUATERNION)
+        self.last_target_pos = target_pos.copy()
+
+        state_id = p.saveState(physicsClientId=self.client)
+        try:
+            # Warm-start from CURRENT joint state so the converged IK
+            # target is in the same branch as the previous step. This
+            # keeps PD targets continuous step-to-step (essential for
+            # the JOINT_FIXED tire bond — large per-step joint jumps
+            # generate kN-scale phantom impulses on the bond).
+            cur_q, _ = self.joint_state()
+            warm = cur_q.copy()
+            # Project the warm start onto the palm-up manifold so the
+            # very first IK pass is already close to the manifold.
+            warm[3] = -math.pi / 2.0 - warm[1] - warm[2]
+            warm[4] = 0.0
+            warm[5] = -math.pi / 2.0
+            warm = np.clip(warm, self.arm.lower, self.arm.upper)
+            arm_targets: Optional[np.ndarray] = None
+            for _pass in range(5):
+                ik = p.calculateInverseKinematics(
+                    self.uid, self.EE_LINK_INDEX,
+                    target_pos.tolist(), target_orn,
+                    lowerLimits=self.arm.lower.tolist(),
+                    upperLimits=self.arm.upper.tolist(),
+                    jointRanges=self.arm.range.tolist(),
+                    restPoses=warm.tolist(),
+                    maxNumIterations=200,
+                    residualThreshold=1e-5,
+                    physicsClientId=self.client,
+                )
+                ik = np.asarray(ik, dtype=np.float64)
+                max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+                if len(ik) > max_slot:
+                    arm_targets = ik[self._ik_arm_slots].copy()
+                else:
+                    arm_targets = self._fallback_targets()
+                # Project onto the palm-up manifold.
+                arm_targets[3] = -math.pi / 2.0 - arm_targets[1] - arm_targets[2]
+                arm_targets[4] = 0.0
+                arm_targets[5] = -math.pi / 2.0
+                arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
+                # Set the (snapshot-protected) joint state for the next
+                # IK pass and for the convergence FK check below.
+                for idx, qv in zip(self.arm.indices, arm_targets):
+                    p.resetJointState(
+                        self.uid, idx,
+                        targetValue=float(qv), targetVelocity=0.0,
+                        physicsClientId=self.client,
+                    )
+                ee_now, _ = self.ee_pose()
+                if float(np.linalg.norm(ee_now - target_pos)) < 1e-4:
+                    break
+                warm = arm_targets.copy()
+            if arm_targets is None:
+                arm_targets = self._fallback_targets()
+        finally:
+            p.restoreState(stateId=state_id, physicsClientId=self.client)
+            p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
+
+        self.drive_arm_targets(arm_targets)
+
+    def enforce_palm_up_wrists(self, tool_z_threshold: float = 0.999) -> None:
+        """Geometric safety net: snap wrist_1/2/3 to the palm-up formula
+        ONLY when the IK-driven gripper has drifted off the palm-up
+        manifold by more than ``acos(tool_z_threshold)`` (default ≈ 2.5°).
+
+        ``tool_z_threshold`` is the dot product of the gripper's tool +Z
+        axis with the world +Z axis; 1.0 = perfectly palm-up, 0.999 =
+        ~2.5° tilt. Most steps will be inside the threshold (IK with
+        HOME warm-start typically holds palm-up to numerical precision),
+        so the wrist override almost never fires — meaning
+        ``JOINT_FIXED`` rigid grasp + IK position accuracy work
+        normally and the tire is physically held upright by the bond.
+        On the rare step where IK saturates and palm-up slips, this
+        method snaps the wrists back via
+        ``resetJointState`` (with ``JOINT_FIXED`` the tire snaps with
+        them; the resulting physics impulse is small because the
+        deviation was small to begin with).
+        """
+        ee_pos, ee_orn = self.ee_pose()
+        R = np.array(p.getMatrixFromQuaternion(list(ee_orn))).reshape(3, 3)
+        tool_z_dot_world_z = float(R[2, 2])
+        if tool_z_dot_world_z >= tool_z_threshold:
+            return  # palm-up is healthy; do nothing.
+
+        states = p.getJointStates(
+            self.uid, self.arm.indices, physicsClientId=self.client,
+        )
+        q = np.array([s[0] for s in states], dtype=np.float64)
+        lift = float(q[1])
+        elbow = float(q[2])
+        w1 = float(np.clip(
+            -math.pi / 2.0 - lift - elbow,
+            float(self.arm.lower[3]), float(self.arm.upper[3]),
+        ))
+        w2 = float(np.clip(
+            0.0, float(self.arm.lower[4]), float(self.arm.upper[4]),
+        ))
+        w3 = float(np.clip(
+            -math.pi / 2.0,
+            float(self.arm.lower[5]), float(self.arm.upper[5]),
+        ))
+        for slot, val in zip((3, 4, 5), (w1, w2, w3)):
+            p.resetJointState(
+                self.uid,
+                self.arm.indices[slot],
+                targetValue=float(val),
+                targetVelocity=0.0,
+                physicsClientId=self.client,
+            )
+        wrist_indices = [self.arm.indices[s] for s in (3, 4, 5)]
+        p.setJointMotorControlArray(
+            self.uid, wrist_indices,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=[w1, w2, w3],
+            forces=[60.0, 60.0, 60.0],
+            positionGains=[1.0, 1.0, 1.0],
+            velocityGains=[1.0, 1.0, 1.0],
+            physicsClientId=self.client,
+        )
+
+    def apply_palm_up_pose(self, pos, target_orn) -> None:
+        """Absolute-pose IK with **HOME-based warm start**, for palm-up.
+
+        2026-06-01 (Option B): ``apply_absolute_ee`` warm-starts IK from
+        the *current* joint state, which is intended to keep the solver
+        in the same branch as the previous step. But when we tilt-lock
+        the orientation to palm-up, the current state may be in a
+        partially-tilted branch (because SLERP from a non-palm-up
+        previous target left the arm there) and IK then converges to
+        an upside-down "shoulder rotated 180°" solution that satisfies
+        ``tool +Z = world −Z`` instead of ``+Z``. Diagnostic smoke
+        showed ``tool_z · world_z`` flipping to −0.58 mid-trajectory.
+        Switching the warm start to ``HOME_POSE`` (the canonical
+        palm-up rest pose) consistently anchors IK to the upright
+        branch. Residual / maxIter / PD gains identical to
+        ``apply_delta_ee`` lock path which had clean palm-up
+        convergence in the v0 smoke.
+        """
+        target_pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        target_orn = np.asarray(target_orn, dtype=np.float64).reshape(4)
+        n = float(np.linalg.norm(target_orn))
+        if n > 1e-12:
+            target_orn = target_orn / n
+        else:
+            target_orn = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        self.last_target_pos = target_pos.copy()
+
+        # Warm-start from the *current* arm state (not HOME) so consecutive
+        # planner steps stay in the same IK branch — HOME rest was the main
+        # source of step-to-step wrist snaps / visible shaking.
+        cur_q, _ = self.joint_state()
+        ik = p.calculateInverseKinematics(
+            self.uid, self.EE_LINK_INDEX,
+            target_pos.tolist(), target_orn.tolist(),
+            lowerLimits=self.arm.lower.tolist(),
+            upperLimits=self.arm.upper.tolist(),
+            jointRanges=self.arm.range.tolist(),
+            restPoses=cur_q.tolist(),
+            maxNumIterations=200,
+            residualThreshold=1e-4,
+            physicsClientId=self.client,
+        )
+        ik = np.asarray(ik, dtype=np.float64)
+        max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+        if len(ik) > max_slot:
+            arm_targets = ik[self._ik_arm_slots]
+        else:
+            arm_targets = self._fallback_targets()
+        arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
+        if self._joint_slew_max > 0.0:
+            self.drive_arm_targets_toward(arm_targets, self._joint_slew_max)
+        else:
+            self.drive_arm_targets(arm_targets)
 
     def apply_absolute_ee(self, pos, quat) -> None:
         """Direct absolute (world-frame) EE-pose IK + joint control.
@@ -458,19 +783,7 @@ class UR10Robot(Robot):
         else:
             arm_targets = self._fallback_targets()
         arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
-        # UR10 joint torque caps + PD — same tuning as ``apply_delta_ee``.
-        forces = [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
-        pgains = [1.0] * len(forces)
-        vgains = [1.0] * len(forces)
-        p.setJointMotorControlArray(
-            self.uid, self.arm.indices,
-            controlMode=p.POSITION_CONTROL,
-            targetPositions=arm_targets.tolist(),
-            forces=forces,
-            positionGains=pgains,
-            velocityGains=vgains,
-            physicsClientId=self.client,
-        )
+        self.drive_arm_targets(arm_targets)
 
     def _arm_joint_indices(self) -> List[int]:
         # Match by URDF joint name — robust to non-arm joints (Robotiq gripper,

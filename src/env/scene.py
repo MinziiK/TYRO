@@ -53,6 +53,14 @@ class SceneHandles:
     #: vertical tire during Stage 0 (front + rear). Empty when
     #: ``spawn_tire_rack`` is False.
     tire_rack: List[int] = field(default_factory=list)
+    #: **2026-06-02 (cargo penetration fix)** — UID of the static thin slab
+    #: behind the hub (``cfg.spawn_cargo_back_wall``). Previously the
+    #: ``_make_cargo_back_wall`` return value was discarded, which left the
+    #: body in the simulation but invisible to ``_in_bad_collision`` /
+    #: ``_max_contact_normal_force``. Storing it here so the env can include
+    #: it in collision checks (both for the robot arms and for the
+    #: kinematically-driven tire). ``None`` when the back wall is disabled.
+    cargo_back_wall: Optional[int] = None
 
     @property
     def target_bolt(self) -> BodyLinkRef:
@@ -120,6 +128,19 @@ class Scene:
         vehicle_id: Optional[int] = None
         if self.cfg.spawn_vehicle_primitive_box:
             vehicle_id = self._make_vehicle_box(hub_pos)
+        # **2026-06-01 (cargo back wall)** — independent thin slab placed
+        # at ``hub_y + cargo_back_wall_y_offset`` (default 0.18 m, just
+        # past a fully-mounted tire's far face at hub_y + 0.15). Stops
+        # the policy from pushing the tire all the way through the hub
+        # into the cargo interior. Implemented as a separate static
+        # body to avoid the PyBullet compound-primitive count limit
+        # we hit when subdividing the cargo body itself.
+        cargo_back_wall_uid: Optional[int] = None
+        if (
+            self.cfg.spawn_vehicle_primitive_box
+            and bool(getattr(self.cfg, "spawn_cargo_back_wall", False))
+        ):
+            cargo_back_wall_uid = self._make_cargo_back_wall(hub_pos)
 
         truck_uid: Optional[int] = None
         bolts: List[BodyLinkRef] = []
@@ -195,6 +216,7 @@ class Scene:
             vehicle=vehicle_id,
             target_bolt_idx=target_idx,
             tire_rack=rack_uids,
+            cargo_back_wall=cargo_back_wall_uid,
         )
         return self.handles
 
@@ -431,6 +453,38 @@ class Scene:
             baseVisualShapeIndex=vis,
             basePosition=pos.tolist(),
             baseOrientation=cargo_orn.tolist(),
+            physicsClientId=self.client,
+        )
+
+    def _make_cargo_back_wall(self, hub_center: np.ndarray) -> int:
+        """Static thin slab behind the hub blocking +Y push past the flange.
+
+        World-axis aligned (no yaw) for simplicity — only the +Y face
+        matters for blocking. Half-extents from
+        ``cfg.cargo_back_wall_half_extents``; placed at
+        ``(hub_x, hub_y + offset, back_wall_center_z)``.
+        """
+        he = list(self.cfg.cargo_back_wall_half_extents)
+        offset = float(self.cfg.cargo_back_wall_y_offset)
+        wall_pos = [
+            float(hub_center[0]),
+            float(hub_center[1]) + offset,
+            float(self.cfg.cargo_back_wall_center_z),
+        ]
+        rgba = list(self.cfg.cargo_back_wall_rgba)
+        col = p.createCollisionShape(
+            p.GEOM_BOX, halfExtents=he, physicsClientId=self.client,
+        )
+        vis = p.createVisualShape(
+            p.GEOM_BOX, halfExtents=he, rgbaColor=rgba,
+            physicsClientId=self.client,
+        )
+        return p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=wall_pos,
+            baseOrientation=[0.0, 0.0, 0.0, 1.0],
             physicsClientId=self.client,
         )
 

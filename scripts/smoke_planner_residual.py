@@ -9,7 +9,14 @@ trajectory state so we can verify:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import numpy as np
+
+_REPO = Path(__file__).resolve().parents[1]
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 from src.config import make_env_config
 from src.env.tyro_env import TyroEnv

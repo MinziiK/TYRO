@@ -26,6 +26,7 @@ set DEFAULT_RUN=phase1_%TS%
     --num-envs 12 ^
     --total-steps 2000000 ^
     --run-name %DEFAULT_RUN% ^
+    --contact-force-done 0 ^
     %*
 
 endlocal

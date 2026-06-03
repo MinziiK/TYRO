@@ -123,6 +123,8 @@ class RewardConfig:
     #: termination gate triggers.
     w_vertical: float = 1.0
     #: Stage 2 — penalty on tire descent speed (encourages soft landing).
+    #: **2026-06-03 (phase1_grad_v6 / R2)** — v5 raised this to 0.75 which
+    #: encouraged hover-without-landing (reward hacking). Restored to v4.
     w_landing_speed: float = 0.5
 
     # FSM transition / completion bonuses
@@ -183,7 +185,18 @@ class RewardConfig:
     # UR10 cooperative sync — penalize large joint velocity on A so Panda can refine.
     #: **v9**: 0.08 → 0.04; **v9b**: 0.04 → 0.02 — v9 still logged
     #: sync_joint_A ≈ -2.5~-4/step drowning carry dense despite w_guide=8.
-    w_sync_joint_a: float = 0.02
+    #: **2026-06-02 (phase1_grad_v3)**: 0.02 → **0.005**. With the
+    #: planner-residual control scheme, the planner sets large IK
+    #: targets every step and the motor servos at correspondingly high
+    #: joint velocities; v2 logged ``sync_joint_A ≈ -11/step``, single-
+    #: handedly making ``dense_total_pre_mix`` negative (-10.9) despite
+    #: ``guide_A + pb_carry`` being positive. With the residual policy
+    #: only adding fine corrections on top, the cooperative-sync
+    #: penalty no longer plays the regulariser role it did in the
+    #: legacy raw-delta scheme — slashing the weight 4× restores a
+    #: positive dense kernel without sacrificing arm jitter control
+    #: (the planner already produces smooth nominal trajectories).
+    w_sync_joint_a: float = 0.005
 
     # Sparse / dense balancing (applied to sparse success vs dense process total).
     mix_sparse_success: float = 0.7
@@ -243,6 +256,22 @@ class RewardConfig:
     #: with v11 Stage 1 dense gating (lateral/axial masked) makes hover
     #: cost positive (worse than chance), so the value function is forced
     #: to value progress, not standing-still.
+    #: **2026-06-02 (phase1_grad_v3)**: 0.15 → **0.05**. v11 used
+    #: ``max_steps = 400`` so the alive cost capped at -60/ep. The
+    #: current ``max_steps = 600`` makes the same 0.15/step pile up to
+    #: -90/ep — a constant negative baseline that drowns out the FSM
+    #: bonus signal during early exploration (when ep_len_mean ≈ 416
+    #: the alive cost alone is -62, larger than the per-step expected
+    #: value of any single positive dense term). 0.05/step over 600
+    #: steps caps at -30/ep, restoring the v6/v9b ratio while keeping
+    #: hover discouraged (still a non-trivial opportunity cost).
+    #: **2026-06-03 (phase1_grad_v7 / S3)**: 0.05 → **0.15** restored.
+    #: v5/v6 deterministic eval showed reward hacking — the policy
+    #: hovered for the full episode (≈ 600 steps) collecting dense
+    #: shaping (+ 368 ~ + 603 / ep) instead of completing the task
+    #: (R_mount + R_demount + R_landing ≈ + 480). 0.15 / step × 600
+    #: step = - 90 / ep, larger than any feasible hover-farming
+    #: subtotal, restoring sparse > dense ordering.
     w_step_alive: float = 0.15
 
     # Potential-based shaping (optional; enabled via use_shaping flag in EnvConfig)
@@ -319,7 +348,17 @@ class EnvConfig:
     #: cycle plus margin. Hover risk is already contained by the new
     #: ``w_step_alive`` and the tight ``approach_decay`` (rev-3). Override
     #: via ``--max-steps`` on the CLI when running pickup-only sweeps.
-    max_steps: int = 600            # ≈ 30 s at 20 Hz (v11c: 400 → 600 to fit full Pickup → Mount → Demount → Return cycle)
+    #: **2026-06-02 (phase1_grad_v5 / Q3)**: 600 → 900 (≈ 45 s at 20 Hz).
+    #: v4 deterministic eval on hard HOME spawns used ~500 steps to reach
+    #: mount with no time left for demount + cradle return; 900 gives
+    #: ~400 steps after mount for Stage 2/3 without changing physics.
+    #: **2026-06-03 (phase1_grad_v7 / S1)**: 900 → **600** restored.
+    #: v5/v6 deterministic eval revealed dense reward farming over
+    #: 900-step hover episodes (rew + 368 ~ + 603 / ep with sparse = 0).
+    #: 600 caps the dense-accumulation budget, restoring sparse-bonus
+    #: dominance even though hard-HOME ep cannot always finish the
+    #: full Pickup → Mount → Demount → Return cycle in 600 step.
+    max_steps: int = 600
     gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
     render: bool = False            # GUI vs DIRECT
 
@@ -339,12 +378,19 @@ class EnvConfig:
     #: positive guide+PB carry kernels, ending the episode on contact is
     #: also a *premature* signal that prevents the policy from
     #: recovering from a glancing brush against the rack/cargo.
-    #: **2026-06-01 (planner-residual rewrite)**: flipped back to ``True``.
-    #: With the new Min-Jerk planner the nominal trajectory is *guaranteed*
-    #: collision-free for the fixed Phase-1 scene, so any in-collision
-    #: state is unambiguous policy misbehaviour. We end the episode
-    #: immediately and apply ``R_fail = -50`` (auto-paid in ``step``).
-    collision_terminates: bool = True
+    #: **2026-06-01 (planner-residual rewrite)**: initially flipped back
+    #: to ``True`` on the assumption that the Min-Jerk EE trajectory was
+    #: collision-free. **Reverted to ``False`` after the v1 training run**
+    #: showed every easy-spawn ep terminated within 1–48 steps. Root
+    #: cause: the EE trajectory itself is clear, but the UR10 *arm body*
+    #: (shoulder / upper-arm links) sweeps into the cargo box during the
+    #: long Y-direction carry from cradle (Y≈0) to hub (Y≈+0.80) — the
+    #: nominal planner is end-effector-only, not whole-arm collision-free.
+    #: With ``False`` the env still applies the per-step
+    #: ``-w_collision`` penalty (10.0) so the residual policy is forced
+    #: to learn an arm-side avoidance, but the episode survives long
+    #: enough to receive the R_mount sparse signal.
+    collision_terminates: bool = False
 
     # Reward shaping toggle (Stage 4 in spec §4.3)
     use_shaping: bool = False
@@ -476,6 +522,44 @@ class EnvConfig:
     #: this check so the policy is free to rotate the tire toward
     #: ``hub_axis_world`` for mount alignment.
     tire_spawn_axis_world: Tuple[float, float, float] = (1.0, 0.0, 0.0)
+    #: **2026-06-02 (kinematic upright lock — final design)** — while
+    #: the tire is grasped, re-write its base orientation every control
+    #: step so roll/pitch stay at the spawn "standing" pose and only
+    #: world +Z yaw can change (driven by the UR10 EE yaw so the bore
+    #: can align with the hub). Position follows the EE via a cached
+    #: world-frame COM offset. With the cargo penetration guard
+    #: (``_sync_grasped_tire_upright`` reverts to the last safe pose
+    #: when the kinematic update would push the tire INTO cargo /
+    #: back-wall geometry), this approach is robust and physically
+    #: meaningful: the tire is rigidly upright, cargo cannot be
+    #: phased through, and the policy is penalised for trying.
+    #:
+    #: A geometric palm-up lock with a ``JOINT_FIXED`` rigid grasp
+    #: (path B) was prototyped but rejected: PyBullet's iterative
+    #: constraint solver cannot keep a 0.5 kg child rigidly bonded to
+    #: a multi-link arm under fast trajectory motion, even with
+    #: ``erp=1.0`` and 200 LCP iterations. Bond reaction forces of
+    #: 400-650 kN (vs the ~10 N that physics actually requires) and
+    #: 0.7 → 0.5 m bond-distance oscillation were observed in
+    #: ``scripts/diag_palmup_locked_grasp.py``. Kinematic projection
+    #: is the practical solution for this scenario.
+    lock_tire_upright_when_grasped: bool = True
+    #: Stages where the tire pose is re-written every step (kinematic
+    #: upright lock). Default ``(0,)`` = pickup approach only. Stage 1+
+    #: uses a ``JOINT_FIXED`` EE bond instead so the tire is not
+    #: teleported every physics sub-step (which amplified EE/IK jitter
+    #: into visible "수직 유지" shaking during carry/mount).
+    kinematic_tire_lock_stages: Tuple[int, ...] = (0, 1, 2, 3)
+    #: EMA blend for kinematic tire sync (1.0 = snap, 0.35 = smooth).
+    #: Low values cut the "수직 유지" teleport jitter while keeping reach.
+    kinematic_tire_sync_alpha: float = 0.65
+    #: Max joint change (rad) per control step when playing back a baked
+    #: planner trajectory — slew is taken from the *measured* arm state,
+    #: not the previous command, so PD lag cannot cause 1+ rad snaps.
+    ur10_joint_slew_max_rad: float = 0.0
+    #: Baked planner: advance to the next waypoint when
+    #: ``max|q - q_waypoint|`` falls below this (rad).
+    planner_joint_waypoint_tol_rad: float = 0.05
     #: Hub-mounting target in world (= hub_pos_nominal under the new
     #: Robot B-centric layout).
     tire_mount_pos: Tuple[float, float, float] = (0.0, 0.80, 0.22)
@@ -525,11 +609,11 @@ class EnvConfig:
     #: Linear ramp length (global PPO timesteps) after the soft hold
     #: during which the gate is interpolated from ``approach_tol_soft``
     #: down to ``approach_radius_tol``. Matches the start-pos ramp.
-    #: **2026-05-29 (rev 4)**: shortened 500k → 300k so the hard regime
-    #: lands by t = 400k. With total = 2M this leaves 1.6M steps of
-    #: pure hard-mode learning (vs 1.4M previously) — more budget for
-    #: the policy to actually master the HOME-pose pickup.
-    approach_tol_ramp_steps: int = 300_000
+    #: **2026-06-02**: lengthened 300k → **500k** so the gate tightens
+    #: more gradually (≈ 0.04 mm narrower per 100 steps). With total =
+    #: 2M and 100k soft hold this hits the hard regime at t = 600k,
+    #: leaving 1.4M steps of pure hard-mode learning.
+    approach_tol_ramp_steps: int = 500_000
 
     # ------------------------------------------------------------------
     # Stage 0 starting-pose curriculum + early termination.
@@ -552,10 +636,12 @@ class EnvConfig:
     start_pos_curriculum_steps: int = 100_000
     #: Smoothstep ramp length (global PPO timesteps) after the easy hold.
     #: alpha advances from 0 → 1 as ``smoothstep((t − hold) / ramp)``.
-    #: **2026-05-29 (rev 4)**: shortened 500k → 300k so the policy
-    #: locks onto HOME-pose pickups by t = 400k, leaving 1.6M steps
-    #: of converged hard-mode learning.
-    start_pos_ramp_steps: int = 300_000
+    #: **2026-06-02**: lengthened 300k → **500k** to match the new
+    #: ``approach_tol_ramp_steps``. The two curricula are deliberately
+    #: synced: tightening the pickup gate while moving the start pose
+    #: away from the easy zone in lockstep prevents either curriculum
+    #: from outpacing the other.
+    start_pos_ramp_steps: int = 500_000
     #: **v8 (50% mix)** — start-pos curriculum *operating mode*.
     #:   * ``"lerp"`` (legacy): the callback smoothsteps a single alpha
     #:     from 0 (easy) → 1 (HOME) over ``curriculum_steps + ramp_steps``.
@@ -581,7 +667,18 @@ class EnvConfig:
     #: ``terminate_on='mount'`` this yields the fastest possible
     #: Mount-only training loop. Override on the CLI to mix HOME
     #: starts back in once mount converges.
-    start_pos_easy_prob: float = 1.0
+    #: **2026-06-02 (phase1_grad_v5 / Q3)**: 1.0 → **0.9** initial mix weight.
+    #: When ``start_pos_easy_prob_curriculum_enable`` is True,
+    #: ``StartPosEasyProbCurriculumCallback`` drives the live value down
+    #: to 0.5 @ 1M steps and 0.3 @ 2M steps so hard HOME spawns ramp in.
+    start_pos_easy_prob: float = 0.9
+    #: Schedule Bernoulli easy-spawn probability in ``mix`` mode (v5).
+    start_pos_easy_prob_curriculum_enable: bool = True
+    start_pos_easy_prob_schedule_start: float = 0.9
+    start_pos_easy_prob_schedule_mid: float = 0.5
+    start_pos_easy_prob_schedule_end: float = 0.3
+    start_pos_easy_prob_schedule_mid_steps: int = 1_000_000
+    start_pos_easy_prob_schedule_end_steps: int = 2_000_000
 
     # ------------------------------------------------------------------
     # **v11 (2026-05-31) — Reverse curriculum (backtracking) scheduler.**
@@ -696,6 +793,19 @@ class EnvConfig:
     #: replanning code stays wired but is not exercised under this default
     #: — flip to ``"never"`` once mount converges.
     terminate_on: str = "mount"
+    #: **2026-06-03 — hub mount pose hold (demo / visual correctness).**
+    #: Phase-1 FSM continues to Stage 2 (demount) after mount; the tire
+    #: stays kinematically glued to the EE until landing unless pinned.
+    #: When ``pin_tire_on_mount`` is True, the tire is snapped to
+    #: ``tire_mount_pos`` with bore ‖ ``hub_axis_world`` and made static
+    #: (same mechanism as cradle pin) at the mount event.
+    pin_tire_on_mount: bool = True
+    #: After the mount gate fires, keep the arm frozen at the current
+    #: joint vector for this many control steps before ending the episode
+    #: (only when ``terminate_on == "mount"``). 0 = immediate terminate
+    #: (legacy training). 40 ≈ 2 s at 20 Hz — enough to *see* a still
+    #: mounted tire in the GUI.
+    mount_hold_steps: int = 0
     #: Stage 2 demount target — axial distance (m) the tire centre must
     #: travel *away* from the hub centre to fire the Stage 2 → 3 trigger.
     #: 30 cm is roughly 1.5× tire thickness (0.30 m / 2 + clearance), so
@@ -725,18 +835,30 @@ class EnvConfig:
     #: even when carry trajectory is loose. The radius then sweeps
     #: 0.30 → ``mount_radius_tol`` over ``mount_tol_ramp_steps``.
     mount_radius_tol_soft: float = 0.30
-    #: v6 mount-gate curriculum — **start axis tolerance** (rad). Default
-    #: 35° lets the tire-bore vs hub-axis angle be very forgiving while
-    #: the policy learns the carry trajectory; the ramp tightens it to
-    #: ``RewardConfig.delta_A`` (5°) at the end.
-    mount_angle_tol_soft_rad: float = np.deg2rad(35.0)
+    #: v6 mount-gate curriculum — **start axis tolerance** (rad).
+    #: **2026-06-02 (planner-yaw alignment)**: tightened back from
+    #: 100° → **30°**. Stage 1's planner end-pose now rotates the
+    #: gripper −90° about world +Z so the kinematically-locked tire
+    #: bore aligns with ``hub_axis_world`` automatically (see
+    #: ``TyroEnv._compute_stage_end_ee_pose`` stage==1 branch). 30°
+    #: gives the policy headroom for residual yaw error during the
+    #: SLERP rotation but is no longer a "free pass" — the planner
+    #: does the bulk of the work. Smoothsteps to ``reward.delta_A``
+    #: (5°) over ``mount_tol_ramp_steps``.
+    mount_angle_tol_soft_rad: float = np.deg2rad(30.0)
     #: v6 mount curriculum hold (global PPO steps) — gate stays at the
     #: soft pair before the smoothstep ramp engages.
-    mount_tol_curriculum_steps: int = 200_000
+    #: **2026-06-02**: 200k → 300k so the policy has more time to
+    #: master the new yaw-aligned mount before the gate tightens.
+    mount_tol_curriculum_steps: int = 300_000
     #: v6 mount curriculum ramp (global PPO steps) — smoothstep from
     #: ``(mount_radius_tol_soft, mount_angle_tol_soft_rad)`` down to
     #: ``(mount_radius_tol, reward.delta_A)``.
-    mount_tol_ramp_steps: int = 600_000
+    #: **2026-06-02**: 600k → 1.0M so each 1° narrowing of the angle
+    #: tol gets ~40k steps of policy adaptation (was ~6k under the
+    #: 100° → 5° / 600k schedule). With total = 2M this still leaves
+    #: 700k steps of pure hard-mode learning at the end.
+    mount_tol_ramp_steps: int = 1_000_000
     #: Stage 2 → success: ‖tire − pickup‖ < ``return_radius_tol`` AND tire
     #: descent speed < ``landing_speed_max`` (soft landing).
     return_radius_tol: float = 0.05
@@ -748,6 +870,18 @@ class EnvConfig:
     #: so the policy can rotate the tire 90° about world +Z to align
     #: the bore with ``hub_axis_world`` for mount.
     vertical_tol_rad: float = np.deg2rad(15.0)
+    #: **2026-06-02 (Stage 3 cradle-return gate fix)** — radius (metres)
+    #: from ``tire_pickup_pos`` within which the Stage 3 vertical gate
+    #: (termination + dense penalty) re-activates. Outside this radius
+    #: the policy is free to slerp the tire bore from ``hub_axis_world``
+    #: (-Y) back to ``tire_spawn_axis_world`` (+X) along the planner
+    #: return trajectory without tripping the 15° tolerance. Inside the
+    #: radius the spawn vertical pose is enforced again so the cradle
+    #: landing still demands the production pose. 0.20 m comfortably
+    #: covers the cradle drop neighbourhood (rack diameter ≈ 0.30 m)
+    #: while leaving > 1.5 m of free-rotation runway across the carry
+    #: trajectory.
+    stage3_vertical_gate_radius: float = 0.20
     #: Legacy (kept for backwards-compat with utility scripts). The Phase 1
     #: FSM uses ``tire_pickup_pos`` directly so this offset is no longer
     #: consumed by the env, but render/calibrate scripts may still read it.
@@ -812,6 +946,35 @@ class EnvConfig:
     #: wheel-well cutout removes the middle/bottom cells, leaving two
     #: vertical pillars plus a roof so the arch opens around the tire.
     cargo_collision_subdiv: Tuple[int, int, int] = (1, 6, 3)
+
+    # ------------------------------------------------------------------
+    # **2026-06-01 — Cargo back wall (inner cargo block).**
+    # ------------------------------------------------------------------
+    # A separate static body placed *behind* the hub (between the wheel
+    # well and the cargo interior) so the tire cannot be pushed through
+    # the hub flange into the cargo. Independent body avoids hitting
+    # PyBullet's compound primitive count limit when adding more cargo
+    # subdivisions. Geometry: thin slab spanning the cargo's X-Z face,
+    # placed at world Y just past the hub (= ``hub_y + back_wall_y_offset``)
+    #: Master switch — when False, no extra body is spawned.
+    spawn_cargo_back_wall: bool = True
+    #: Y offset (m) from the hub centre to the back-wall plane. The hub
+    #: thickness is 0.06 m and the tire is 0.30 m thick; once the tire
+    #: COM is at the hub centre, the tire's far face sits at hub_y + 0.15.
+    #: **2026-06-01 (relaxed)** — pushed 0.18 → **0.30** m so the wall
+    #: sits in the middle of the 0.50 m cargo depth (world Y = 1.10):
+    #:   * 15 cm clearance past the mounted-tire face (was only 3 cm)
+    #:   * 20 cm clearance from the cargo's outer face (Y = 1.30)
+    #: This gives the policy a small overshoot tolerance during the final
+    #: mount approach without letting the tire actually penetrate the hub
+    #: into the cargo interior.
+    cargo_back_wall_y_offset: float = 0.30
+    #: Half-extents (X, Y, Z). Y half-thickness is the wall thickness.
+    cargo_back_wall_half_extents: Tuple[float, float, float] = (1.0, 0.02, 0.50)
+    #: Z centre of the wall (world). Default = cargo centre Z so it spans
+    #: the same vertical range as the cargo body.
+    cargo_back_wall_center_z: float = 0.78
+    cargo_back_wall_rgba: Tuple[float, float, float, float] = (0.45, 0.30, 0.30, 1.0)
 
     # ------------------------------------------------------------------
     # Inline (Y-split) dual-block tire rack (Phase 1 pickup support).
@@ -928,11 +1091,97 @@ class EnvConfig:
     #: planner. Flip to True (and optionally retune ``rot_offset_scale``)
     #: once the position residual has converged.
     planner_enable_rot_offset: bool = False
+    #: Master switch for planner palm-up **tilt-lock** (tool +Z = world +Z,
+    #: yaw from SLERP). Which FSM stages use it is set by
+    #: ``planner_lock_palm_up_stages``.
+    planner_lock_palm_up: bool = True
+    #: **2026-06-01 (Option B, restored)** — FSM stage indices where
+    #: tilt-lock is active. Default ``(0, 1, 2, 3)`` = ALL stages: the
+    #: gripper stays palm-up throughout the cycle so the tire — which
+    #: stands vertically when picked up — keeps standing vertically all
+    #: the way to the hub and back. Yaw is still free (inherited from
+    #: the planner SLERP) so the wrist can rotate about the vertical to
+    #: align the bore with the hub axis. Set to ``(0,)`` to relax the
+    #: lock to pickup-only (Option C, faster IK convergence but the
+    #: tire flops over during carry).
+    planner_lock_palm_up_stages: Tuple[int, ...] = (0, 1, 2, 3)
+    #: Stage 1 carry arch height (m). 0.5 m clears the UR10 base column
+    #: on a straight-line carry from cradle to hub; lower values risk
+    #: clipping the base / cargo bottom.
+    #: **2026-06-02 (phase1_grad_v3)**: 0.5 → **0.35**. Geometry
+    #: re-check — base column top sits at z = 0 (plinth height 0.30 m
+    #: above floor at z = -0.30); arch midpoint with lift 0.35 sits at
+    #: z = (-0.13 - 0.305)/2 + 0.35 = +0.13, giving 13 cm clearance
+    #: over the column top. The 0.5 m lift gave 28 cm clearance but
+    #: pushed the via-point distance from the UR10 base to 0.72 m
+    #: which, combined with the end-pose at 1.13 m (86 % of the
+    #: 1.32 m max reach), saturates the UR10 IK during the descent
+    #: phase of the arch — v2 logged ``ik_residual_A_mean ≈ 0.45 m``
+    #: which directly inflates ``contact_force_mean`` (≈ 1.8 kN) and
+    #: ``sync_joint_A`` (motor servoing hard against the IK clip).
+    #: 0.35 trims the via-point distance to 0.61 m (15 cm headroom)
+    #: which empirically restores clean IK tracking on the descent.
+    planner_stage1_lift: float = 0.35
     #: Nominal trajectory length (control steps). 100 step ≈ 5.0 s at
     #: 20 Hz control. End-pose is held constant once the index exceeds
     #: this length so the policy can still operate on a "fix to last
     #: pose" basis if it has not yet triggered the stage gate.
     planner_traj_steps: int = 100
+    #: **2026-06-02 (D4 — Stage 1/3 yaw front-loading)** — exponent ``k``
+    #: in the SLERP time-warp ``s(t) = 1 - (1 - t)^k`` applied to the
+    #: orientation interpolation for Stage 1 (carry) and Stage 3
+    #: (return). With ``k = 2.5`` about 60 % of the 90° bore yaw
+    #: rotation completes in the first 30 % of the trajectory and
+    #: > 95 % by 70 %, so the tire enters the cradle gate (D1 fix)
+    #: with the bore already aligned to the destination axis. This
+    #: is the planner-side companion to D1: D1 demotes Stage 3
+    #: vertical violation to penalty-only, D4 makes the violation
+    #: itself rare by getting the yaw recovery done early. Set to
+    #: ``<= 1.0`` to fall back to uniform linear SLERP (legacy
+    #: behaviour).
+    planner_yaw_front_load_k: float = 2.5
+    #: **2026-06-03 — UR10 joint-target motion smoothing (visual jitter fix).**
+    #: The planner emits a fresh IK target every 20 Hz control step; near
+    #: reach-saturation the raw IK solution jitters step-to-step and the
+    #: stiff PD (gains 1.0, 400/300/60 N·m caps) snaps the arm toward each
+    #: new target inside the 240 Hz physics window, which reads as a
+    #: visible "흔들흔들" tremor. These two knobs low-pass the *commanded*
+    #: joint targets so the arm moves smoothly even when IK is noisy.
+    #: Disabled by default (alpha=1.0, max_step=0.0) so trained policies
+    #: see the exact control dynamics they were trained on; enable for
+    #: demos / replay via overrides.
+    #:
+    #: EMA blend factor for the commanded joint vector:
+    #:   q_cmd = alpha * q_ik + (1 - alpha) * q_cmd_prev
+    #: 1.0 = no smoothing (legacy), 0.2–0.4 = visibly smooth.
+    ur10_joint_target_smooth_alpha: float = 1.0
+    #: Hard cap on the per-control-step joint change (rad) applied AFTER
+    #: the EMA. 0.0 = disabled. ~0.05–0.10 rad caps the worst IK spikes
+    #: so the arm slews instead of snapping. Acts like a crude joint
+    #: speed limit (≈ alpha·freq rad/s).
+    ur10_joint_max_step_rad: float = 0.0
+    #: **2026-06-03 — UR10 PD gains (visual jitter fix, part 2).**
+    #: PyBullet ``POSITION_CONTROL`` positionGain/velocityGain for the
+    #: arm motors. The legacy 1.0/1.0 is extremely stiff — it tries to
+    #: annihilate the joint error in a single solver pass, which (with
+    #: the high torque caps) overshoots and rings around a fixed target,
+    #: reading as a tremor even when the IK target is perfectly still.
+    #: Lowering positionGain to ~0.1–0.3 makes the motor *ease* toward
+    #: the target over several physics steps (critically-damped-ish)
+    #: instead of snapping. Defaults kept at 1.0/1.0 so trained policies
+    #: see their original dynamics; override (with retrain) or use in
+    #: replay/eval for a smooth demo.
+    ur10_position_gain: float = 1.0
+    ur10_velocity_gain: float = 1.0
+    #: **2026-06-03 — bake joint-space planner trajectory at replan time.**
+    #: When True (default), ``_replan_for_current_stage`` runs IK once per
+    #: nominal waypoint with chained warm-start (previous solution → next)
+    #: and stores ``_traj_q``. Each control step then *plays back* joint
+    #: targets — no per-step ``apply_palm_up_pose`` (HOME warm-start IK),
+    #: which was the dominant source of visible arm tremor even with zero
+    #: policy residual. Set False to restore the legacy per-step IK path
+    #: (needed only for A/B debugging).
+    planner_precompute_joint_traj: bool = True
     #: When ``True`` AND the easy-spawn branch is rolled in ``reset``
     #: (i.e. Bernoulli(``start_pos_easy_prob``) returned True under
     #: ``start_pos_curriculum_mode == "mix"``), the env performs the

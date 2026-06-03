@@ -398,16 +398,82 @@ python -m src.sweep --study tyro1 --n-trials 20         # 이어서 진행
 
 - **`runs/`** — legacy 실험 run·로그·체크포인트 전부 삭제 (`.gitignore` 유지, git 미추적)
 - **`scripts/`** — 유지: `train.ps1/bat`, `smoke_fsm.py`, `smoke_planner_residual.py`,
-  `render_phase1_goal.py`, `verify_home.py`, `summarize_log.py`,
-  `generate_truck_wheel_station_urdf.py`
+  `replay_planner.py`, `diag_v4_eval.py`, `render_phase1_goal.py`, `verify_home.py`,
+  `summarize_log.py`, `generate_truck_wheel_station_urdf.py`
 - 제거됨: `check_*`, `dump_scene.py`, `calibrate_home_pose.py`, 버전별 `smoke_v5_*`~`smoke_v11_*`,
   v11c supervisor `.ps1` (일회성 디버그)
+
+---
+
+## 시뮬 안정화 · 물리 장착 · 경로 시각화 (2026-06-03)
+
+Phase 1 **학습 설계는 EE 명목 궤적 + PPO 잔차** (`_traj_pos` + `action[0:3]`)입니다.  
+아래 패치는 **GUI 떨림**, **허브 물리 결합**, **계획 vs 실제 경로 불일치**를 다룹니다.
+
+### GUI 떨림 — 원인과 대응
+
+| 원인 | 설명 |
+|---|---|
+| 매 스텝 HOME warm-start IK | `apply_palm_up_pose`가 `arm.rest`로 IK → 관절해가 스텝마다 튐 |
+| 키네마틱 upright lock | `_sync_grasped_tire_upright`가 EE 떨림을 타이어에 매 스텝 텔레포트 |
+| 관절 bake vs PD | bake `_traj_q`는 부드러운데 PD가 못 따라가면 실제 EE가 계획선과 어긋남 |
+
+| 설정 / 코드 | 기본 (학습) | replay / 시연 |
+|---|---|---|
+| `planner_precompute_joint_traj` | `True` | 동일 — **action≈0일 때만** 관절 재생; PPO는 `apply_palm_up_pose(EE)` |
+| `apply_palm_up_pose` warm-start | **현재 관절** (`robots.py`) | HOME 아님 |
+| `kinematic_tire_sync_alpha` | `0.65` | EMA로 타이어 pose 부드럽게 (1.0=즉시 스냅) |
+| `ur10_joint_*_smooth_*` / PD gains | 꺼짐 / 1.0 | `replay_planner.py`에서만 조정 가능 |
+
+**권장**: 학습 일관성을 위해 장기적으로 `planner_precompute_joint_traj=False`로 **매 스텝 EE→IK**만 쓰는 것도 검토.  
+replay는 `scripts/replay_planner.py` (플래너만, action=0).
+
+### 허브 물리 장착 + 홀드 (Robot B 볼트 체결 전)
+
+| 플래그 | 기본 | 효과 |
+|---|---|---|
+| `pin_tire_on_mount` | `True` | 마운트 시 타이어 ↔ **허브 URDF** `JOINT_FIXED` (world-pin 대신) |
+| `mount_hold_steps` | `0` (학습) | replay 스크립트는 `40` (~2 s) — UR10 관절 동결 + 타이어 seated pose 클램프 |
+
+- Stage 2(빼기)·3(복귀)는 **`terminate_on=mount`** 기본 때문에 **학습/기본 replay에서 실행 안 됨**.
+- 전체 사이클: `--terminate-on never` (train.ps1 / eval).
+
+### 플래너 경로 GUI (`scripts/replay_planner.py`)
+
+```powershell
+conda activate tyro
+python scripts/replay_planner.py --render --easy-start
+# 전체 4-stage: config override로 terminate_on=never 필요 시 train.ps1 참고
+```
+
+| 선 | 의미 |
+|---|---|
+| 파랑 / 주황 / 자홍 / 초록 | stage 0~3 **명목 EE** 궤적 (`compute_all_stage_trajectories`) |
+| 노란 | **실제 EE**가 지나간 자취 (매 step FK) |
+
+색깔 선(이상적 EE)과 노란 선(관절+IK+PD+키네마틱 실측)이 벌어지는 것은 위 표의 구조적 이유 때문입니다.
+
+### 학습 run 참고 (phase1_grad_v7)
+
+- **Best ckpt**: `runs/phase1_grad_v7/best/best_model.zip` — det. EASY 5/5 full cycle (S1 설정).
+- `max_steps=600`, `w_step_alive=0.15`, D1/D4 planner 패치 포함.
+- 2M step까지 학습 시 easy_prob 하락으로 **regression** 가능 → 배포는 **best** 사용 권장.
+
+```powershell
+python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --easy-start
+```
 
 ---
 
 ## 변경 이력 (CHANGELOG) — 왜 바꿨는지
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
+
+### 2026-06-03 — 시뮬 떨림 · 허브 물리 결합 · 경로 시각화
+
+- **문제**: 플래너-only replay도 떨림; 마운트 후 타이어가 EE에 붙어 허브에 안착한 것처럼 보이지 않음; GUI 계획선 vs 실제 경로 괴리.
+- **조치**: palm-up IK current warm-start; bake joint traj + tilt-lock at replan; kinematic tire EMA; hub `JOINT_FIXED` + mount hold; `replay_planner.py` (다색 명목 경로 + 노란 실측); `compute_all_stage_trajectories()`.
+- **학습**: 정책 잔차는 여전히 EE; `mount_hold_steps=0`, `terminate_on=mount` 유지.
 
 ### 2026-06-01 — Min-Jerk 플래너 + PPO 잔차 + Mount-only 기본
 

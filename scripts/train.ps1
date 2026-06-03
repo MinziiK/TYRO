@@ -29,4 +29,5 @@ $defaultRun = "phase1_" + (Get-Date -Format "yyyyMMdd-HHmm")
     --num-envs 12 `
     --total-steps 2000000 `
     --run-name $defaultRun `
+    --contact-force-done 0 `
     @args
