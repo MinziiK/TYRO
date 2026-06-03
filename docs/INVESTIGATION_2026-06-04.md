@@ -115,10 +115,16 @@ EE 분리 (pickup-EE ↔ mount-EE) ≈ **2.07 m** → 최적 베이스에서도 
 5. 씬 재배치 (대형 base)
 6. **전량 재학습**
 
-### 6.5 PoC (1단계)
+### 6.5 PoC (1단계) — 2026-06-04 진행 상황
 
-- `scripts/poc_fanuc_urdf.py` — iC/210F URDF 확보·변환·PyBullet 로드 검증.
-- 산출: `data/urdf/fanuc_r2000ic/` (clone 후 처리).
+| 단계 | 상태 | 비고 |
+|---|---|---|
+| `--fetch` | ✅ | sparse clone `data/urdf/fanuc_ros/` (gitignore) |
+| `--convert` | ✅ | `pip install xacro`, 상대 include 스테이징 → `data/urdf/fanuc_r2000ic/r2000ic210f.urdf` |
+| `--load` | ⏳ | **tyro conda** (또는 MSVC 있는 pybullet wheel) 필요 — 시스템 Python 3.11은 pybullet 빌드 실패 |
+
+- 모델: **R-2000iC/210F** (6 revolute + flange + tool0), mesh는 `r2000ic165f` STL 공유.
+- EE 링크 후보: `tool0`, `flange`, `link_6`.
 
 ---
 

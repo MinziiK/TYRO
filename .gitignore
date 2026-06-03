@@ -5,3 +5,4 @@ runs/
 *.zip
 # ROS-Industrial fanuc clone (meshes; use scripts/poc_fanuc_urdf.py --fetch)
 data/urdf/fanuc_ros/
+data/urdf/fanuc_r2000ic/_xacro_staging/

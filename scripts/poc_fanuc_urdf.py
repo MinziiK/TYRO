@@ -73,28 +73,74 @@ def _rewrite_package_uris(text: str, pkg_root: Path) -> str:
     return text
 
 
+def _resolve_find(text: str) -> str:
+    ic = IC_PKG.as_posix()
+    res = (FANUC_REPO / "fanuc_resources").as_posix()
+    return (
+        text.replace("$(find fanuc_r2000ic_support)", ic)
+        .replace("$(find fanuc_resources)", res)
+    )
+
+
+def _stage_xacro_tree() -> Path:
+    """Stage xacro files with absolute includes (no ROS $(find))."""
+    staged = OUT_DIR / "_xacro_staging"
+    staged.mkdir(parents=True, exist_ok=True)
+    res_urdf = FANUC_REPO / "fanuc_resources" / "urdf"
+    colours = staged / "common_colours.xacro"
+    materials = staged / "common_materials.xacro"
+    macro = staged / "r2000ic210f_macro.xacro"
+    colours.write_text(
+        (res_urdf / "common_colours.xacro").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    mat = (res_urdf / "common_materials.xacro").read_text(encoding="utf-8")
+    mat = mat.replace(
+        "$(find fanuc_resources)/urdf/common_colours.xacro",
+        "common_colours.xacro",
+    )
+    materials.write_text(mat, encoding="utf-8")
+    mac = (IC_PKG / "urdf" / "r2000ic210f_macro.xacro").read_text(encoding="utf-8")
+    mac = mac.replace(
+        "$(find fanuc_resources)/urdf/common_materials.xacro",
+        "common_materials.xacro",
+    )
+    # xacro expands package:// via $(find pkg) — replace before processing (no ROS).
+    mac = mac.replace("package://fanuc_r2000ic_support/", f"{IC_PKG.as_posix()}/")
+    macro.write_text(mac, encoding="utf-8")
+    wrapper = staged / "r2000ic210f_poc.xacro"
+    wrapper.write_text(
+        """<?xml version="1.0"?>
+<robot name="fanuc_r2000ic210f" xmlns:xacro="http://wiki.ros.org/xacro">
+  <xacro:include filename="r2000ic210f_macro.xacro"/>
+  <xacro:fanuc_r2000ic210f prefix=""/>
+</robot>
+""",
+        encoding="utf-8",
+    )
+    return wrapper
+
+
 def convert_xacro() -> Path:
     """Expand r2000ic210f.xacro to a flat URDF for PyBullet."""
-    if not XACRO_TOP.is_file():
-        raise FileNotFoundError(f"Missing {XACRO_TOP}; run with --fetch first.")
+    if not IC_PKG.is_dir():
+        raise FileNotFoundError(f"Missing {IC_PKG}; run with --fetch first.")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Try ROS xacro module
     try:
         import xacro  # type: ignore
     except ImportError as exc:
         print("[convert] `xacro` Python module not installed.")
-        print("  Install: pip install xacro   (or use ROS Noetic xacro on PATH)")
-        print("  Manual: rosrun xacro r2000ic210f.xacro > r2000ic210f.urdf")
+        print("  Install: pip install xacro")
         raise SystemExit(1) from exc
-    # xacro needs ROS package path for includes
+    wrapper = _stage_xacro_tree()
     import os
-    os.environ.setdefault(
-        "ROS_PACKAGE_PATH",
-        f"{FANUC_REPO}{os.pathsep}{IC_PKG.parent}",
-    )
-    doc = xacro.process_file(str(XACRO_TOP))
+    os.chdir(wrapper.parent)
+    doc = xacro.process_file(wrapper.name)
     xml = doc.toprettyxml(indent="  ")
     xml = _rewrite_package_uris(xml, IC_PKG)
+    # Absolute mesh paths from staging → repo-relative (portable across machines).
+    rel_ic = Path(os.path.relpath(IC_PKG, OUT_DIR)).as_posix()
+    xml = xml.replace(IC_PKG.as_posix(), rel_ic)
     URDF_OUT.write_text(xml, encoding="utf-8")
     print(f"[convert] wrote {URDF_OUT} ({URDF_OUT.stat().st_size // 1024} KB)")
     return URDF_OUT
