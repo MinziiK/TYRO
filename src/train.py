@@ -1185,6 +1185,20 @@ def main() -> int:
         choices=("ur10", "fanuc_r2000ic"),
         help='Robot A model: "ur10" (default) or "fanuc_r2000ic".',
     )
+    ap.add_argument(
+        "--robot-b-kind",
+        type=str,
+        default=None,
+        choices=("panda", "ur10e"),
+        help='Robot B model: "panda" (default) or "ur10e".',
+    )
+    ap.add_argument(
+        "--scene-layout",
+        type=str,
+        default=None,
+        choices=("shipping", "fanuc_spacious"),
+        help='Scene layout: "shipping" (legacy) or "fanuc_spacious" (FANUC+UR10e).',
+    )
 
     # IO
     ap.add_argument("--out", type=str, default=str(PROJECT_ROOT / "runs"))
@@ -1255,6 +1269,10 @@ def main() -> int:
             overrides["tire_mass"] = args.tire_mass
         if args.robot_a_kind is not None:
             overrides["robot_a_kind"] = str(args.robot_a_kind)
+        if getattr(args, "robot_b_kind", None) is not None:
+            overrides["robot_b_kind"] = str(args.robot_b_kind)
+        if getattr(args, "scene_layout", None) is not None:
+            overrides["scene_layout"] = str(args.scene_layout)
         overrides["start_pos_curriculum_enable"] = bool(args.start_pos_curriculum)
         overrides["start_pos_easy_lift"] = float(args.start_pos_easy_lift)
         overrides["start_pos_curriculum_steps"] = int(args.start_pos_curriculum_steps)

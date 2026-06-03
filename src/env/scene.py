@@ -193,9 +193,9 @@ class Scene:
         # ``_spawn_tire`` so the tire's static world-pin (mass=0 at
         # COM = rack_top + R) already sees the cradle rails underneath it
         # on step 1. The 10 cm Y-gap between the rails is what makes
-        # Stage 0 grasp geometrically legal: the UR10 gripper threads
-        # along the shared robot-tire Y=-0.80 centerline straight to the
-        # 6 o'clock outer point without colliding with either rail.
+        # Stage 0 grasp geometrically legal: gripper threads along the tire
+        # bore axis (layout-dependent Y centerline) to the 6 o'clock outer
+        # point without colliding with either rail.
         rack_uids = self._make_split_tire_rack()
 
         tire = self._spawn_tire()
@@ -657,10 +657,19 @@ class Scene:
         )
 
     def _make_panda_stand(self) -> Optional[int]:
+        kind = str(getattr(self.cfg, "robot_b_kind", "panda")).lower()
+        if kind in ("ur10e", "ur10_e", "ur_e"):
+            radius = float(getattr(self.cfg, "ur10e_stand_radius", 0.12))
+            rgba = tuple(getattr(
+                self.cfg, "ur10e_stand_rgba", (0.35, 0.38, 0.42, 1.0),
+            ))
+        else:
+            radius = float(getattr(self.cfg, "panda_stand_radius", 0.0))
+            rgba = tuple(getattr(self.cfg, "panda_stand_rgba", (0.4, 0.4, 0.45, 1.0)))
         return self._make_robot_stand(
             base_pos=self.cfg.robot_B_base_pos,
-            radius=float(getattr(self.cfg, "panda_stand_radius", 0.0)),
-            rgba=tuple(getattr(self.cfg, "panda_stand_rgba", (0.4, 0.4, 0.45, 1.0))),
+            radius=radius,
+            rgba=rgba,
         )
 
     def _make_ur10_stand(self) -> Optional[int]:
@@ -683,9 +692,9 @@ class Scene:
         """Build the inline (Y-split) dual-block tire cradle (Inner + Outer rails).
 
         Two static rails (mass=0) parallel to the X axis, flanking the
-        tire bore (world −Y) on opposite sides of the Y=-0.80 centerline.
+        tire bore on opposite sides of the Y=0 centerline.
         They support the vertical tire's tread on both Y faces while
-        leaving a hollow Y-gap between them so the UR10 gripper can
+        leaving a hollow Y-gap between them so the gripper can
         thread straight along the robot-tire Y centerline to the 6
         o'clock outer point and grasp it without clipping either rail.
 

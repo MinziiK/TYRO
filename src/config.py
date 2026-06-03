@@ -467,6 +467,10 @@ class EnvConfig:
     #: dynamics. Avoid 1.0–3.0 kg — that range hits an underdamped resonance
     #: with PyBullet's default position-control gains. Tune via ``--tire-mass``.
     tire_mass: float = 0.5
+    #: Optional explicit base inertia diagonal (kg·m²). When ``None`` and
+    #: ``tire_mass >= 50``, ``tire_inertia_heavy`` is used so Bullet does not
+    #: infer unrealistic spin from the lightweight collision mesh density.
+    tire_inertia_diagonal: Optional[Tuple[float, float, float]] = None
     tire_outer_radius: float = 0.525
     #: Tread ring inner radius (wheel-well cavity); keep > hub pilot & flange for slide fit.
     tire_inner_radius: float = 0.282
@@ -1085,12 +1089,14 @@ class EnvConfig:
     ur10_search_path: str = str(URDF_DIR / "ur10_robot")
     panda_urdf: str = "franka_panda/panda.urdf"  # resolved via pybullet_data
 
-    #: Robot A model: ``"ur10"`` (default) or ``"fanuc_r2000ic"``.
-    #: FANUC uses the ROS-Industrial R-2000iC/210F URDF (R-2000iD has no
-    #: public URDF). Run ``scripts/poc_fanuc_urdf.py --fetch --convert``
-    #: before first use. **Requires full scene re-tuning + re-training.**
+    #: Robot A model: ``"ur10"`` (default legacy) or ``"fanuc_r2000ic"``.
     robot_a_kind: str = "ur10"
-    fanuc_urdf: str = str(URDF_DIR / "fanuc_r2000ic" / "r2000ic210f.urdf")
+    #: Robot B model: ``"panda"`` (legacy) or ``"ur10e"``.
+    robot_b_kind: str = "panda"
+    #: ``"shipping"`` = UR10 legacy layout; ``"fanuc_spacious"`` = widened hub/cargo
+    #: with FANUC base retreated (see ``apply_fanuc_spacious_layout``).
+    scene_layout: str = "shipping"
+    fanuc_urdf: str = str(URDF_DIR / "fanuc_r2000ic" / "r2000ic210f_wheeltool.urdf")
     fanuc_search_path: str = str(URDF_DIR / "fanuc_r2000ic")
     fanuc_mesh_support_path: str = str(
         URDF_DIR / "fanuc_ros" / "fanuc_r2000ic_support"
@@ -1106,8 +1112,28 @@ class EnvConfig:
     fanuc_position_gain: float = 1.0
     fanuc_velocity_gain: float = 1.0
     fanuc_joint_slew_max_rad: float = 0.08
+    #: EE link name for IK / grasp parent (FANUC + wheel tool).
+    fanuc_ee_link_name: str = "wheel_tool_tip"
+    #: Grasp anchor: tire COM = EE + (0, 0, tire_outer_radius) in world +Z
+    #: when bore is vertical (same convention as UR10 palm-up grasp).
+    grasp_com_offset_world: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
-    #: Phase 1 only: completely freeze Robot B (Panda) at its HOME pose.
+    ur10e_urdf: str = str(URDF_DIR / "ur10e_robot" / "ur10e.urdf")
+    ur10e_search_path: str = str(URDF_DIR / "ur10e_robot")
+    ur10e_mesh_support_path: str = str(URDF_DIR / "ur_ros" / "ur_e_description")
+    ur10e_stand_radius: float = 0.12
+    ur10e_stand_rgba: Tuple[float, float, float, float] = (0.35, 0.38, 0.42, 1.0)
+    ur10e_motor_max_velocity_rad_s: float = 1.0
+    ur10e_position_gain: float = 1.0
+    ur10e_velocity_gain: float = 1.0
+    #: 100 kg truck tire sim (fanuc_spacious layout). Legacy shipping uses 0.5.
+    tire_mass_heavy: float = 100.0
+    #: Manual inertia for ``tire_mass_heavy`` (bore spin, transverse, transverse).
+    tire_inertia_heavy: Tuple[float, float, float] = (18.0, 32.0, 32.0)
+    #: When True and ``tire_mass >= 50``, carry stages use JOINT_FIXED not kinematic.
+    heavy_tire_fixed_grasp: bool = True
+    #: Min link index for A↔B collision penalty (skip base links).
+    robot_ab_collision_min_link: int = 2
     #: When True, the env ignores action[6:12] and never calls
     #: ``robot_B.apply_delta_ee`` — Panda stays parked at HOME for every
     #: step of every episode, removing it from the learning problem.
@@ -1388,6 +1414,43 @@ class EnvConfig:
         self.spawn_vehicle_primitive_box = bool(v)
 
 
+def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
+    """Widen hub/cargo/cradle for FANUC reach; 100 kg tire physics.
+
+    Robot B stays at world origin (0,0,0). FANUC base retreats to −X so
+    hub reach ≈ 75% of 2.65 m (vs UR10 87% at shipping layout).
+    """
+    cfg.scene_layout = "fanuc_spacious"
+    cfg.robot_a_kind = "fanuc_r2000ic"
+    cfg.robot_b_kind = "ur10e"
+    cfg.fanuc_urdf = str(URDF_DIR / "fanuc_r2000ic" / "r2000ic210f_wheeltool.urdf")
+    cfg.fanuc_ee_link_name = "wheel_tool_tip"
+    cfg.ur10_lock_tool_up = False
+    cfg.fanuc_lock_tool_up = False
+
+    cfg.robot_A_base_pos = (-1.50, 0.0, -0.30)
+    cfg.hub_pos_nominal = (0.0, 1.20, 0.22)
+    cfg.tire_mount_pos = cfg.hub_pos_nominal
+    cfg.tire_pickup_pos = (-2.40, 0.0, 0.3913)
+    cfg.vehicle_center_world = (0.0, 1.45, 0.78)
+    cfg.cargo_back_wall_y_offset = 0.35
+    cfg.tire_rack_inner_center = (-2.40, 0.40, -0.30)
+    cfg.tire_rack_outer_center = (-2.40, -0.40, -0.30)
+
+    cfg.tire_mass = cfg.tire_mass_heavy
+    cfg.tire_inertia_diagonal = cfg.tire_inertia_heavy
+    cfg.physics_num_sub_steps = 12
+    cfg.contact_erp = 0.2
+    cfg.contact_cfm = 2e-5
+    cfg.contact_force_terminate_above = 50_000.0
+    cfg.fanuc_position_gain = 0.85
+    cfg.fanuc_velocity_gain = 1.15
+    cfg.fanuc_motor_max_velocity_rad_s = 0.8
+    cfg.kinematic_tire_lock_stages = (0,)
+    cfg.obs.workspace_radius = 3.0
+    cfg.grasp_com_offset_world = (0.0, 0.0, 1.0)
+
+
 # ----------------------------------------------------------------------
 # Stage helper (spec §4.3): incrementally enable reward terms.
 # ----------------------------------------------------------------------
@@ -1493,4 +1556,7 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
             cfg.obs.dim = tail
     if legacy_obs_dim is not None:
         cfg.obs.dim = int(legacy_obs_dim)
+    layout = str(getattr(cfg, "scene_layout", "shipping")).lower()
+    if layout in ("fanuc_spacious", "fanuc", "spacious"):
+        apply_fanuc_spacious_layout(cfg)
     return cfg

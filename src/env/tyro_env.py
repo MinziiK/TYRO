@@ -50,7 +50,7 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from ..config import EnvConfig
 from . import rewards
-from .robots import PandaRobot, Robot, make_robot_a, robot_a_lock_quaternion
+from .robots import PandaRobot, Robot, make_robot_a, make_robot_b, robot_a_lock_quaternion
 from .scene import Scene, SceneHandles
 from .utils import (
     axisangle3_to_quat,
@@ -217,7 +217,7 @@ class TyroEnv(gym.Env):
         self.scene: Optional[Scene] = None
         self.handles: Optional[SceneHandles] = None
         self.robot_A: Optional[Robot] = None
-        self.robot_B: Optional[PandaRobot] = None
+        self.robot_B: Optional[Robot] = None
         # Tire ↔ UR10 EE fixed joint (Stage 1/2). Recreated on each pickup.
         self._grasp_constraint: Optional[int] = None
         # Tire ↔ world fixed joint (Stage 0 and after final landing). Keeps
@@ -385,7 +385,7 @@ class TyroEnv(gym.Env):
         self.handles = self.scene.build()
 
         self.robot_A = make_robot_a(self.client, self.cfg)
-        self.robot_B = PandaRobot(self.client, self.cfg)
+        self.robot_B = make_robot_b(self.client, self.cfg)
 
         # Vertical reference quaternion sourced from ``cfg.tire_spawn_rpy``.
         # Used by ``_pin_tire_to_world`` at reset/landing so the tire
@@ -1190,6 +1190,21 @@ class TyroEnv(gym.Env):
             )
         )
 
+    def _grasp_com_offset_from_ee(self, ee_orn: np.ndarray) -> np.ndarray:
+        """World-frame offset from EE link to tire COM at grasp."""
+        R = float(self.cfg.tire_outer_radius)
+        off = np.asarray(
+            getattr(self.cfg, "grasp_com_offset_world", (0.0, 0.0, 1.0)),
+            dtype=np.float64,
+        )
+        scale = off * R if np.linalg.norm(off) > 1e-9 else np.array([0.0, 0.0, R])
+        if abs(float(scale[0])) < 1e-9 and abs(float(scale[1])) < 1e-9:
+            return np.array([0.0, 0.0, float(scale[2])], dtype=np.float64)
+        tire_R = np.array(
+            p.getMatrixFromQuaternion(list(ee_orn)), dtype=np.float64,
+        ).reshape(3, 3)
+        return tire_R @ scale
+
     def _use_kinematic_tire_sync(self) -> bool:
         """Per-step tire teleport upright lock (Stage 0 only by default)."""
         return (
@@ -1920,9 +1935,8 @@ class TyroEnv(gym.Env):
             dtype=np.float64,
         )
 
-        # 2. Tire COM exactly one outer radius above the gripper in world +Z,
-        #    so the 6 o'clock tread point sits on the EE (R-margin).
-        tire_pos = ee_pos + np.array([0.0, 0.0, R], dtype=np.float64)
+        # 2. Tire COM offset from EE (tool tip or palm-up grasp anchor).
+        tire_pos = ee_pos + self._grasp_com_offset_from_ee(ee_orn)
 
         # 3. Force the tire to the prescribed pose (overrides any spawn
         #    drift before the grasp).
@@ -3116,11 +3130,13 @@ class TyroEnv(gym.Env):
                 # link 0 / -1 is the base; foot contact is fine, but mid-arm isn't.
                 if cp[3] > 1:    # link index on robot side
                     return True
-        # Robot A vs Robot B
+        # Robot A vs Robot B — ignore base-link grazing (large arms).
+        min_link = int(getattr(self.cfg, "robot_ab_collision_min_link", 2))
         cps = p.getContactPoints(bodyA=self.robot_A.uid, bodyB=self.robot_B.uid,
                                  physicsClientId=self.client)
-        if len(cps) > 0:
-            return True
+        for cp in cps:
+            if cp[3] > min_link or cp[4] > min_link:
+                return True
         if self.handles.vehicle is not None:
             for robot in (self.robot_A, self.robot_B):
                 cpsv = p.getContactPoints(

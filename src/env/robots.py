@@ -1038,7 +1038,9 @@ class FanucR2000icRobot(UR10Robot):
             urdf_path=urdf,
             search_path=None,
         )
-        self.EE_LINK_INDEX = self._link_index_for_child_link("tool0")
+        self.EE_LINK_INDEX = self._link_index_for_child_link(
+            str(getattr(cfg, "fanuc_ee_link_name", "wheel_tool_tip"))
+        )
         self._cmd_q = None
         self.reset_to_home()
         home_pos, home_quat = self.ee_pose()
@@ -1073,6 +1075,100 @@ class FanucR2000icRobot(UR10Robot):
 
     def enforce_palm_up_wrists(self, tool_z_threshold: float = 0.999) -> None:
         return
+
+
+def make_robot_b(client: int, cfg: EnvConfig) -> Robot:
+    """Factory for Robot B (Panda default, optional UR10e)."""
+    kind = str(getattr(cfg, "robot_b_kind", "panda")).lower().replace("-", "_")
+    if kind in ("ur10e", "ur10_e", "ur_e"):
+        return UR10eRobot(client, cfg)
+    return PandaRobot(client, cfg)
+
+
+class UR10eRobot(UR10Robot):
+    """Universal UR10e as Robot B (world origin, Phase 1 freeze)."""
+
+    NAME = "ur10e"
+    EE_LINK_INDEX = 6  # tool0 / wrist_3 — resolved after load
+    #: Parked clear of FANUC carry envelope (+X side, facing hub +Y).
+    HOME_POSE = (0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0)
+
+    def __init__(self, client: int, cfg: EnvConfig):
+        self._lock_tool_up = False
+        self._smooth_alpha = float(
+            getattr(cfg, "ur10e_joint_target_smooth_alpha",
+                    getattr(cfg, "ur10_joint_target_smooth_alpha", 1.0))
+        )
+        self._max_step = float(
+            getattr(cfg, "ur10e_joint_max_step_rad",
+                    getattr(cfg, "ur10_joint_max_step_rad", 0.0))
+        )
+        self._pgain = float(
+            getattr(cfg, "ur10e_position_gain",
+                    getattr(cfg, "ur10_position_gain", 1.0))
+        )
+        self._vgain = float(
+            getattr(cfg, "ur10e_velocity_gain",
+                    getattr(cfg, "ur10_velocity_gain", 1.0))
+        )
+        self._max_joint_vel = float(
+            getattr(cfg, "ur10e_motor_max_velocity_rad_s", 1.0)
+        )
+        self._joint_slew_max = float(
+            getattr(cfg, "ur10_joint_slew_max_rad", 0.08)
+        )
+        self._cmd_q: Optional[np.ndarray] = None
+
+        urdf = str(getattr(cfg, "ur10e_urdf", ""))
+        mesh = getattr(cfg, "ur10e_mesh_support_path", None)
+        if mesh:
+            p.setAdditionalSearchPath(str(mesh), physicsClientId=client)
+        search = str(getattr(cfg, "ur10e_search_path", ""))
+        if search:
+            p.setAdditionalSearchPath(search, physicsClientId=client)
+
+        Robot.__init__(
+            self,
+            client=client,
+            base_pos=cfg.robot_B_base_pos,
+            base_orn=rpy_to_quat(cfg.robot_B_base_rpy),
+            urdf_path=urdf,
+            search_path=None,
+        )
+        for link_name in ("tool0", "ee_link", "wrist_3_link"):
+            try:
+                self.EE_LINK_INDEX = self._link_index_for_child_link(link_name)
+                break
+            except RuntimeError:
+                continue
+        self._cmd_q = None
+        self.reset_to_home()
+        home_pos, home_quat = self.ee_pose()
+        self.FINAL_LOCK_QUATERNION = tuple(float(x) for x in home_quat)
+        self.TOOL_UP_QUATERNION = self.FINAL_LOCK_QUATERNION
+        print(
+            f"[{self.NAME}] EE_LINK_INDEX={self.EE_LINK_INDEX}  "
+            f"HOME ee={tuple(round(v, 3) for v in home_pos)}"
+        )
+
+    def _link_index_for_child_link(self, link_name: str) -> int:
+        for j in range(p.getNumJoints(self.uid, physicsClientId=self.client)):
+            info = p.getJointInfo(self.uid, j, physicsClientId=self.client)
+            child = info[12]
+            name = child.decode() if isinstance(child, (bytes, bytearray)) else str(child)
+            if name == link_name:
+                return j
+        raise RuntimeError(f"{self.NAME}: link '{link_name}' not found")
+
+    def _arm_joint_indices(self) -> List[int]:
+        return self._joints_by_name([
+            "shoulder_pan_joint",
+            "shoulder_lift_joint",
+            "elbow_joint",
+            "wrist_1_joint",
+            "wrist_2_joint",
+            "wrist_3_joint",
+        ])
 
 
 class PandaRobot(Robot):

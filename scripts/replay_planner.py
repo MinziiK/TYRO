@@ -65,6 +65,20 @@ def main() -> int:
         "--no-trail", action="store_true",
         help="Don't draw the actual travelled EE trail in the GUI.",
     )
+    ap.add_argument(
+        "--mount-tol", type=float, default=None,
+        help=(
+            "Override the mount radius gate (m). Default uses the hard "
+            "0.04 m gate, which zero-action replay cannot reach (the "
+            "trained policy closes the last ~2 cm). Set e.g. 0.10 to let "
+            "the nominal trajectory alone seat the tire and confirm carry "
+            "+ insertion smoothness end-to-end."
+        ),
+    )
+    ap.add_argument(
+        "--mount-ang-tol-deg", type=float, default=None,
+        help="Override the mount axis-angle gate (degrees).",
+    )
     args = ap.parse_args()
     if args.easy_start and args.home_start:
         ap.error("Use only one of --easy-start or --home-start.")
@@ -162,12 +176,26 @@ def main() -> int:
 
     for ep in range(args.episodes):
         env.reset(seed=args.seed + ep)
+        if args.mount_tol is not None or args.mount_ang_tol_deg is not None:
+            cur_r, cur_a = env.get_mount_tol()
+            new_r = float(args.mount_tol) if args.mount_tol is not None else cur_r
+            new_a = (
+                np.deg2rad(float(args.mount_ang_tol_deg))
+                if args.mount_ang_tol_deg is not None else cur_a
+            )
+            env.set_mount_tol(new_r, new_a)
+            print(
+                f"[planner] mount gate override: radius={new_r:.3f} m  "
+                f"angle={np.rad2deg(new_a):.1f}°"
+            )
         draw_all_stage_paths()
         total_r = 0.0
         steps = 0
         terminated = truncated = False
         info: dict = {}
         prev_ee = np.asarray(env.robot_A.ee_pose()[0], dtype=np.float64)
+        ee_jumps: list[float] = []          # per-step EE displacement (m)
+        jump_stages: list[int] = []          # FSM stage at each step
         while not (terminated or truncated):
             if args.render and not p.isConnected(env.client):
                 print("[planner] GUI closed — stopping replay.")
@@ -179,6 +207,8 @@ def main() -> int:
                 print("[planner] physics server disconnected — stopping replay.")
                 break
             cur_ee = np.asarray(env.robot_A.ee_pose()[0], dtype=np.float64)
+            ee_jumps.append(float(np.linalg.norm(cur_ee - prev_ee)))
+            jump_stages.append(int(getattr(env, "task_stage", -1)))
             draw_trail_segment(prev_ee, cur_ee)
             prev_ee = cur_ee
             total_r += float(r)
@@ -192,6 +222,24 @@ def main() -> int:
             f"success={info.get('is_success', False)}  "
             f"termination={info.get('termination', '-')}"
         )
+        if ee_jumps:
+            j = np.asarray(ee_jumps, dtype=np.float64)
+            n_big = int((j > 0.15).sum())
+            print(
+                f"      EE jump (cm): max={j.max()*100:6.2f}  "
+                f"mean={j.mean()*100:5.2f}  >15cm={n_big}"
+            )
+            stages = np.asarray(jump_stages, dtype=np.int64)
+            for st in sorted(set(jump_stages)):
+                if st < 0:
+                    continue
+                m = stages == st
+                js = j[m]
+                print(
+                    f"        stage {st}: steps={int(m.sum()):4d}  "
+                    f"max={js.max()*100:6.2f}cm  mean={js.mean()*100:5.2f}cm  "
+                    f">15cm={int((js > 0.15).sum())}"
+                )
         if args.render and not p.isConnected(env.client):
             break
 

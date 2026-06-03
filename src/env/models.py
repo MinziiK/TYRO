@@ -19,6 +19,17 @@ from .utils import rpy_to_quat
 PyVec3 = Sequence[float]
 
 
+def _tire_inertia_diagonal(cfg: EnvConfig) -> Optional[list]:
+    """Explicit base inertia when mass does not match collision mesh density."""
+    custom = getattr(cfg, "tire_inertia_diagonal", None)
+    if custom is not None:
+        return [float(x) for x in custom]
+    if float(cfg.tire_mass) >= 50.0:
+        heavy = getattr(cfg, "tire_inertia_heavy", (18.0, 32.0, 32.0))
+        return [float(x) for x in heavy]
+    return None
+
+
 def _iter_box_chunks(
     he: list,
     po: list,
@@ -316,7 +327,8 @@ def create_tire_wheel_multibody(
                 client, merged_he, merged_po, merged_or, rgbs,
             )
             if col >= 0 and vis >= 0:
-                uid = p.createMultiBody(
+                inertia = _tire_inertia_diagonal(cfg)
+                mb_kwargs = dict(
                     baseMass=tire_mass,
                     baseCollisionShapeIndex=col,
                     baseVisualShapeIndex=vis,
@@ -324,6 +336,9 @@ def create_tire_wheel_multibody(
                     baseOrientation=list(base_orientation),
                     physicsClientId=client,
                 )
+                if inertia is not None:
+                    mb_kwargs["baseInertiaDiagonal"] = inertia
+                uid = p.createMultiBody(**mb_kwargs)
                 p.changeDynamics(
                     uid, -1, linearDamping=0.5, angularDamping=0.5,
                     physicsClientId=client,
@@ -377,7 +392,7 @@ def create_tire_wheel_multibody(
     joint_types = [p.JOINT_FIXED] * n_links
     joint_axis = [[0.0, 0.0, 1.0]] * n_links
 
-    uid = p.createMultiBody(
+    mb_kwargs = dict(
         baseMass=tire_mass,
         baseCollisionShapeIndex=t_col,
         baseVisualShapeIndex=t_vis,
@@ -395,6 +410,10 @@ def create_tire_wheel_multibody(
         linkJointAxis=joint_axis,
         physicsClientId=client,
     )
+    inertia = _tire_inertia_diagonal(cfg)
+    if inertia is not None:
+        mb_kwargs["baseInertiaDiagonal"] = inertia
+    uid = p.createMultiBody(**mb_kwargs)
     p.changeDynamics(
         uid, -1, linearDamping=0.5, angularDamping=0.5, physicsClientId=client,
     )
