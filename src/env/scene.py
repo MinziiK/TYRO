@@ -664,10 +664,19 @@ class Scene:
         )
 
     def _make_ur10_stand(self) -> Optional[int]:
+        kind = str(getattr(self.cfg, "robot_a_kind", "ur10")).lower()
+        if "fanuc" in kind or "r2000" in kind:
+            radius = float(getattr(self.cfg, "fanuc_stand_radius", 0.28))
+            rgba = tuple(getattr(
+                self.cfg, "fanuc_stand_rgba", (0.32, 0.34, 0.38, 1.0),
+            ))
+        else:
+            radius = float(getattr(self.cfg, "ur10_stand_radius", 0.0))
+            rgba = tuple(getattr(self.cfg, "ur10_stand_rgba", (0.4, 0.4, 0.45, 1.0)))
         return self._make_robot_stand(
             base_pos=self.cfg.robot_A_base_pos,
-            radius=float(getattr(self.cfg, "ur10_stand_radius", 0.0)),
-            rgba=tuple(getattr(self.cfg, "ur10_stand_rgba", (0.4, 0.4, 0.45, 1.0))),
+            radius=radius,
+            rgba=rgba,
         )
 
     def _make_split_tire_rack(self) -> List[int]:

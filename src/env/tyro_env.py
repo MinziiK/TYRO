@@ -50,7 +50,7 @@ from scipy.spatial.transform import Rotation, Slerp
 
 from ..config import EnvConfig
 from . import rewards
-from .robots import PandaRobot, UR10Robot
+from .robots import PandaRobot, Robot, make_robot_a, robot_a_lock_quaternion
 from .scene import Scene, SceneHandles
 from .utils import (
     axisangle3_to_quat,
@@ -216,7 +216,7 @@ class TyroEnv(gym.Env):
         self.client: int = -1
         self.scene: Optional[Scene] = None
         self.handles: Optional[SceneHandles] = None
-        self.robot_A: Optional[UR10Robot] = None
+        self.robot_A: Optional[Robot] = None
         self.robot_B: Optional[PandaRobot] = None
         # Tire ↔ UR10 EE fixed joint (Stage 1/2). Recreated on each pickup.
         self._grasp_constraint: Optional[int] = None
@@ -384,7 +384,7 @@ class TyroEnv(gym.Env):
         )
         self.handles = self.scene.build()
 
-        self.robot_A = UR10Robot(self.client, self.cfg)
+        self.robot_A = make_robot_a(self.client, self.cfg)
         self.robot_B = PandaRobot(self.client, self.cfg)
 
         # Vertical reference quaternion sourced from ``cfg.tire_spawn_rpy``.
@@ -1414,9 +1414,7 @@ class TyroEnv(gym.Env):
         sensible direction but no orientation guarantee.
         """
         R = float(self.cfg.tire_outer_radius)
-        palm_up = np.asarray(
-            self.robot_A.FINAL_LOCK_QUATERNION, dtype=np.float64,
-        )
+        palm_up = robot_a_lock_quaternion(self.robot_A)
         have_grasp = (
             self._grasp_t_ee_tire_pos is not None
             and self._grasp_t_ee_tire_quat is not None
@@ -2469,9 +2467,7 @@ class TyroEnv(gym.Env):
         if n_xy < 1e-6:
             # Singular: nominal tool +X is (nearly) vertical. Use the
             # canonical palm-up yaw from the home pose.
-            return np.asarray(
-                self.robot_A.FINAL_LOCK_QUATERNION, dtype=np.float64,
-            )
+            return robot_a_lock_quaternion(self.robot_A)
         tool_x_w = nx_xy / n_xy
         tool_z_w = np.array([0.0, 0.0, 1.0], dtype=np.float64)
         tool_y_w = np.cross(tool_z_w, tool_x_w)

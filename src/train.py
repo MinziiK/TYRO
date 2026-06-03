@@ -1178,6 +1178,13 @@ def main() -> int:
                     help="Terminate if normal force exceeds this (N); ≤0 disables.")
     ap.add_argument("--tire-mass", type=float, default=None,
                     help="Tire base mass in kg (default: EnvConfig.tire_mass = 1.0).")
+    ap.add_argument(
+        "--robot-a-kind",
+        type=str,
+        default=None,
+        choices=("ur10", "fanuc_r2000ic"),
+        help='Robot A model: "ur10" (default) or "fanuc_r2000ic".',
+    )
 
     # IO
     ap.add_argument("--out", type=str, default=str(PROJECT_ROOT / "runs"))
@@ -1246,6 +1253,8 @@ def main() -> int:
             overrides["contact_force_terminate_above"] = args.contact_force_done
         if args.tire_mass is not None:
             overrides["tire_mass"] = args.tire_mass
+        if args.robot_a_kind is not None:
+            overrides["robot_a_kind"] = str(args.robot_a_kind)
         overrides["start_pos_curriculum_enable"] = bool(args.start_pos_curriculum)
         overrides["start_pos_easy_lift"] = float(args.start_pos_easy_lift)
         overrides["start_pos_curriculum_steps"] = int(args.start_pos_curriculum_steps)

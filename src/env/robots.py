@@ -307,6 +307,9 @@ class UR10Robot(Robot):
     )
     TOOL_UP_QUATERNION = FINAL_LOCK_QUATERNION
 
+    def _arm_motor_forces(self) -> List[float]:
+        return [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
+
     def __init__(self, client: int, cfg: EnvConfig):
         self._lock_tool_up = bool(getattr(cfg, "ur10_lock_tool_up", True))
         # 2026-06-03 — commanded-joint-target motion smoothing (see
@@ -448,12 +451,7 @@ class UR10Robot(Robot):
         # over the worst-case static gravity moment (~120 N·m at HOME
         # under a 0.5 kg tire load) and 60 for the wrists matches the
         # real torque-limited region while still beating wrist inertia.
-        forces = [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
-        # ``positionGain`` restored to 1.0 — combined with the new
-        # force caps it gives stiff hold without the 21 cm steady-state
-        # sag that 0.3 produced. The drift-free target accumulator
-        # above means there is no longer a positive feedback loop
-        # between sag and IK target, so we can afford the stiffer PD.
+        forces = self._arm_motor_forces()
         pgains = [self._pgain] * len(forces)
         vgains = [self._vgain] * len(forces)
         p.setJointMotorControlArray(
@@ -490,7 +488,7 @@ class UR10Robot(Robot):
             self.arm.lower, self.arm.upper,
         )
         arm_targets = self._smooth_arm_targets(arm_targets)
-        forces = [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
+        forces = self._arm_motor_forces()
         if self._max_joint_vel > 0.0:
             # setJointMotorControlArray ignores maxVelocity, so issue a
             # per-joint control2 call to enforce the speed cap.
@@ -959,6 +957,122 @@ class UR10Robot(Robot):
             "wrist_2_joint",
             "wrist_3_joint",
         ])
+
+
+def make_robot_a(client: int, cfg: EnvConfig) -> Robot:
+    """Factory for Robot A (UR10 default, optional FANUC R-2000iC)."""
+    kind = str(getattr(cfg, "robot_a_kind", "ur10")).lower().replace("-", "_")
+    if kind in ("fanuc", "fanuc_r2000ic", "fanuc_r2000ic210f", "r2000ic", "r2000ic210f"):
+        return FanucR2000icRobot(client, cfg)
+    return UR10Robot(client, cfg)
+
+
+def robot_a_lock_quaternion(robot: Robot) -> np.ndarray:
+    """Palm-up / stage planner lock quaternion for Robot A."""
+    return np.asarray(
+        getattr(robot, "FINAL_LOCK_QUATERNION", (0.0, 0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+
+
+class FanucR2000icRobot(UR10Robot):
+    """FANUC R-2000iC/210F (ROS-Industrial URDF) as Robot A.
+
+    Reuses UR10 motor smoothing, DLS servo, and planner IK helpers.
+    Palm-up wrist constraints are UR-specific — those methods delegate
+    to full 6-DOF :pymeth:`apply_absolute_ee`.
+    """
+
+    NAME = "fanuc_r2000ic"
+    EE_LINK_INDEX = 8  # ``tool0`` child link (overwritten after load if needed)
+    #: Compact HOME — EE clear of tire bore at shipping layout; re-tune via
+    #: ``scripts/measure_fanuc_home.py`` when the scene layout changes.
+    HOME_POSE = (0.0, -0.5, 0.4, 0.0, -0.9, 0.0)
+    FINAL_LOCK_QUATERNION = (0.0, 0.0, 0.0, 1.0)
+    TOOL_UP_QUATERNION = FINAL_LOCK_QUATERNION
+
+    def __init__(self, client: int, cfg: EnvConfig):
+        self._lock_tool_up = bool(
+            getattr(cfg, "fanuc_lock_tool_up",
+                    getattr(cfg, "ur10_lock_tool_up", False))
+        )
+        self._smooth_alpha = float(
+            getattr(cfg, "fanuc_joint_target_smooth_alpha",
+                    getattr(cfg, "ur10_joint_target_smooth_alpha", 1.0))
+        )
+        self._max_step = float(
+            getattr(cfg, "fanuc_joint_max_step_rad",
+                    getattr(cfg, "ur10_joint_max_step_rad", 0.0))
+        )
+        self._pgain = float(
+            getattr(cfg, "fanuc_position_gain",
+                    getattr(cfg, "ur10_position_gain", 1.0))
+        )
+        self._vgain = float(
+            getattr(cfg, "fanuc_velocity_gain",
+                    getattr(cfg, "ur10_velocity_gain", 1.0))
+        )
+        self._max_joint_vel = float(
+            getattr(cfg, "fanuc_motor_max_velocity_rad_s",
+                    getattr(cfg, "ur10_motor_max_velocity_rad_s", 1.0))
+        )
+        self._joint_slew_max = float(
+            getattr(cfg, "fanuc_joint_slew_max_rad",
+                    getattr(cfg, "ur10_joint_slew_max_rad", 0.08))
+        )
+        self._cmd_q: Optional[np.ndarray] = None
+
+        urdf = str(getattr(cfg, "fanuc_urdf", ""))
+        search = str(getattr(cfg, "fanuc_search_path", ""))
+        if search:
+            p.setAdditionalSearchPath(search, physicsClientId=client)
+        ic_meshes = getattr(cfg, "fanuc_mesh_support_path", None)
+        if ic_meshes:
+            p.setAdditionalSearchPath(str(ic_meshes), physicsClientId=client)
+
+        Robot.__init__(
+            self,
+            client=client,
+            base_pos=cfg.robot_A_base_pos,
+            base_orn=rpy_to_quat(cfg.robot_A_base_rpy),
+            urdf_path=urdf,
+            search_path=None,
+        )
+        self.EE_LINK_INDEX = self._link_index_for_child_link("tool0")
+        self._cmd_q = None
+        self.reset_to_home()
+        home_pos, home_quat = self.ee_pose()
+        self.FINAL_LOCK_QUATERNION = tuple(float(x) for x in home_quat)
+        self.TOOL_UP_QUATERNION = self.FINAL_LOCK_QUATERNION
+        print(
+            f"[{self.NAME}] EE_LINK_INDEX={self.EE_LINK_INDEX}  "
+            f"HOME tool0={tuple(round(v, 3) for v in home_pos)}"
+        )
+
+    def _link_index_for_child_link(self, link_name: str) -> int:
+        for j in range(p.getNumJoints(self.uid, physicsClientId=self.client)):
+            info = p.getJointInfo(self.uid, j, physicsClientId=self.client)
+            child = info[12]
+            name = child.decode() if isinstance(child, (bytes, bytearray)) else str(child)
+            if name == link_name:
+                return j
+        raise RuntimeError(f"{self.NAME}: link '{link_name}' not found on URDF")
+
+    def _arm_joint_indices(self) -> List[int]:
+        return self._joints_by_name([f"joint_{i}" for i in range(1, 7)])
+
+    def _arm_motor_forces(self) -> List[float]:
+        return [2000.0, 2000.0, 1500.0, 400.0, 400.0, 200.0]
+
+    def apply_palm_up_locked(self, pos) -> None:
+        self.apply_absolute_ee(pos, self.FINAL_LOCK_QUATERNION)
+
+    def apply_palm_up_pose(self, pos, target_orn, warm_q=None) -> None:
+        orn = target_orn if target_orn is not None else self.FINAL_LOCK_QUATERNION
+        self.apply_absolute_ee(pos, orn)
+
+    def enforce_palm_up_wrists(self, tool_z_threshold: float = 0.999) -> None:
+        return
 
 
 class PandaRobot(Robot):

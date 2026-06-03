@@ -1085,6 +1085,28 @@ class EnvConfig:
     ur10_search_path: str = str(URDF_DIR / "ur10_robot")
     panda_urdf: str = "franka_panda/panda.urdf"  # resolved via pybullet_data
 
+    #: Robot A model: ``"ur10"`` (default) or ``"fanuc_r2000ic"``.
+    #: FANUC uses the ROS-Industrial R-2000iC/210F URDF (R-2000iD has no
+    #: public URDF). Run ``scripts/poc_fanuc_urdf.py --fetch --convert``
+    #: before first use. **Requires full scene re-tuning + re-training.**
+    robot_a_kind: str = "ur10"
+    fanuc_urdf: str = str(URDF_DIR / "fanuc_r2000ic" / "r2000ic210f.urdf")
+    fanuc_search_path: str = str(URDF_DIR / "fanuc_r2000ic")
+    fanuc_mesh_support_path: str = str(
+        URDF_DIR / "fanuc_ros" / "fanuc_r2000ic_support"
+    )
+    #: Larger plinth for the R-2000iC base footprint.
+    fanuc_stand_radius: float = 0.28
+    fanuc_stand_rgba: Tuple[float, float, float, float] = (0.32, 0.34, 0.38, 1.0)
+    #: FANUC defaults to full 6-DOF planner IK (no UR10 palm-up wrist lock).
+    fanuc_lock_tool_up: bool = False
+    fanuc_motor_max_velocity_rad_s: float = 1.0
+    fanuc_joint_target_smooth_alpha: float = 1.0
+    fanuc_joint_max_step_rad: float = 0.0
+    fanuc_position_gain: float = 1.0
+    fanuc_velocity_gain: float = 1.0
+    fanuc_joint_slew_max_rad: float = 0.08
+
     #: Phase 1 only: completely freeze Robot B (Panda) at its HOME pose.
     #: When True, the env ignores action[6:12] and never calls
     #: ``robot_B.apply_delta_ee`` — Panda stays parked at HOME for every

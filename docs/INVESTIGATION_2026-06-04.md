@@ -115,16 +115,20 @@ EE 분리 (pickup-EE ↔ mount-EE) ≈ **2.07 m** → 최적 베이스에서도 
 5. 씬 재배치 (대형 base)
 6. **전량 재학습**
 
-### 6.5 PoC (1단계) — 2026-06-04 진행 상황
+### 6.5 FANUC 통합 진행 (PoC → env)
 
-| 단계 | 상태 | 비고 |
+| 단계 | 상태 | 명령 / 파일 |
 |---|---|---|
-| `--fetch` | ✅ | sparse clone `data/urdf/fanuc_ros/` (gitignore) |
-| `--convert` | ✅ | `pip install xacro`, 상대 include 스테이징 → `data/urdf/fanuc_r2000ic/r2000ic210f.urdf` |
-| `--load` | ⏳ | **tyro conda** (또는 MSVC 있는 pybullet wheel) 필요 — 시스템 Python 3.11은 pybullet 빌드 실패 |
+| 1 URDF + 단독 GUI | ✅ | `scripts/poc_fanuc_urdf.py --fetch --convert --load --gui` |
+| 2 `FanucR2000icRobot` | ✅ | `src/env/robots.py` — `make_robot_a()`, UR10 DLS/플래너 재사용 |
+| 3 config 스위치 | ✅ | `EnvConfig.robot_a_kind = "ur10"` \| `"fanuc_r2000ic"` |
+| 4 전체 씬 GUI | ✅ | `scripts/replay_fanuc_scene.py --render` |
+| 5 HOME/reach 측정 | ✅ | `scripts/measure_fanuc_home.py` |
+| 6 재학습 | ⏳ | `robot_a_kind=fanuc_r2000ic` — 씬·HOME·reach 재튜닝 후 |
 
-- 모델: **R-2000iC/210F** (6 revolute + flange + tool0), mesh는 `r2000ic165f` STL 공유.
-- EE 링크 후보: `tool0`, `flange`, `link_6`.
+- 모델: **R-2000iC/210F** (6 revolute + `tool0`), mesh `r2000ic165f` STL.
+- 기본 UR10 palm-up wrist lock **미적용** (`fanuc_lock_tool_up=False`) — 플래너 6-DOF IK.
+- 그리퍼 URDF 없음 — EE-only; mount/grasp는 기존 kinematic bond 유지.
 
 ---
 

@@ -146,8 +146,16 @@ def convert_xacro() -> Path:
     return URDF_OUT
 
 
-def load_pybullet(gui: bool = False) -> None:
-    """Load converted URDF in PyBullet; print joint/link summary."""
+# A presentable non-zero pose (rad) so the arm is extended, not folded.
+DEMO_POSE = [0.0, -0.5, 0.4, 0.0, -0.9, 0.0]
+
+
+def load_pybullet(gui: bool = False, save_image: str | None = None,
+                  pose: bool = True) -> None:
+    """Load converted URDF in PyBullet; print joint/link summary.
+
+    If ``save_image`` is given, render a camera frame to PNG (works headless).
+    """
     import pybullet as p
     import pybullet_data
 
@@ -157,6 +165,9 @@ def load_pybullet(gui: bool = False) -> None:
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setAdditionalSearchPath(str(IC_PKG), physicsClientId=cid)
     p.setAdditionalSearchPath(str(OUT_DIR), physicsClientId=cid)
+    if gui:
+        p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=cid)
+    p.loadURDF("plane.urdf", physicsClientId=cid)
     uid = p.loadURDF(
         str(URDF_OUT),
         basePosition=[0, 0, 0],
@@ -167,22 +178,50 @@ def load_pybullet(gui: bool = False) -> None:
     if uid < 0:
         raise RuntimeError("loadURDF failed — check mesh paths in URDF")
     nj = p.getNumJoints(uid, physicsClientId=cid)
-    print(f"[load] uid={uid}  joints={nj}")
+    movable = [j for j in range(nj)
+               if p.getJointInfo(uid, j, physicsClientId=cid)[2] != p.JOINT_FIXED]
+    print(f"[load] uid={uid}  joints={nj}  movable={len(movable)}")
     for j in range(nj):
         info = p.getJointInfo(uid, j, physicsClientId=cid)
         name = info[1].decode() if isinstance(info[1], bytes) else str(info[1])
-        jtype = info[2]
-        if jtype != p.JOINT_FIXED:
-            print(f"  j{j:2d} {name:30s} type={jtype}")
+        if info[2] != p.JOINT_FIXED:
+            lo, hi = info[8], info[9]
+            print(f"  j{j:2d} {name:30s} limits=[{lo:+.2f}, {hi:+.2f}]")
+    if pose:
+        for k, j in enumerate(movable):
+            if k < len(DEMO_POSE):
+                p.resetJointState(uid, j, DEMO_POSE[k], physicsClientId=cid)
     ls = p.getLinkState(uid, nj - 1, computeForwardKinematics=True,
                         physicsClientId=cid)
-    print(f"[load] last link pos={ls[4]}")
+    print(f"[load] tool0 pos={tuple(round(v, 3) for v in ls[4])}")
+
+    cam = dict(cameraDistance=4.0, cameraYaw=50, cameraPitch=-25,
+               cameraTargetPosition=[0, 0, 1.0])
+    if gui:
+        p.resetDebugVisualizerCamera(**cam, physicsClientId=cid)
+    if save_image:
+        view = p.computeViewMatrixFromYawPitchRoll(
+            cam["cameraTargetPosition"], cam["cameraDistance"],
+            cam["cameraYaw"], cam["cameraPitch"], 0, 2)
+        proj = p.computeProjectionMatrixFOV(60, 1.33, 0.1, 100)
+        w, h = 960, 720
+        img = p.getCameraImage(w, h, view, proj,
+                               renderer=p.ER_TINY_RENDERER,
+                               physicsClientId=cid)
+        try:
+            from PIL import Image
+            import numpy as np
+            rgb = np.reshape(img[2], (h, w, 4))[:, :, :3].astype("uint8")
+            Image.fromarray(rgb).save(save_image)
+            print(f"[load] saved screenshot -> {save_image}")
+        except ImportError:
+            print("[load] Pillow not installed; skip PNG (pip install pillow)")
     if gui:
         print("[load] GUI open — close window to exit.")
         import time
-        for _ in range(2400):
+        for _ in range(100000):
             p.stepSimulation(physicsClientId=cid)
-            time.sleep(1.0 / 60.0)
+            time.sleep(1.0 / 120.0)
     p.disconnect(cid)
     print("[load] OK")
 
@@ -193,6 +232,10 @@ def main() -> int:
     ap.add_argument("--convert", action="store_true", help="xacro -> urdf")
     ap.add_argument("--load", action="store_true", help="PyBullet load test")
     ap.add_argument("--gui", action="store_true", help="With --load, open GUI")
+    ap.add_argument("--save-image", metavar="PNG", default=None,
+                    help="Render a screenshot to PNG (works headless)")
+    ap.add_argument("--zero-pose", action="store_true",
+                    help="Keep folded zero pose instead of demo pose")
     args = ap.parse_args()
     if not any([args.fetch, args.convert, args.load]):
         ap.print_help()
@@ -202,7 +245,8 @@ def main() -> int:
     if args.convert:
         convert_xacro()
     if args.load:
-        load_pybullet(gui=args.gui)
+        load_pybullet(gui=args.gui, save_image=args.save_image,
+                      pose=not args.zero_pose)
     return 0
 
 

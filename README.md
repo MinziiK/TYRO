@@ -491,6 +491,7 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 - **대형 로봇 / 재배치**: reach 2.6 m(FANUC R-2000iC) 또는 약한 재배치(hub Y 0.65)로 특이점 제거 가능. R-2000iD URDF는 미지원 → iC/210F 대체. **100 kg**은 payload OK, PyBullet PD·contact 재튜닝 필요.
 - **전체 조사 기록**: [`docs/INVESTIGATION_2026-06-04.md`](docs/INVESTIGATION_2026-06-04.md)
 - **FANUC PoC (1단계)**: `python scripts/poc_fanuc_urdf.py --fetch` → `python scripts/poc_fanuc_urdf.py --load [--gui]`
+- **FANUC 전체 씬 (2단계)**: `robot_a_kind=fanuc_r2000ic` → `python scripts/replay_fanuc_scene.py --render`
 
 ### 2026-06-03 — 시뮬 떨림 · 허브 물리 결합 · 경로 시각화
 
