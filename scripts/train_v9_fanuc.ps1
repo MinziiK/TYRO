@@ -6,6 +6,7 @@
 #   python scripts/merge_fanuc_wheeltool.py
 #   python scripts/measure_fanuc_home.py --layout fanuc_spacious
 #   python scripts/replay_fanuc_scene.py --render --home-start
+#   python scripts/replay_planner.py --render --home-start --scene-layout fanuc_spacious --mount-tol 0.10
 #
 # Default UR10 shipping training remains scripts/train_v8_smooth.ps1
 

@@ -79,6 +79,24 @@ def main() -> int:
         "--mount-ang-tol-deg", type=float, default=None,
         help="Override the mount axis-angle gate (degrees).",
     )
+    ap.add_argument(
+        "--robot-a-kind",
+        type=str,
+        default=None,
+        choices=("ur10", "fanuc_r2000ic"),
+    )
+    ap.add_argument(
+        "--robot-b-kind",
+        type=str,
+        default=None,
+        choices=("panda", "ur10e"),
+    )
+    ap.add_argument(
+        "--scene-layout",
+        type=str,
+        default=None,
+        choices=("shipping", "fanuc_spacious"),
+    )
     args = ap.parse_args()
     if args.easy_start and args.home_start:
         ap.error("Use only one of --easy-start or --home-start.")
@@ -96,6 +114,12 @@ def main() -> int:
     )
     if args.max_steps is not None:
         overrides["max_steps"] = int(args.max_steps)
+    if args.robot_a_kind is not None:
+        overrides["robot_a_kind"] = str(args.robot_a_kind)
+    if args.robot_b_kind is not None:
+        overrides["robot_b_kind"] = str(args.robot_b_kind)
+    if args.scene_layout is not None:
+        overrides["scene_layout"] = str(args.scene_layout)
 
     cfg = make_env_config(stage=args.stage, phase=args.phase, **overrides)
     env = TyroEnv(cfg=cfg, render=args.render, seed=args.seed)
