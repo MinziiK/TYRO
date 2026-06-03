@@ -82,6 +82,46 @@ def _min_jerk_positions(start: np.ndarray, end: np.ndarray, n: int) -> np.ndarra
     return start[None, :] + s[:, None] * (end - start)[None, :]
 
 
+def _multi_min_jerk_positions(waypoints, n: int) -> np.ndarray:
+    """Chain min-jerk segments through a list of ``(K, 3)`` waypoints.
+
+    Steps are distributed across the ``K-1`` segments proportionally to
+    Euclidean segment length (each segment gets >= 2 samples) and the
+    shared segment endpoints are de-duplicated so the result is exactly
+    ``(n, 3)``. Used to route the Stage-1 carry through an arch apex *and*
+    a −Y insertion standoff so the tire threads into the wheel well along
+    the hub axis instead of being dropped onto the cargo from above.
+    """
+    pts = [np.asarray(w, dtype=np.float64).reshape(3) for w in waypoints]
+    n = max(int(n), 2)
+    if len(pts) < 2:
+        return pts[-1][None, :].copy()
+    if len(pts) == 2:
+        return _min_jerk_positions(pts[0], pts[1], n)
+    seg_len = np.array([np.linalg.norm(pts[i + 1] - pts[i])
+                        for i in range(len(pts) - 1)], dtype=np.float64)
+    total = float(seg_len.sum())
+    n_seg = len(seg_len)
+    if total < 1e-9:
+        alloc = np.full(n_seg, max(2, n // n_seg), dtype=int)
+    else:
+        alloc = np.maximum(2, np.round(seg_len / total * n).astype(int))
+    segs = []
+    for i in range(n_seg):
+        s = _min_jerk_positions(pts[i], pts[i + 1], int(alloc[i]))
+        segs.append(s if i == 0 else s[1:])  # drop shared endpoint
+    traj = np.vstack(segs)
+    if traj.shape[0] > n:
+        # subsample preserving the final endpoint
+        idx = np.linspace(0, traj.shape[0] - 1, n).round().astype(int)
+        traj = traj[idx]
+    elif traj.shape[0] < n:
+        pad = np.repeat(traj[-1:], n - traj.shape[0], axis=0)
+        traj = np.vstack([traj, pad])
+    traj[-1] = pts[-1]
+    return traj
+
+
 def _slerp_quats(q_start, q_end, n: int,
                  times: Optional[np.ndarray] = None) -> np.ndarray:
     """Spherical-linear interpolation between two xyzw quaternions.
@@ -221,6 +261,9 @@ class TyroEnv(gym.Env):
         self._traj_quat: Optional[np.ndarray] = None     # (N, 4) world xyzw
         self._traj_q: Optional[np.ndarray] = None        # (N, 6) arm joints
         self.current_traj_step: int = 0
+        # Waypoint arrival gate watchdog — counts control steps the index
+        # has stalled at the current waypoint (see ``_advance_traj_index``).
+        self._traj_stall: int = 0
         # T_ee_tire cached at the moment of the grasp constraint
         # creation. Lets us compute the EE world pose required to put
         # the tire at any desired world pose afterwards (Stage 1 mount
@@ -1449,6 +1492,7 @@ class TyroEnv(gym.Env):
                                      total_steps: int = 100,
                                      lift: float = 0.0,
                                      orient_front_load_k: float = 0.0,
+                                     approach_standoff: Optional[np.ndarray] = None,
                                      ) -> Tuple[np.ndarray, np.ndarray]:
         """Build a ``(N, 3) / (N, 4)`` nominal EE trajectory.
 
@@ -1487,21 +1531,41 @@ class TyroEnv(gym.Env):
         end_pos, end_quat = end_pose
         n = int(total_steps)
 
-        if float(lift) > 1e-6:
-            mid_pos = 0.5 * (np.asarray(start_pos, dtype=np.float64)
-                             + np.asarray(end_pos, dtype=np.float64))
-            mid_pos = mid_pos + np.array([0.0, 0.0, float(lift)],
-                                         dtype=np.float64)
+        start_arr = np.asarray(start_pos, dtype=np.float64).reshape(3)
+        end_arr = np.asarray(end_pos, dtype=np.float64).reshape(3)
+        has_standoff = False
+        if approach_standoff is not None:
+            so = np.asarray(approach_standoff, dtype=np.float64).reshape(3)
+            has_standoff = float(np.linalg.norm(so)) > 1e-6
+        if has_standoff:
+            # General multi-via path (start, [apex], standoff, end). Only
+            # taken when an insertion standoff is requested (e.g. a future
+            # scene redesign); the shipping config leaves standoff = 0 so
+            # the original arch path below is used unchanged.
+            waypoints = [start_arr]
+            if float(lift) > 1e-6:
+                waypoints.append(
+                    0.5 * (start_arr + end_arr)
+                    + np.array([0.0, 0.0, float(lift)], dtype=np.float64))
+            waypoints.append(end_arr + so)
+            waypoints.append(end_arr)
+            traj_pos = _multi_min_jerk_positions(waypoints, n)
+        elif float(lift) > 1e-6:
+            # Original symmetric arch: split the n steps equally between
+            # the start→apex and apex→end segments (preserves the tested
+            # carry timing the mount subsystem is tuned to).
+            mid_pos = 0.5 * (start_arr + end_arr) + np.array(
+                [0.0, 0.0, float(lift)], dtype=np.float64)
             half = max(1, n // 2)
-            seg1 = _min_jerk_positions(start_pos, mid_pos, half + 1)
-            seg2 = _min_jerk_positions(mid_pos, end_pos, n - half + 1)
+            seg1 = _min_jerk_positions(start_arr, mid_pos, half + 1)
+            seg2 = _min_jerk_positions(mid_pos, end_arr, n - half + 1)
             traj_pos = np.vstack([seg1[:-1], seg2[:-1], seg2[-1:]])
             traj_pos = traj_pos[:n] if traj_pos.shape[0] > n else traj_pos
             if traj_pos.shape[0] < n:
                 pad = np.repeat(traj_pos[-1:], n - traj_pos.shape[0], axis=0)
                 traj_pos = np.vstack([traj_pos, pad])
         else:
-            traj_pos = _min_jerk_positions(start_pos, end_pos, n)
+            traj_pos = _min_jerk_positions(start_arr, end_arr, n)
 
         if float(orient_front_load_k) > 1.0 + 1e-6:
             t_lin = np.linspace(0.0, 1.0, n, dtype=np.float64)
@@ -1573,6 +1637,7 @@ class TyroEnv(gym.Env):
             self._traj_quat = None
             self._traj_q = None
             self.current_traj_step = 0
+            self._traj_stall = 0
             return
         start_pos, start_quat = self.robot_A.ee_pose()
         end_pos, end_quat = self._compute_stage_end_ee_pose(int(self.task_stage))
@@ -1615,6 +1680,16 @@ class TyroEnv(gym.Env):
             end_quat = self._tilt_lock_palm_up_quat(
                 np.asarray(end_quat, dtype=np.float64),
             )
+        standoff = None
+        if int(self.task_stage) == 1:
+            d = float(getattr(self.cfg, "planner_stage1_approach_standoff", 0.0))
+            if d > 1e-6:
+                hub_axis = np.asarray(
+                    self.cfg.hub_axis_world, dtype=np.float64)
+                hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
+                # Stand off *along* the hub axis (−Y) so the final approach
+                # is a straight insertion into the wheel well.
+                standoff = hub_axis * d
         traj_pos, traj_quat = self._generate_nominal_trajectory(
             (np.asarray(start_pos, dtype=np.float64),
              np.asarray(start_quat, dtype=np.float64)),
@@ -1623,14 +1698,44 @@ class TyroEnv(gym.Env):
             total_steps=n,
             lift=lift,
             orient_front_load_k=front_load_k,
+            approach_standoff=standoff,
         )
         self._traj_pos = traj_pos
         self._traj_quat = traj_quat
         self.current_traj_step = 0
+        self._traj_stall = 0
         if bool(getattr(self.cfg, "planner_precompute_joint_traj", True)):
             self._traj_q = self._bake_planner_joint_trajectory(traj_pos, traj_quat)
+            self._traj_q = self._smooth_baked_joint_trajectory(self._traj_q)
         else:
             self._traj_q = None
+
+    def _smooth_baked_joint_trajectory(self, traj_q: Optional[np.ndarray]
+                                       ) -> Optional[np.ndarray]:
+        """Centred moving-average over the baked joint sequence.
+
+        Removes per-waypoint IK micro-branch chatter that otherwise reads
+        as a high-frequency EE zig-zag when the baked joints are replayed
+        one-per-control-step. The endpoints are preserved (shrinking
+        window at the edges) so the start pose and the mount end pose are
+        not pulled off-target. No-op for window ≤ 1 or short trajectories.
+        """
+        if traj_q is None:
+            return None
+        w = int(getattr(self.cfg, "planner_smooth_baked_window", 0))
+        n = int(traj_q.shape[0])
+        if w <= 1 or n < 3:
+            return traj_q
+        half = w // 2
+        out = np.empty_like(traj_q)
+        for i in range(n):
+            lo = max(0, i - half)
+            hi = min(n, i + half + 1)
+            out[i] = traj_q[lo:hi].mean(axis=0)
+        # Pin the exact endpoints so the mount target pose is unchanged.
+        out[0] = traj_q[0]
+        out[-1] = traj_q[-1]
+        return out
 
     def _bake_planner_joint_trajectory(
         self,
@@ -2378,6 +2483,46 @@ class TyroEnv(gym.Env):
             Rotation.from_matrix(Rt).as_quat(), dtype=np.float64,
         )
 
+    def _advance_traj_index(self, nominal_pos: np.ndarray) -> None:
+        """Advance ``current_traj_step`` with a waypoint **arrival gate**.
+
+        2026-06-04 — the index used to increment every control step
+        regardless of whether the arm had reached the current nominal
+        waypoint. Near reach-saturation the stiff PD lags the commanded
+        target by 10–40 cm, so the index raced ahead of the arm and the
+        realised EE path zig-zagged behind the Min-Jerk plan (the
+        "오락가락" carry). Now the index only advances when the *measured*
+        EE is within ``planner_waypoint_pos_tol_m`` of the current
+        waypoint, OR a stall watchdog (``planner_waypoint_max_stall``
+        control steps) force-advances it so an unreachable pose can't
+        freeze the trajectory and time the episode out. The result is a
+        realised path that tracks the plan closely → smooth, robot-like
+        motion.
+
+        Default-OFF: the baked Min-Jerk joint trajectory is played one
+        waypoint per control step and reaches the hub cleanly, so the
+        gate is only useful for the per-step EE-IK path. When disabled
+        the index simply advances every step.
+        """
+        if not bool(getattr(self.cfg, "planner_waypoint_gate_enable", False)):
+            self.current_traj_step += 1
+            self._traj_stall = 0
+            return
+        tol = float(getattr(self.cfg, "planner_waypoint_pos_tol_m", 0.04))
+        max_stall = int(getattr(self.cfg, "planner_waypoint_max_stall", 10))
+        try:
+            ee_now, _ = self.robot_A.ee_pose()
+            err = float(np.linalg.norm(
+                np.asarray(ee_now, dtype=np.float64)
+                - np.asarray(nominal_pos, dtype=np.float64)
+            ))
+        except Exception:
+            err = 0.0
+        self._traj_stall = int(getattr(self, "_traj_stall", 0)) + 1
+        if err <= tol or self._traj_stall >= max(1, max_stall):
+            self.current_traj_step += 1
+            self._traj_stall = 0
+
     def _apply_action(self, action: np.ndarray) -> None:
         """Dispatch the policy action to the robots.
 
@@ -2469,12 +2614,33 @@ class TyroEnv(gym.Env):
                 final_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
             residual_active = float(np.max(np.abs(action[0:3]))) >= 1e-4
+            use_dls = bool(getattr(self.cfg, "use_dls_cartesian_servo", False)) and (
+                residual_active
+                or bool(getattr(self.cfg, "planner_dls_always", False))
+            )
             use_baked = (
-                self._traj_q is not None
+                not use_dls
+                and self._traj_q is not None
                 and bool(getattr(self.cfg, "planner_precompute_joint_traj", True))
                 and not residual_active
             )
-            if use_baked:
+            if use_dls:
+                # 2026-06-04 — closed-loop DLS resolved-rate servo toward
+                # the nominal+residual EE pose. Replaces per-step absolute
+                # IK to kill the 40–70 cm EE snaps near the hub singularity.
+                self.robot_A.drive_ee_servo_dls(
+                    final_pos, final_quat,
+                    damping=float(getattr(self.cfg, "planner_dls_damping", 0.06)),
+                    max_joint_step=float(getattr(
+                        self.cfg, "planner_dls_max_joint_step", 0.10)),
+                    pos_gain=float(getattr(self.cfg, "planner_dls_pos_gain", 1.0)),
+                    orn_gain=float(getattr(self.cfg, "planner_dls_orn_gain", 0.8)),
+                    adaptive=bool(getattr(self.cfg, "planner_dls_adaptive", True)),
+                    manip_threshold=float(getattr(
+                        self.cfg, "planner_dls_manip_threshold", 0.02)),
+                )
+                self._advance_traj_index(nominal_pos)
+            elif use_baked:
                 # 2026-06-03 — play back joint targets baked at replan
                 # time (chained warm-start IK). Avoids per-step HOME-
                 # anchored IK in ``apply_palm_up_pose``, which was the
@@ -2482,7 +2648,7 @@ class TyroEnv(gym.Env):
                 q_cmd = np.asarray(self._traj_q[idx], dtype=np.float64)
                 self.robot_A.last_target_pos = nominal_pos.copy()
                 self.robot_A.drive_arm_targets(q_cmd)
-                self.current_traj_step += 1
+                self._advance_traj_index(nominal_pos)
             else:
                 hold_q = getattr(self, "_planner_hold_arm_targets", None)
                 skip_ik = (
@@ -2490,15 +2656,30 @@ class TyroEnv(gym.Env):
                     and int(self.current_traj_step) == 0
                     and not residual_active
                 )
+                # When a baked joint trajectory exists, warm-start the
+                # residual-offset IK from the baked solution for this
+                # waypoint so the realised path hugs the clean baked
+                # branch (+ small offset) instead of snapping elsewhere.
+                warm_q = None
+                if (
+                    self._traj_q is not None
+                    and bool(getattr(
+                        self.cfg,
+                        "planner_residual_warmstart_from_baked", True,
+                    ))
+                ):
+                    warm_q = np.asarray(self._traj_q[idx], dtype=np.float64)
                 if skip_ik:
                     self.robot_A.last_target_pos = final_pos.copy()
                     self.robot_A.drive_arm_targets(hold_q)
                     self._planner_hold_arm_targets = None
                 elif lock_palm_up:
-                    self.robot_A.apply_palm_up_pose(final_pos, final_quat)
+                    self.robot_A.apply_palm_up_pose(
+                        final_pos, final_quat, warm_q=warm_q,
+                    )
                 else:
                     self.robot_A.apply_absolute_ee(final_pos, final_quat)
-                self.current_traj_step += 1
+                self._advance_traj_index(nominal_pos)
         else:
             # Legacy raw-delta path (kept for backwards-compatibility).
             ps = self.cfg.action.pos_scale

@@ -16,7 +16,9 @@ import pybullet as p
 import pybullet_data
 
 from ..config import EnvConfig
-from .utils import quat_multiply, rpy_to_quat, axisangle3_to_quat
+from .utils import (
+    quat_multiply, rpy_to_quat, axisangle3_to_quat, relative_axisangle,
+)
 
 
 @dataclass
@@ -315,6 +317,16 @@ class UR10Robot(Robot):
         self._max_step = float(getattr(cfg, "ur10_joint_max_step_rad", 0.0))
         self._pgain = float(getattr(cfg, "ur10_position_gain", 1.0))
         self._vgain = float(getattr(cfg, "ur10_velocity_gain", 1.0))
+        # 2026-06-04 — per-joint motor speed cap (rad/s). 0 = unlimited.
+        # Passed to PyBullet POSITION_CONTROL ``maxVelocity`` so the stiff
+        # PD cannot whip the arm during the near-singular hub insertion
+        # (the residual source of the 70 cm/step "오락가락" EE snap once the
+        # carry itself is smooth). Throttles velocity *inside* the physics
+        # sub-steps — unlike ``_max_step`` which clamps the commanded
+        # target delta but lets the PD overshoot toward it.
+        self._max_joint_vel = float(
+            getattr(cfg, "ur10_motor_max_velocity_rad_s", 0.0)
+        )
         self._joint_slew_max = float(
             getattr(cfg, "ur10_joint_slew_max_rad", 0.08),
         )
@@ -479,15 +491,30 @@ class UR10Robot(Robot):
         )
         arm_targets = self._smooth_arm_targets(arm_targets)
         forces = [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
-        p.setJointMotorControlArray(
-            self.uid, self.arm.indices,
-            controlMode=p.POSITION_CONTROL,
-            targetPositions=arm_targets.tolist(),
-            forces=forces,
-            positionGains=[self._pgain] * len(forces),
-            velocityGains=[self._vgain] * len(forces),
-            physicsClientId=self.client,
-        )
+        if self._max_joint_vel > 0.0:
+            # setJointMotorControlArray ignores maxVelocity, so issue a
+            # per-joint control2 call to enforce the speed cap.
+            for i, j in enumerate(self.arm.indices):
+                p.setJointMotorControl2(
+                    self.uid, j,
+                    controlMode=p.POSITION_CONTROL,
+                    targetPosition=float(arm_targets[i]),
+                    force=float(forces[i]),
+                    positionGain=self._pgain,
+                    velocityGain=self._vgain,
+                    maxVelocity=self._max_joint_vel,
+                    physicsClientId=self.client,
+                )
+        else:
+            p.setJointMotorControlArray(
+                self.uid, self.arm.indices,
+                controlMode=p.POSITION_CONTROL,
+                targetPositions=arm_targets.tolist(),
+                forces=forces,
+                positionGains=[self._pgain] * len(forces),
+                velocityGains=[self._vgain] * len(forces),
+                physicsClientId=self.client,
+            )
 
     def solve_arm_joints_in_snapshot(
         self,
@@ -678,8 +705,16 @@ class UR10Robot(Robot):
             physicsClientId=self.client,
         )
 
-    def apply_palm_up_pose(self, pos, target_orn) -> None:
+    def apply_palm_up_pose(self, pos, target_orn, warm_q=None) -> None:
         """Absolute-pose IK with **HOME-based warm start**, for palm-up.
+
+        ``warm_q`` (2026-06-04): optional explicit IK warm-start joint
+        vector. When the planner has a baked joint trajectory, the env
+        passes ``_traj_q[idx]`` here so the residual-offset IK stays in
+        the same clean branch as the reachable baked path (instead of
+        re-solving from the live joints, which let the realised carry
+        path snap to far IK branches → "오락가락"). ``None`` falls back to
+        the current joint state.
 
         2026-06-01 (Option B): ``apply_absolute_ee`` warm-starts IK from
         the *current* joint state, which is intended to keep the solver
@@ -705,17 +740,25 @@ class UR10Robot(Robot):
             target_orn = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
         self.last_target_pos = target_pos.copy()
 
-        # Warm-start from the *current* arm state (not HOME) so consecutive
-        # planner steps stay in the same IK branch — HOME rest was the main
-        # source of step-to-step wrist snaps / visible shaking.
-        cur_q, _ = self.joint_state()
+        # Warm-start from the baked joint vector when provided (keeps IK in
+        # the reachable baked branch), else from the *current* arm state
+        # (not HOME) so consecutive planner steps stay in the same IK
+        # branch — HOME rest was the main source of step-to-step wrist
+        # snaps / visible shaking.
+        if warm_q is not None:
+            rest_q = np.clip(
+                np.asarray(warm_q, dtype=np.float64).reshape(-1),
+                self.arm.lower, self.arm.upper,
+            )
+        else:
+            rest_q, _ = self.joint_state()
         ik = p.calculateInverseKinematics(
             self.uid, self.EE_LINK_INDEX,
             target_pos.tolist(), target_orn.tolist(),
             lowerLimits=self.arm.lower.tolist(),
             upperLimits=self.arm.upper.tolist(),
             jointRanges=self.arm.range.tolist(),
-            restPoses=cur_q.tolist(),
+            restPoses=rest_q.tolist(),
             maxNumIterations=200,
             residualThreshold=1e-4,
             physicsClientId=self.client,
@@ -784,6 +827,126 @@ class UR10Robot(Robot):
             arm_targets = self._fallback_targets()
         arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
         self.drive_arm_targets(arm_targets)
+
+    # ------------------------------------------------------------------
+    # 2026-06-04 — Damped least-squares resolved-rate Cartesian servo.
+    # ------------------------------------------------------------------
+    def _movable_joint_indices(self) -> List[int]:
+        """All non-fixed joints in PyBullet enumeration order (cached).
+
+        ``calculateJacobian`` needs position/velocity/accel vectors over
+        *every* movable DOF, and returns columns in this same order; the
+        arm columns are then sliced via ``_ik_arm_slots``.
+        """
+        cached = getattr(self, "_movable_cache", None)
+        if cached is not None:
+            return cached
+        n = p.getNumJoints(self.uid, physicsClientId=self.client)
+        movable = [
+            j for j in range(n)
+            if p.getJointInfo(self.uid, j, physicsClientId=self.client)[2]
+            != p.JOINT_FIXED
+        ]
+        self._movable_cache = movable
+        return movable
+
+    def drive_ee_servo_dls(
+        self,
+        target_pos,
+        target_quat,
+        damping: float = 0.06,
+        max_joint_step: float = 0.10,
+        pos_gain: float = 1.0,
+        orn_gain: float = 0.8,
+        adaptive: bool = True,
+        manip_threshold: float = 0.02,
+    ) -> None:
+        """Resolved-rate EE servo with damped least squares (DLS).
+
+        2026-06-04 — replaces the per-step *absolute* IK (which can teleport
+        across IK branches and, near reach saturation, makes the measured
+        EE snap 40–70 cm in a single control step) with a **closed-loop**
+        step on the EE error:
+
+            e = [pos_gain·(p* − p);  orn_gain·axisangle(q → q*)]
+            Δq = Jᵀ (J Jᵀ + λ²I)⁻¹ e            (damped least squares)
+            q_cmd = clip(q + clip(Δq, ±max_joint_step))
+
+        Because the command is always ``current_q + small Δq``, the PD
+        target never sits far from the achievable pose, so there is no
+        lag-then-burst.
+
+        **Adaptive damping (Nakamura & Hanafusa 1986).** A *fixed* λ forces
+        a single compromise: small λ tracks accurately but snaps at the
+        singularity, large λ is smooth everywhere but never reaches the hub
+        (the EE stalls 40–60 cm short). With ``adaptive=True`` the damping
+        is scheduled on the manipulability ``w = √det(J Jᵀ)``:
+
+            λ² = 0                                   if w ≥ w0
+            λ² = damping² · (1 − w/w0)²              if w <  w0
+
+        So far from singularities (w ≥ w0 = ``manip_threshold``) the servo
+        tracks the plan exactly (zero damping → no stall), and damping
+        switches on *only* as the arm enters the ill-conditioned hub-
+        insertion region, smoothly bounding the EE velocity there. This is
+        what lets a single controller be both jump-free during the approach
+        **and** able to seat the tire.
+        """
+        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+        target_quat = np.asarray(target_quat, dtype=np.float64).reshape(4)
+        nq = float(np.linalg.norm(target_quat))
+        target_quat = (
+            target_quat / nq if nq > 1e-12
+            else np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
+        )
+        self.last_target_pos = target_pos.copy()
+
+        cur_pos, cur_orn = self.ee_pose()
+        e_pos = (target_pos - np.asarray(cur_pos, dtype=np.float64)) * float(pos_gain)
+        e_orn = relative_axisangle(cur_orn, target_quat) * float(orn_gain)
+        err = np.concatenate([e_pos, e_orn])
+
+        movable = self._movable_joint_indices()
+        states = p.getJointStates(self.uid, movable, physicsClientId=self.client)
+        q_full = [float(s[0]) for s in states]
+        zeros = [0.0] * len(movable)
+        jac_lin, jac_ang = p.calculateJacobian(
+            self.uid, self.EE_LINK_INDEX,
+            [0.0, 0.0, 0.0], q_full, zeros, zeros,
+            physicsClientId=self.client,
+        )
+        J_full = np.vstack([
+            np.asarray(jac_lin, dtype=np.float64),
+            np.asarray(jac_ang, dtype=np.float64),
+        ])  # (6, n_movable)
+        J = J_full[:, self._ik_arm_slots]  # (6, n_arm)
+
+        JJt = J @ J.T
+        if bool(adaptive):
+            # Manipulability-scheduled damping: zero away from singularities
+            # (exact tracking → no stall), ramping up only as w → 0.
+            det = float(max(np.linalg.det(JJt), 0.0))
+            w = math.sqrt(det)
+            w0 = float(manip_threshold)
+            if w0 > 1e-12 and w < w0:
+                scale = (1.0 - w / w0)
+                lam2 = (float(damping) ** 2) * scale * scale
+            else:
+                lam2 = 0.0
+        else:
+            lam2 = float(damping) ** 2
+        try:
+            y = np.linalg.solve(JJt + lam2 * np.eye(6), err)
+        except np.linalg.LinAlgError:
+            y = np.linalg.lstsq(JJt + lam2 * np.eye(6), err, rcond=None)[0]
+        dq = J.T @ y
+
+        cap = float(max_joint_step)
+        if cap > 0.0:
+            dq = np.clip(dq, -cap, cap)
+        cur_q, _ = self.joint_state()
+        q_cmd = np.clip(cur_q + dq, self.arm.lower, self.arm.upper)
+        self.drive_arm_targets(q_cmd)
 
     def _arm_joint_indices(self) -> List[int]:
         # Match by URDF joint name — robust to non-arm joints (Robotiq gripper,

@@ -469,6 +469,29 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
 
+### 2026-06-04 — "오락가락" 근본 원인 규명 + 삽입 속도 제한 (측정 기반)
+
+**근본 원인 = 기하 특이점.** carry를 4분면으로 분해하면 점프가 어디 있는지 명확:
+
+| 구간 (step) | max jump | 큰 점프(>15cm) |
+|---|---|---|
+| 0–51 (carry 전반) | ~5 cm | 0 — **이미 부드러움** |
+| 74–99 (허브 삽입) | **70 cm** | 11 — 여기서만 터짐 |
+
+- baked 관절 명령은 그 구간에서도 \|Δq\|≈0.12 rad로 **매끄러움** → IK/계획 문제 아님. 허브가 UR10 reach의 **88–96%** 라 stiff PD가 특이점에서 팔을 **채찍질**하는 것.
+- **DLS Cartesian 서보** 구현(`UR10Robot.drive_ee_servo_dls`, `use_dls_cartesian_servo`): 동작은 매우 부드럽게(mean 1.05 cm, 큰 점프 0) 만들지만 **같은 특이점 때문에 타이어를 4 cm 게이트에 못 꽂음** → **기본 OFF** (opt-in 레버로 보존).
+- **베이스/허브 재배치 검토(공격적 레이아웃, reach 60%)**: zero-action carry가 **70→8 cm** 로 완전 평활화됨을 입증(근본 원인 재확인). 그러나 허브 이동이 **cargo 박스를 carry 통로로 끌어들이고**(가드 동결), −Y 삽입 standoff를 넣자 **팔 링크가 트럭 본체와 충돌(step 80 폭발)**. mount/삽입 서브시스템 전체가 원래 기하에 정밀 설계돼 있어 다층 재튜닝 필요 → **레이아웃 원복**. (`planner_stage1_approach_standoff` 다구간 경로 코드는 향후 재설계용으로 보존, 기본 0.)
+- **채택한 해법 = `ur10_motor_max_velocity_rad_s = 1.0`** (PyBullet POSITION_CONTROL maxVelocity). 특이점에서의 PD 채찍질만 잘라냄:
+  - 최악 삽입 점프 **70 → 25 cm**, mean **6.3 → 3.2 cm**, 큰 점프 **11 → 2**.
+  - 커리큘럼 시작 게이트(0.12 m)에서 **mount@112**, hard 게이트(0.04 m)에선 타이어 허브 5.8 cm 까지(마지막 ~2 cm는 정책 residual이 마무리).
+  - 1.5는 미시팅, 2.0은 mount되나 노이즈(max 38 cm) → **1.0이 최적**. 0이면 legacy(mount@104, 70 cm snap).
+- **학습**: maxVel이 env dynamics를 바꾸므로 pre-2026-06-04 ckpt는 OOD → `scripts/train_v8_smooth.ps1` 신규 학습.
+- **정직한 한계**: 88% reach 특이점 자체는 남아 있음(완전 평활은 씬 재설계 필요). maxVel은 그 안에서 **위험 없이 3배 개선**하는 실용 해법.
+- **yaw 진동**: EE yaw가 carry 중 24회 역회전(step 20–70 정체) 후 특이점에서 wrap. 허브 근처 회전은 cargo 충돌, 거치대 선회전은 도달 불가 → **spawn bore −Y** 또는 **특이점 제거**만이 근본 해법.
+- **대형 로봇 / 재배치**: reach 2.6 m(FANUC R-2000iC) 또는 약한 재배치(hub Y 0.65)로 특이점 제거 가능. R-2000iD URDF는 미지원 → iC/210F 대체. **100 kg**은 payload OK, PyBullet PD·contact 재튜닝 필요.
+- **전체 조사 기록**: [`docs/INVESTIGATION_2026-06-04.md`](docs/INVESTIGATION_2026-06-04.md)
+- **FANUC PoC (1단계)**: `python scripts/poc_fanuc_urdf.py --fetch` → `python scripts/poc_fanuc_urdf.py --load [--gui]`
+
 ### 2026-06-03 — 시뮬 떨림 · 허브 물리 결합 · 경로 시각화
 
 - **문제**: 플래너-only replay도 떨림; 마운트 후 타이어가 EE에 붙어 허브에 안착한 것처럼 보이지 않음; GUI 계획선 vs 실제 경로 괴리.

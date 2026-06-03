@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 runs/
 *.zip
+# ROS-Industrial fanuc clone (meshes; use scripts/poc_fanuc_urdf.py --fetch)
+data/urdf/fanuc_ros/

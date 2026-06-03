@@ -553,6 +553,24 @@ class EnvConfig:
     #: EMA blend for kinematic tire sync (1.0 = snap, 0.35 = smooth).
     #: Low values cut the "수직 유지" teleport jitter while keeping reach.
     kinematic_tire_sync_alpha: float = 0.65
+    #: **2026-06-04 (insertion smoothing)** — per-joint motor speed cap
+    #: (rad/s) applied via PyBullet POSITION_CONTROL ``maxVelocity`` in
+    #: ``UR10Robot.drive_arm_targets``. 0 = unlimited (legacy). The carry
+    #: itself is smooth; the residual "오락가락" is the stiff PD whipping the
+    #: arm through the near-singular hub insertion (hub at 88 % reach).
+    #: Measured 2026-06-04: cap ≈ 1.0 rad/s cut the worst insertion EE jump
+    #: 70 → 25 cm (mean 6.3 → 1.5 cm) while the baked Min-Jerk joint path
+    #: (max |Δq| ≈ 0.15 rad/step ⇒ ~3 rad/s peak) still tracks given the
+    #: full step budget. The Min-Jerk profile is already velocity-bounded,
+    #: so this only clips the singular-direction overshoot, not the plan.
+    #: **Swept 2026-06-04** (zero-action, shipping geometry): 1.0 rad/s is
+    #: the sweet spot — worst insertion jump 70 → 25 cm, mean 6.3 → 3.2 cm,
+    #: >15 cm jumps 11 → 2, and it mounts at the curriculum-start gate
+    #: (mount@112 / 0.12 m) with the tire 5.8 cm from the hub at the hard
+    #: 0.04 m gate (the policy residual closes the final ~2 cm). 1.5 rad/s
+    #: failed to seat; 2.0 rad/s mounted but stayed noisy (max 38 cm). 0
+    #: restores the legacy uncapped behaviour (mount@104, 70 cm snap).
+    ur10_motor_max_velocity_rad_s: float = 1.0
     #: Max joint change (rad) per control step when playing back a baked
     #: planner trajectory — slew is taken from the *measured* arm state,
     #: not the previous command, so PD lag cannot cause 1+ rad snaps.
@@ -560,6 +578,32 @@ class EnvConfig:
     #: Baked planner: advance to the next waypoint when
     #: ``max|q - q_waypoint|`` falls below this (rad).
     planner_joint_waypoint_tol_rad: float = 0.05
+    #: **2026-06-04 (waypoint arrival gate)** — OFF by default. When
+    #: enabled, ``current_traj_step`` advances only when the measured EE
+    #: is within ``planner_waypoint_pos_tol_m`` of the current waypoint
+    #: (or the stall watchdog elapses). This was prototyped to stop the
+    #: index racing ahead of a lagging arm, but with the *baked* joint
+    #: trajectory (which is a pre-solved smooth path played one waypoint
+    #: per control step) the natural PD lag exceeds the tolerance almost
+    #: everywhere, so the gate stalled the index and the arm never
+    #: reached the hub. Left in the codebase (default off) for the
+    #: per-step EE-IK path; the baked path does not need it.
+    planner_waypoint_gate_enable: bool = False
+    planner_waypoint_pos_tol_m: float = 0.04
+    #: Max control steps the index may stall at a single waypoint before
+    #: it is force-advanced (watchdog). Only consulted when the gate is
+    #: enabled. 10 steps ≈ 0.5 s at 20 Hz.
+    planner_waypoint_max_stall: int = 10
+    #: **2026-06-04 (−Y insertion standoff)** — when > 0, the Stage-1 carry
+    #: routes through a pre-hub via-point offset this far along **−Y** (the
+    #: wheel-well / hub axis) from the mount EE target, so the final segment
+    #: is a straight +Y insertion into the well. Built for the (rejected)
+    #: anti-singularity hub-reposition layout, where the cargo box sat in
+    #: the carry corridor. **Default 0 (disabled)** — the shipping layout's
+    #: mount/insertion subsystem is co-designed with the arch approach and
+    #: this standoff is unnecessary (and the multi-via code path is left in
+    #: place for any future scene redesign).
+    planner_stage1_approach_standoff: float = 0.0
     #: Hub-mounting target in world (= hub_pos_nominal under the new
     #: Robot B-centric layout).
     tire_mount_pos: Tuple[float, float, float] = (0.0, 0.80, 0.22)
@@ -1080,7 +1124,13 @@ class EnvConfig:
     #: ``action[0:3]`` ∈ [-1, 1] before adding to the nominal pose.
     #: 0.15 m matches the spec — generous enough for genuine avoidance
     #: but small enough that the planner remains the dominant signal.
-    planner_pos_offset_scale: float = 0.15
+    #: **2026-06-04**: 0.15 → **0.10**. With the waypoint arrival gate +
+    #: per-step EE IK (no joint bake), the realised path tracks the
+    #: Min-Jerk nominal closely; a 0.15 m residual let the policy yank
+    #: the EE far enough off the plan to re-introduce the zig-zag the
+    #: gate is meant to remove. 0.10 m keeps genuine obstacle-avoidance
+    #: headroom while letting the smooth planner dominate the motion.
+    planner_pos_offset_scale: float = 0.10
     #: Per-step residual rotation offset scale (radians, axis-angle).
     #: Only consumed when ``planner_enable_rot_offset = True``.
     planner_rot_offset_scale: float = 0.15
@@ -1159,6 +1209,14 @@ class EnvConfig:
     #: the EMA. 0.0 = disabled. ~0.05–0.10 rad caps the worst IK spikes
     #: so the arm slews instead of snapping. Acts like a crude joint
     #: speed limit (≈ alpha·freq rad/s).
+    #: **2026-06-04**: tested at 0.06 but reverted to **0.0**. With the
+    #: baked Min-Jerk joint trajectory (the reachable path), the per-step
+    #: joint change must occasionally exceed 0.06–0.12 rad (e.g. the
+    #: shoulder-pan swing from cradle to hub); a hard cap stalled the
+    #: carry and the tire never reached the hub in the 600-step budget.
+    #: The baked trajectory is *already* a smooth, bounded-jerk speed
+    #: profile, so it provides the "real-robot" motion without an extra
+    #: throttle. Keep 0.0 for training; enable in replay/eval only.
     ur10_joint_max_step_rad: float = 0.0
     #: **2026-06-03 — UR10 PD gains (visual jitter fix, part 2).**
     #: PyBullet ``POSITION_CONTROL`` positionGain/velocityGain for the
@@ -1181,7 +1239,80 @@ class EnvConfig:
     #: which was the dominant source of visible arm tremor even with zero
     #: policy residual. Set False to restore the legacy per-step IK path
     #: (needed only for A/B debugging).
+    #: **2026-06-04**: kept **True** (baked reaches the hub cleanly —
+    #: zero-action smoke mounts at ~step 104, d_hub→0). A per-step EE-IK
+    #: path warm-started from the *current* joints stalls ~0.85 m short
+    #: of the hub, so True is required for reachability. The realised-
+    #: path "오락가락" came from the *residual-active* branch throwing the
+    #: baked solution away and re-solving IK from scratch each step; that
+    #: is now fixed by warm-starting the residual IK from the baked joint
+    #: vector (see ``planner_residual_warmstart_from_baked``).
     planner_precompute_joint_traj: bool = True
+    #: **2026-06-04** — moving-average window (waypoints) over the baked
+    #: joint trajectory ``_traj_q``. **Default 0 (disabled).** Prototyped
+    #: as a fix for the baked carry zig-zag (zero-action straightness
+    #: ratio 3.15, 29 reversals), but measurement showed any window ≥ 5
+    #: pulls the final approach off the 4 cm mount tolerance → the tire
+    #: reaches the hub neighbourhood but never trips the mount gate
+    #: (mounted@None, wanders to max_steps). Joint-space smoothing is
+    #: therefore incompatible with the tight mount gate; left in the
+    #: codebase (off) for experiments only. The realised carry wiggle is
+    #: dominated by the arch + 90° yaw, not IK chatter — a genuine fix
+    #: needs a straighter carry plan or Cartesian tracking (future work).
+    planner_smooth_baked_window: int = 0
+    #: **2026-06-04** — warm-start the residual-offset IK from the baked
+    #: joint solution ``_traj_q[idx]`` instead of the live joint state.
+    #: NOTE (measured): for the 6-DOF UR10 with 200-iter DLS IK and a
+    #: reachable target, the converged solution is essentially branch-
+    #: independent, so this had **no measurable effect** on the realised
+    #: path (identical metrics with it on/off). Kept (cheap, harmless) as
+    #: defence for poses near singularities, but it is *not* the carry-
+    #: smoothness lever it was hoped to be. Default off to avoid implying
+    #: otherwise; flip on for redundant/near-singular configurations.
+    planner_residual_warmstart_from_baked: bool = False
+    #: **2026-06-04 — DLS Cartesian servo (smoothness fix).**
+    #: When True the planner-residual path drives the UR10 with a damped
+    #: least-squares resolved-rate servo (``UR10Robot.drive_ee_servo_dls``)
+    #: toward the nominal+residual EE pose, instead of per-step absolute
+    #: IK. This is a closed-loop step on the EE error, so the commanded
+    #: joint target never sits far from the achievable pose — eliminating
+    #: the lag-then-burst that made the measured EE snap 40–70 cm/step near
+    #: the hub (86 % of UR10 reach). The λ² damping degrades gracefully at
+    #: singularities (smooth slow-down instead of a wild swing). When the
+    #: baked joint trajectory exists it is still used for the zero-residual
+    #: replay path; DLS engages whenever a residual is active OR
+    #: ``planner_dls_always`` is set.
+    #: **Default OFF**: measured 2026-06-04 — DLS makes the carry beautifully
+    #: smooth (mean 1.05 cm/step, zero >15 cm jumps) but the λ² damping cannot
+    #: drive the tire into the 4 cm mount gate at 96 % reach, so it must not
+    #: silently replace the IK path during training. Kept as an opt-in lever.
+    use_dls_cartesian_servo: bool = False
+    #: Apply DLS on every step (including zero residual). Default False so
+    #: zero-action replay still plays the clean baked joint trajectory.
+    planner_dls_always: bool = False
+    #: DLS damping λ (rad·m⁻¹ scale). Larger = smoother / more singularity-
+    #: robust but more EE tracking error. 0.06 balances hub reach vs swing.
+    planner_dls_damping: float = 0.06
+    #: Per-control-step joint change cap (rad) inside the DLS servo. Bounds
+    #: the resolved-rate command like a joint speed limit. 0.10 ≈ 2 rad/s
+    #: at 20 Hz — fast enough to traverse the carry, slow enough to look
+    #: like a real robot.
+    planner_dls_max_joint_step: float = 0.10
+    #: EE position / orientation servo gains (proportional). <1 eases the
+    #: approach so the arm does not overshoot a fast-moving nominal target.
+    planner_dls_pos_gain: float = 1.0
+    planner_dls_orn_gain: float = 0.8
+    #: **2026-06-04 — adaptive (manipulability-scheduled) DLS damping.**
+    #: When True the damping is 0 away from singularities (exact tracking,
+    #: no stall) and ramps up to ``planner_dls_damping`` only as the
+    #: manipulability ``w = √det(J Jᵀ)`` drops below
+    #: ``planner_dls_manip_threshold`` — i.e. it activates *only* in the
+    #: ill-conditioned hub-insertion region. This is what lets one DLS
+    #: controller be both jump-free during the carry and still seat the
+    #: tire (fixed damping had to trade one for the other).
+    planner_dls_adaptive: bool = True
+    planner_dls_manip_threshold: float = 0.02
+
     #: When ``True`` AND the easy-spawn branch is rolled in ``reset``
     #: (i.e. Bernoulli(``start_pos_easy_prob``) returned True under
     #: ``start_pos_curriculum_mode == "mix"``), the env performs the
