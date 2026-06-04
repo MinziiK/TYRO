@@ -433,6 +433,12 @@ class EnvConfig:
     #: in Robot B's base frame.
     robot_B_base_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     robot_B_base_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    #: Reference point for the Robot B-centric observation frame. ``None``
+    #: keeps the legacy behaviour (subtract ``robot_B_base_pos``). When the
+    #: spacious layout pushes Robot B far out of the carry corridor, the
+    #: obs frame is pinned to world origin here so positional channels stay
+    #: well-scaled inside ``workspace_radius`` regardless of where B sits.
+    obs_reference_pos: Optional[Tuple[float, float, float]] = None
     #: Stand primitives (cylinder + flange) under each robot base so neither
     #: appears to float above the floor. Heights derive from
     #: ``base_z − floor_z`` (UR10 = 0.20 m, Panda = 0.60 m). Set radius ≤ 0
@@ -1114,6 +1120,11 @@ class EnvConfig:
     fanuc_joint_slew_max_rad: float = 0.08
     #: EE link name for IK / grasp parent (FANUC + wheel tool).
     fanuc_ee_link_name: str = "wheel_tool_tip"
+    #: Optional 6-joint HOME override (rad). ``None`` keeps the class default
+    #: ``FanucR2000icRobot.HOME_POSE``. The spacious layout sets a folded,
+    #: palm-up ready pose so the wheel tool sits ~0.9 m high (not stretched
+    #: to ~2.45 m). Re-tune via ``scripts/audit_fanuc_layout.py``.
+    fanuc_home_pose: Optional[Tuple[float, ...]] = None
     #: Grasp anchor: tire COM = EE + (0, 0, tire_outer_radius) in world +Z
     #: when bore is vertical (same convention as UR10 palm-up grasp).
     grasp_com_offset_world: Tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -1427,6 +1438,9 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.fanuc_ee_link_name = "wheel_tool_tip"
     cfg.ur10_lock_tool_up = False
     cfg.fanuc_lock_tool_up = False
+    #: Folded palm-up ready pose — wheel tool sits ~0.9 m high (was ~2.45 m
+    #: with the stretched-up class default). EE z≈0.88, tool +Z ≈ world +Z.
+    cfg.fanuc_home_pose = (0.381, -1.05, -1.522, 0.0, 2.066, -1.189)
 
     cfg.robot_A_base_pos = (-1.50, 0.0, -0.30)
     cfg.hub_pos_nominal = (0.0, 1.20, 0.22)
@@ -1436,6 +1450,15 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.cargo_back_wall_y_offset = 0.35
     cfg.tire_rack_inner_center = (-2.40, 0.40, -0.30)
     cfg.tire_rack_outer_center = (-2.40, -0.40, -0.30)
+
+    #: Push Robot B (UR10e) far out of the FANUC carry corridor (pickup −X →
+    #: hub +Y). Phase 1 freezes B at HOME so it is a pure obstacle here; the
+    #: obs frame is pinned to world origin (below) so this move does not warp
+    #: the observation scaling. NOTE: this is too far for Phase-2 hub bolting
+    #: (UR10e reach ~1.3 m → hub ~1.9 m); bring B back near the hub when
+    #: Phase 2 begins.
+    cfg.robot_B_base_pos = (1.40, 0.0, -0.30)
+    cfg.obs_reference_pos = (0.0, 0.0, 0.0)
 
     cfg.tire_mass = cfg.tire_mass_heavy
     cfg.tire_inertia_diagonal = cfg.tire_inertia_heavy

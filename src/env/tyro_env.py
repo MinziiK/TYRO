@@ -2773,7 +2773,11 @@ class TyroEnv(gym.Env):
         # convention and (2) makes the policy invariant to any future
         # global translation of the world frame (the real Panda's base
         # is the canonical reference for Sim2Real transfer).
-        rb_base = np.asarray(self.cfg.robot_B_base_pos, dtype=np.float64)
+        obs_ref = getattr(self.cfg, "obs_reference_pos", None)
+        rb_base = np.asarray(
+            obs_ref if obs_ref is not None else self.cfg.robot_B_base_pos,
+            dtype=np.float64,
+        )
         eeA_pos_rel = eeA_pos - rb_base
         eeB_pos_rel = eeB_pos - rb_base
         tire_pos_rel = tire_pos - rb_base

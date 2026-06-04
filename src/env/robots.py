@@ -1041,6 +1041,13 @@ class FanucR2000icRobot(UR10Robot):
         self.EE_LINK_INDEX = self._link_index_for_child_link(
             str(getattr(cfg, "fanuc_ee_link_name", "wheel_tool_tip"))
         )
+        home_override = getattr(cfg, "fanuc_home_pose", None)
+        if home_override is not None:
+            self.HOME_POSE = tuple(float(x) for x in home_override)
+            # ``arm.rest`` was baked from the class HOME_POSE during
+            # ``Robot.__init__`` (above) — refresh it so ``reset_to_home``
+            # uses the override.
+            self.arm.rest = np.array(self.HOME_POSE, dtype=np.float64)
         self._cmd_q = None
         self.reset_to_home()
         home_pos, home_quat = self.ee_pose()
