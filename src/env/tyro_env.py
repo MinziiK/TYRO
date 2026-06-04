@@ -632,8 +632,8 @@ class TyroEnv(gym.Env):
 
           [0:6]    qA_n            — UR10 joints
           [6:12]   dqA_n           — UR10 joint vels
-          [12:19]  qB_n (7)        — Panda joints      ← zero in Phase 1
-          [19:26]  dqB_n (7)       — Panda joint vels  ← zero in Phase 1
+          [12:19]  qB_n (7)        — Robot B joints (Panda 7-D; UR10e padded)
+          [19:26]  dqB_n (7)       — Robot B joint vels  ← zero in Phase 1
           [26:33]  eeA_pos_rel/orn — UR10 EE
           [33:40]  eeB_pos_rel/orn — Panda EE          ← zero in Phase 1
           [40:47]  tire_pos_rel/orn
@@ -2718,6 +2718,22 @@ class TyroEnv(gym.Env):
         # in Phase 2/3 it lives at ``action[12]`` and only feeds back into
         # the obs via ``prev_action`` so the policy can still emit intent.
 
+    # Fixed Robot B joint slots in obs (Panda=7; UR10e=6 padded with zeros).
+    _ROBOT_B_OBS_ARM_DOFS: int = 7
+
+    @staticmethod
+    def _pad_obs_vector(v: np.ndarray, size: int) -> np.ndarray:
+        """Pad or truncate a 1-D obs slice to a fixed width for checkpoint compat."""
+        v = np.asarray(v, dtype=np.float64).reshape(-1)
+        n = int(size)
+        if v.size == n:
+            return v
+        if v.size > n:
+            return v[:n].copy()
+        out = np.zeros(n, dtype=np.float64)
+        out[: v.size] = v
+        return out
+
     # ------------------------------------------------------------------
     # Observation (spec §2.1 base + mating scalars ⇒ 89-d)
     # ------------------------------------------------------------------
@@ -2738,6 +2754,9 @@ class TyroEnv(gym.Env):
         qB_n = 2 * (qB - self.robot_B.arm.lower) / np.maximum(self.robot_B.arm.range, 1e-6) - 1
         dqA_n = np.clip(dqA / vmax, -1.0, 1.0)
         dqB_n = np.clip(dqB / vmax, -1.0, 1.0)
+        b_dof = int(self._ROBOT_B_OBS_ARM_DOFS)
+        qB_n = self._pad_obs_vector(qB_n, b_dof)
+        dqB_n = self._pad_obs_vector(dqB_n, b_dof)
 
         eeA_pos, eeA_orn = self.robot_A.ee_pose()
         eeB_pos, eeB_orn = self.robot_B.ee_pose()

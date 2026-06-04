@@ -30,6 +30,19 @@ def _tire_inertia_diagonal(cfg: EnvConfig) -> Optional[list]:
     return None
 
 
+def _apply_tire_base_dynamics(uid: int, client: int, cfg: EnvConfig) -> None:
+    """Post-create base link damping + inertia (PyBullet lacks createMultiBody kw)."""
+    inertia = _tire_inertia_diagonal(cfg)
+    kwargs: dict = dict(
+        linearDamping=0.5,
+        angularDamping=0.5,
+        physicsClientId=client,
+    )
+    if inertia is not None:
+        kwargs["localInertiaDiagonal"] = inertia
+    p.changeDynamics(uid, -1, **kwargs)
+
+
 def _iter_box_chunks(
     he: list,
     po: list,
@@ -327,8 +340,7 @@ def create_tire_wheel_multibody(
                 client, merged_he, merged_po, merged_or, rgbs,
             )
             if col >= 0 and vis >= 0:
-                inertia = _tire_inertia_diagonal(cfg)
-                mb_kwargs = dict(
+                uid = p.createMultiBody(
                     baseMass=tire_mass,
                     baseCollisionShapeIndex=col,
                     baseVisualShapeIndex=vis,
@@ -336,13 +348,7 @@ def create_tire_wheel_multibody(
                     baseOrientation=list(base_orientation),
                     physicsClientId=client,
                 )
-                if inertia is not None:
-                    mb_kwargs["baseInertiaDiagonal"] = inertia
-                uid = p.createMultiBody(**mb_kwargs)
-                p.changeDynamics(
-                    uid, -1, linearDamping=0.5, angularDamping=0.5,
-                    physicsClientId=client,
-                )
+                _apply_tire_base_dynamics(uid, client, cfg)
                 return uid, (disk_prims is not None and len(disk_prims[0]) > 0)
 
     # Multi-link: tread on base, wheel disk split into ≤cap box arrays per link
@@ -392,7 +398,7 @@ def create_tire_wheel_multibody(
     joint_types = [p.JOINT_FIXED] * n_links
     joint_axis = [[0.0, 0.0, 1.0]] * n_links
 
-    mb_kwargs = dict(
+    uid = p.createMultiBody(
         baseMass=tire_mass,
         baseCollisionShapeIndex=t_col,
         baseVisualShapeIndex=t_vis,
@@ -410,13 +416,7 @@ def create_tire_wheel_multibody(
         linkJointAxis=joint_axis,
         physicsClientId=client,
     )
-    inertia = _tire_inertia_diagonal(cfg)
-    if inertia is not None:
-        mb_kwargs["baseInertiaDiagonal"] = inertia
-    uid = p.createMultiBody(**mb_kwargs)
-    p.changeDynamics(
-        uid, -1, linearDamping=0.5, angularDamping=0.5, physicsClientId=client,
-    )
+    _apply_tire_base_dynamics(uid, client, cfg)
     return uid, True
 
 
