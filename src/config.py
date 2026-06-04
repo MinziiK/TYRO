@@ -1771,7 +1771,18 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.contact_force_terminate_above = 50_000.0
     cfg.fanuc_position_gain = 0.85
     cfg.fanuc_velocity_gain = 1.15
-    cfg.fanuc_motor_max_velocity_rad_s = 0.8
+    #: **2026-06-05 (carry tracking)** — 0.8 rad/s left the 100 kg tire
+    #: lagging the baked Min-Jerk by ~0.7 m (``ik_residual_A_mean``) while the
+    #: traj index advanced every step; raise the cap so the arm can keep up.
+    cfg.fanuc_motor_max_velocity_rad_s = 1.4
+    cfg.fanuc_torque_scale = 1.5
+    #: Finer baked trajectory (200 vs 100) → smaller per-step joint deltas.
+    cfg.planner_traj_steps = 200
+    #: Wait until the measured EE is near the nominal waypoint before advancing
+    #: the traj index (prevents the index from outrunning the heavy load).
+    cfg.planner_waypoint_gate_enable = True
+    cfg.planner_waypoint_pos_tol_m = 0.06
+    cfg.planner_waypoint_max_stall = 15
     cfg.kinematic_tire_lock_stages = (0,)
     cfg.obs.workspace_radius = 3.0
     cfg.grasp_com_offset_world = (0.0, 0.0, 1.0)
