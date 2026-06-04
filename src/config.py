@@ -170,6 +170,16 @@ class RewardConfig:
     #: migrated continue to credit the same terminal bonus. Both names
     #: point at the same Stage-3 episode-terminal bonus.
     R_return: float = 300.0
+    #: **2026-06-04 (full-cycle FSM)** — event bonuses for the extended
+    #: mount/dismount loop. Only paid when ``EnvConfig.full_cycle`` is on.
+    #: ``R_retract`` — S2→S3, arm released the tire (tighten dwell done) and
+    #: pulled clear to HOME. ``R_regrasp`` — S4→S5, arm re-supported the tire
+    #: from below and the hub pin released. ``R_loosen`` — S5→S6, loosen dwell
+    #: done, ready to carry back. Kept below pickup/mount since each is a
+    #: shorter sub-motion; the final ``R_success`` still dominates.
+    R_retract: float = 150.0
+    R_regrasp: float = 200.0
+    R_loosen: float = 100.0
     #: One-shot terminal penalty on any *failure* termination (vertical
     #: violation, robot collision, workspace exit, contact-force damage).
     #: Counteracts the "die fast to stop losing reward" exploit when dense
@@ -850,6 +860,40 @@ class EnvConfig:
     #: (legacy training). 40 ≈ 2 s at 20 Hz — enough to *see* a still
     #: mounted tire in the GUI.
     mount_hold_steps: int = 0
+    #: **2026-06-04 (full-cycle FSM)** — master switch for the extended
+    #: 7-state mount/dismount cycle:
+    #:   S0 pick → S1 carry/mount → S2 tighten-hold (arm holds, tire pinned
+    #:   to hub) → S3 retract-to-HOME (arm releases, tire stays on hub) →
+    #:   S4 re-approach under hub + re-grasp (arm supports tire from its
+    #:   6 o'clock, then hub pin released) → S5 loosen-hold → S6 return tire
+    #:   to rack.
+    #: When ``False`` (default) the env behaves *exactly* as the legacy
+    #: 4-state FSM (pick/mount/demount/return) so existing checkpoints,
+    #: curricula and eval scripts are untouched. Requires
+    #: ``terminate_on='never'`` and a longer ``max_steps`` to run the full
+    #: loop. ``mount_hold_steps`` is the tighten dwell, ``loosen_hold_steps``
+    #: the loosen dwell (Robot B stays frozen — the dwell is a timed stand-in
+    #: for the bolt work, to be replaced by a real Robot B policy later).
+    full_cycle: bool = False
+    #: Loosen-hold dwell (control steps) in S5 of the full cycle, mirroring
+    #: ``mount_hold_steps``. Only consulted when ``full_cycle`` is True.
+    loosen_hold_steps: int = 40
+    #: S3→S4 gate (full cycle): arm EE within this radius (m) of its HOME
+    #: forward-kinematics pose counts as "retracted to HOME".
+    retract_home_tol: float = 0.10
+    #: S4→S5 gate (full cycle): arm EE within this radius (m) of the seated
+    #: tire's 6 o'clock point counts as "re-grasped". Looser than the pickup
+    #: gate because the re-grasp bonds in place (no teleport) and the hub is
+    #: near the UR10 reach limit, so the baked approach settles a few cm short.
+    regrasp_radius_tol: float = 0.13
+    #: S6 return (full cycle) is a *two-segment* nominal: first lift the
+    #: grasped tire straight up by ``planner_s6_liftup`` m to pull the arm
+    #: out of the near-singular fully-extended hub-support pose, then arch
+    #: over the base to the rack. ``planner_s6_liftup_frac`` is the fraction
+    #: of the trajectory steps spent on that initial vertical lift.
+    planner_s6_liftup: float = 0.45
+    planner_s6_liftup_frac: float = 0.25
+    planner_s6_pull_frac: float = 0.25
     #: Stage 2 demount target — axial distance (m) the tire centre must
     #: travel *away* from the hub centre to fire the Stage 2 → 3 trigger.
     #: 30 cm is roughly 1.5× tire thickness (0.30 m / 2 + clearance), so
@@ -1140,7 +1184,17 @@ class EnvConfig:
     #: scratch training because the wrist DOFs are fully managed by the
     #: planner. Flip to True (and optionally retune ``rot_offset_scale``)
     #: once the position residual has converged.
-    planner_enable_rot_offset: bool = False
+    #:
+    #: **2026-06-04 (Option B — yaw control handle)** — set to ``True`` so
+    #: the policy can actively steer the bore-alignment yaw. Under palm-up
+    #: tilt-lock (default for all stages) the only meaningful rotational DOF
+    #: is yaw about world +Z, so ``_apply_action`` consumes just
+    #: ``action[5]`` as a yaw residual (Rz preserves tool +Z = world +Z);
+    #: the gripper stays palm-up / tire stays upright while the policy fixes
+    #: the residual mount-angle error the open-loop SLERP nominal leaves
+    #: near the wrist singularity. With the lock relaxed it falls back to
+    #: the full ``action[3:6]`` axis-angle residual.
+    planner_enable_rot_offset: bool = True
     #: Master switch for planner palm-up **tilt-lock** (tool +Z = world +Z,
     #: yaw from SLERP). Which FSM stages use it is set by
     #: ``planner_lock_palm_up_stages``.
@@ -1189,7 +1243,15 @@ class EnvConfig:
     #: itself rare by getting the yaw recovery done early. Set to
     #: ``<= 1.0`` to fall back to uniform linear SLERP (legacy
     #: behaviour).
-    planner_yaw_front_load_k: float = 2.5
+    #:
+    #: **2026-06-04 (Option B)** — 2.5 → **3.5**. The hub neighbourhood is
+    #: crowded (cargo box + back wall), so finishing the 90° bore yaw *near
+    #: the hub* risks collisions. k = 3.5 completes ~95 % of the yaw by
+    #: t ≈ 0.58 — around the carry-arch apex (highest point, farthest from
+    #: the cargo), so the tire arrives at the hub already bore-aligned and
+    #: the policy's yaw residual only has to stabilise (not rotate) near the
+    #: hub.
+    planner_yaw_front_load_k: float = 3.5
     #: **2026-06-03 — UR10 joint-target motion smoothing (visual jitter fix).**
     #: The planner emits a fresh IK target every 20 Hz control step; near
     #: reach-saturation the raw IK solution jitters step-to-step and the
@@ -1248,6 +1310,19 @@ class EnvConfig:
     #: is now fixed by warm-starting the residual IK from the baked joint
     #: vector (see ``planner_residual_warmstart_from_baked``).
     planner_precompute_joint_traj: bool = True
+    #: **2026-06-04 (GUI target line = baked FK)** — when True (and the
+    #: baked joint path is on), ``compute_all_stage_trajectories`` draws the
+    #: *forward kinematics of the baked joint waypoints* as the GUI "target"
+    #: path instead of the ideal min-jerk + SLERP curve. The ideal Cartesian
+    #: curve passes near the UR10 wrist/extension singularity and is not
+    #: exactly realisable, so the displayed target and the travelled trail
+    #: used to diverge; the baked-FK path is exactly what the arm executes,
+    #: so they now coincide. **Visualisation only** — the executed nominal
+    #: (``_traj_pos`` consumed in ``_apply_action``) is deliberately left as
+    #: the ideal curve: overwriting it with FK was measured to perturb the
+    #: mount approach (zero-action mount slipped from step ~110 to never),
+    #: so training/reachability is intentionally untouched.
+    planner_nominal_from_baked_fk: bool = True
     #: **2026-06-04** — moving-average window (waypoints) over the baked
     #: joint trajectory ``_traj_q``. **Default 0 (disabled).** Prototyped
     #: as a fix for the baked carry zig-zag (zero-action straightness
@@ -1437,6 +1512,13 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     cfg.reward = make_reward_config(stage, phase)
     cfg.use_shaping = (stage == 4)
     cfg.curriculum.phase = phase
+    # Full-cycle FSM defaults: palm-up tilt-lock on every stage (the gripper
+    # supports the tire upright throughout) and a non-zero tighten dwell so
+    # the tire actually seats before the arm lets go.
+    if bool(getattr(cfg, "full_cycle", False)):
+        cfg.planner_lock_palm_up_stages = (0, 1, 2, 3, 4, 5, 6)
+        if int(getattr(cfg, "mount_hold_steps", 0)) <= 0:
+            cfg.mount_hold_steps = 40
     # Stages 1–2 omit collision/contact *penalties*; Bullet still reports large
     # normal forces from tire–EE fixed constraints → avoid instant episode death.
     if stage <= 2 and not cf_user_set:

@@ -59,6 +59,11 @@ class RewardBreakdown:
     guide_A: float = 0.0      # Stage 1 EE-vector guide (w_guide * exp(-||hub-ee||/τ))
     pb_carry: float = 0.0     # Stage 1 PB shaping on Δd_A (w_pb_carry * (prev - curr))
     d_guide: float = 0.0      # ||hub - ee|| diagnostic (mirrors hub_guide_vector norm)
+    # 2026-06-04 (full-cycle FSM) — extended-loop dense diagnostics
+    retract_A: float = 0.0    # S3 dense term (w_return * exp(-||ee-home||/τ))
+    d_retract: float = 0.0    # ||ee - home_ee|| during S3 retract-to-HOME
+    reapproach_A: float = 0.0 # S4 dense term (w_approach * exp(-d_bottom/τ))
+    d_reapproach: float = 0.0 # ||ee - tire 6 o'clock|| during S4 re-approach
 
 
 def align_reward(tire_pos, hub_pos, tire_axis, hub_axis,

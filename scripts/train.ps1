@@ -24,10 +24,20 @@ if (-not (Test-Path $TYRO_PY)) {
 # Default run name = phase1_<yyyymmdd-HHmm>; override with --run-name.
 $defaultRun = "phase1_" + (Get-Date -Format "yyyyMMdd-HHmm")
 
+# 2026-06-04 — full-cycle run: the 7-state FSM runs
+#   pick → carry → mount → tighten-hold → retract-to-HOME →
+#   re-approach+re-grasp → loosen-hold → return-to-rack.
+# ``--terminate-on never`` keeps the episode alive through the whole loop and
+# the long ``--max-steps`` horizon gives every leg time to finish.
 & $TYRO_PY -m src.train `
     --stage 3 --phase 1 `
     --num-envs 12 `
     --total-steps 2000000 `
+    --full-cycle `
+    --terminate-on never `
+    --max-steps 1200 `
+    --mount-hold-steps 40 `
+    --loosen-hold-steps 40 `
     --run-name $defaultRun `
     --contact-force-done 0 `
     @args

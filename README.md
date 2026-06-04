@@ -469,6 +469,26 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
 
+### 2026-06-04 (PM) — 풀사이클 7상태 FSM (마운트 후 받침·복귀)
+
+마운트 후 "조이기 대기 → HOME 복귀 → 허브 아래 재접근·받침 → 풀기 대기 → 거치대 복귀"를 구현. `cfg.full_cycle = True`에서만 동작하며 기존 4단계 FSM은 그대로 보존 (기본 `False`).
+
+| Stage | 이름 | 동작 | 전이 게이트 | Sparse |
+|---|---|---|---|---|
+| **0** | pick | 거치대 접근·그립 | `‖EE−grasp‖ < approach_radius_tol` | R_pickup |
+| **1** | carry/mount | 허브로 운반·마운트 | `‖tire−hub‖ < mount_radius_tol` AND `θ < δ_A` | R_mount |
+| **2** | tighten-hold | 타이어 허브 핀 + 팔 동결 (`mount_hold_steps`, 너트 조이기) | dwell 종료 | — |
+| **3** | retract | 그립 해제 → HOME 관절 직행 | `‖EE−HOME_ee‖ < retract_home_tol` | **R_retract** |
+| **4** | re-approach | 허브 아래 6시 재접근 → 정상 re-grasp → 허브 핀 해제 | `‖EE−grasp‖ < regrasp_radius_tol` | **R_regrasp** |
+| **5** | loosen-hold | 받침 자세 동결 (`loosen_hold_steps`, 너트 풀기) | dwell 종료 | **R_loosen** |
+| **6** | return | 3구간 경로(수직 lift → hub축 퇴피 → arch) → 거치대 안착 | `‖tire−pickup‖ < rack_return_radius_tol` AND `|v_z| < max` | R_success |
+
+- **S3 복귀**는 baked IK 대신 `HOME_POSE` 관절 직행 — HOME EE는 베이스 뒤 저점이라 palm-up IK가 못 풀어 약 35cm 위에서 정체하던 문제 회피.
+- **S4 재결합**은 `_attach_tire_to_robot_A()`(검증된 pickup transform)로 수행 — in-place 결합은 기울어진 EE↔tire 오프셋을 캡처해 S6 복귀 EE 타깃이 0.6m 빗나가 정체.
+- **S6 복귀**는 단일 직선이 불가(허브 근특이 자세·트럭 차체 충돌) → lift → hub축 퇴피 → arch의 **3구간 min-jerk**. zero-action으로는 허브 근처에서 멈추며, 나머지는 **정책 잔차로 학습**.
+- zero-action 스모크: **S0~S5 안정 전이**(mount@110, retract@150, HOME@199, regrasp@311, loosen@351), S6는 학습 필요.
+- 학습: `scripts/train.ps1`이 `--full-cycle --terminate-on never --max-steps 1200 --mount-hold-steps 40 --loosen-hold-steps 40`로 기본 구성. GUI 재생: `scripts/replay_planner.py --render --full-cycle --easy-start`.
+
 ### 2026-06-04 — "오락가락" 근본 원인 규명 + 삽입 속도 제한 (측정 기반)
 
 **근본 원인 = 기하 특이점.** carry를 4분면으로 분해하면 점프가 어디 있는지 명확:

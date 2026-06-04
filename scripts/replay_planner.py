@@ -65,6 +65,15 @@ def main() -> int:
         "--no-trail", action="store_true",
         help="Don't draw the actual travelled EE trail in the GUI.",
     )
+    ap.add_argument(
+        "--full-cycle", action="store_true",
+        help="Run the 7-state mount/dismount FSM (tighten/retract/regrasp/"
+             "loosen/return). Implies a longer default horizon.",
+    )
+    ap.add_argument(
+        "--loosen-hold-steps", type=int, default=40,
+        help="Loosen dwell (control steps) in S5 of the full cycle.",
+    )
     args = ap.parse_args()
     if args.easy_start and args.home_start:
         ap.error("Use only one of --easy-start or --home-start.")
@@ -80,7 +89,15 @@ def main() -> int:
         mount_hold_steps=40,
         pin_tire_on_mount=True,
     )
-    if args.max_steps is not None:
+    if args.full_cycle:
+        overrides["full_cycle"] = True
+        overrides["terminate_on"] = "never"
+        overrides["loosen_hold_steps"] = int(args.loosen_hold_steps)
+        # Long horizon so the whole pick→…→return loop has time to run.
+        overrides["max_steps"] = (
+            int(args.max_steps) if args.max_steps is not None else 1200
+        )
+    elif args.max_steps is not None:
         overrides["max_steps"] = int(args.max_steps)
 
     cfg = make_env_config(stage=args.stage, phase=args.phase, **overrides)
@@ -116,12 +133,15 @@ def main() -> int:
     draw_path = args.render and not args.no_path
     draw_trail = args.render and not args.no_trail
     path_line_ids: list[int] = []
-    # Per-stage planner path colours (stage 0..3).
+    # Per-stage planner path colours.
     stage_colors = {
-        0: [0.20, 0.60, 1.00],  # blue  — approach / pickup
-        1: [1.00, 0.55, 0.00],  # orange — carry to hub
-        2: [0.85, 0.20, 0.85],  # magenta — demount
-        3: [0.20, 0.85, 0.40],  # green — return to cradle
+        0: [0.20, 0.60, 1.00],  # blue    — approach / pickup
+        1: [1.00, 0.55, 0.00],  # orange  — carry to hub
+        2: [0.85, 0.20, 0.85],  # magenta — (demount / tighten-hold)
+        3: [0.20, 0.85, 0.40],  # green   — return (legacy) / retract-to-HOME
+        4: [1.00, 1.00, 0.20],  # yellow  — re-approach under hub
+        5: [0.55, 0.30, 0.90],  # purple  — loosen-hold
+        6: [0.20, 0.85, 0.85],  # cyan    — return to cradle (full cycle)
     }
 
     def draw_all_stage_paths() -> None:
@@ -148,7 +168,8 @@ def main() -> int:
                 path_line_ids.append(lid)
             total += len(pts)
         print("[planner] nominal paths: stages %s (%d pts)  "
-              "blue=approach orange=carry magenta=demount green=return"
+              "blue=approach orange=carry green=retract/return "
+              "yellow=re-approach cyan=return(full)"
               % (sorted(trajs), total))
 
     def draw_trail_segment(a, b) -> None:
@@ -168,6 +189,7 @@ def main() -> int:
         terminated = truncated = False
         info: dict = {}
         prev_ee = np.asarray(env.robot_A.ee_pose()[0], dtype=np.float64)
+        prev_stage = int(env.task_stage)
         while not (terminated or truncated):
             if args.render and not p.isConnected(env.client):
                 print("[planner] GUI closed — stopping replay.")
@@ -178,6 +200,12 @@ def main() -> int:
             except p.error:
                 print("[planner] physics server disconnected — stopping replay.")
                 break
+            # Redraw the remaining nominal paths whenever the FSM advances so
+            # full-cycle stages (retract/re-approach/return) show their real
+            # post-transition geometry instead of the reset-time estimate.
+            if int(env.task_stage) != prev_stage:
+                prev_stage = int(env.task_stage)
+                draw_all_stage_paths()
             cur_ee = np.asarray(env.robot_A.ee_pose()[0], dtype=np.float64)
             draw_trail_segment(prev_ee, cur_ee)
             prev_ee = cur_ee

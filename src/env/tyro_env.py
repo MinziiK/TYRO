@@ -260,6 +260,10 @@ class TyroEnv(gym.Env):
         self._traj_pos: Optional[np.ndarray] = None      # (N, 3) world XYZ
         self._traj_quat: Optional[np.ndarray] = None     # (N, 4) world xyzw
         self._traj_q: Optional[np.ndarray] = None        # (N, 6) arm joints
+        # GUI-only: FK of the baked joint path for the *current* stage (see
+        # ``planner_nominal_from_baked_fk``). Never fed to ``_apply_action``.
+        self._viz_traj_pos: Optional[np.ndarray] = None
+        self._viz_traj_quat: Optional[np.ndarray] = None
         self.current_traj_step: int = 0
         # Waypoint arrival gate watchdog — counts control steps the index
         # has stalled at the current waypoint (see ``_advance_traj_index``).
@@ -292,6 +296,14 @@ class TyroEnv(gym.Env):
         self._mount_hold_left: int = 0
         self._mount_frozen_q: Optional[np.ndarray] = None
         self._mount_hold_finish_term: bool = False
+        # 2026-06-04 (full-cycle FSM) — cached HOME EE pose (FK of HOME_POSE)
+        # used as the S3 retract target. Home pose is fixed so cache once.
+        self._home_ee_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        # S6 return target joint config (IK of the rack grasp pose, solved
+        # once at the S5→S6 transition). The loaded arm is joint-space driven
+        # to it — a Cartesian baked path stalls because S6 starts in the
+        # near-singular fully-extended hub-support pose.
+        self._return_grasp_q: Optional[np.ndarray] = None
 
         self.action_space = spaces.Box(low=-1.0, high=1.0,
                                        shape=(self.cfg.action.dim,), dtype=np.float32)
@@ -351,6 +363,7 @@ class TyroEnv(gym.Env):
         self._planner_hold_arm_targets = None
         self._mount_hold_left = 0
         self._mount_frozen_q = None
+        self._return_grasp_q = None
         self._mount_hold_finish_term = False
         # v6 (4-stage FSM) — also reset Stage-2 bookkeeping at the start
         # of every reset call so the demount stall counter never carries
@@ -1463,6 +1476,46 @@ class TyroEnv(gym.Env):
             )
             return end_pos, np.asarray(end_quat, dtype=np.float64)
 
+        # 2026-06-04 (full-cycle FSM) — extended-loop stage end poses.
+        # Stages 2/5 are arm-frozen holds (planner unused → return current
+        # pose). Stage 3 retracts to HOME, stage 4 re-approaches under the
+        # hub, stage 6 carries the tire back to the rack.
+        if bool(getattr(self.cfg, "full_cycle", False)):
+            if stage == 3:
+                return self._home_ee_pose()
+            if stage == 4:
+                # Aim at the *live* seated tire's 6 o'clock so the planner
+                # end matches the re-grasp gate target (the tire may sit a
+                # few cm off ``tire_mount_pos`` after the tighten settle).
+                if self._mount_seated_pos is not None:
+                    tire_p = np.asarray(self._mount_seated_pos, dtype=np.float64)
+                else:
+                    tp, _ = self.scene.tire_pose()
+                    tire_p = np.asarray(tp, dtype=np.float64)
+                end_pos = tire_p + np.array([0.0, 0.0, -R], dtype=np.float64)
+                return end_pos, palm_up
+            if stage == 6:
+                tire_end_pos = np.asarray(
+                    self.cfg.tire_pickup_pos, dtype=np.float64,
+                )
+                tire_end_quat = np.asarray(
+                    p.getQuaternionFromEuler(list(self.cfg.tire_spawn_rpy)),
+                    dtype=np.float64,
+                )
+                if have_grasp:
+                    return self._ee_pose_for_tire_pose(
+                        tire_end_pos, tire_end_quat,
+                    )
+                end_pos = tire_end_pos + np.array(
+                    [0.0, 0.0, -R], dtype=np.float64,
+                )
+                return end_pos, palm_up
+            cur_pos, cur_quat = self.robot_A.ee_pose()
+            return (
+                np.asarray(cur_pos, dtype=np.float64),
+                np.asarray(cur_quat, dtype=np.float64),
+            )
+
         if stage == 2:
             hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
             hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
@@ -1596,15 +1649,19 @@ class TyroEnv(gym.Env):
         start_pos = np.asarray(start_pos, dtype=np.float64)
         start_quat = np.asarray(start_quat, dtype=np.float64)
         n = int(getattr(self.cfg, "planner_traj_steps", 100))
-        for stage in range(s0, 4):
+        full_cycle = bool(getattr(self.cfg, "full_cycle", False))
+        stage_hi = 7 if full_cycle else 4
+        lift_stages = (1, 3, 4, 6) if full_cycle else (1,)
+        yaw_stages = (1, 6) if full_cycle else (1, 3)
+        for stage in range(s0, stage_hi):
             end_pos, end_quat = self._compute_stage_end_ee_pose(stage)
             end_pos = np.asarray(end_pos, dtype=np.float64)
             end_quat = np.asarray(end_quat, dtype=np.float64)
             lift = 0.0
-            if stage == 1:
+            if stage in lift_stages:
                 lift = float(getattr(self.cfg, "planner_stage1_lift", 0.2))
             front_load_k = 0.0
-            if stage in (1, 3):
+            if stage in yaw_stages:
                 front_load_k = float(getattr(
                     self.cfg, "planner_yaw_front_load_k", 2.5,
                 ))
@@ -1612,10 +1669,50 @@ class TyroEnv(gym.Env):
             if self._planner_palm_up_active(stage):
                 sq = self._tilt_lock_palm_up_quat(sq)
                 eq = self._tilt_lock_palm_up_quat(eq)
-            traj_pos, traj_quat = self._generate_nominal_trajectory(
-                (start_pos, sq), (end_pos, eq),
-                total_steps=n, lift=lift, orient_front_load_k=front_load_k,
-            )
+            if full_cycle and stage == 6:
+                # Mirror the 3-segment S6 return (lift → axial pull → arch).
+                up = float(getattr(self.cfg, "planner_s6_liftup", 0.45))
+                f1 = float(getattr(self.cfg, "planner_s6_liftup_frac", 0.25))
+                f2 = float(getattr(self.cfg, "planner_s6_pull_frac", 0.25))
+                n1 = max(2, int(round(n * f1)))
+                n2 = max(2, int(round(n * f2)))
+                n3 = max(2, n - n1 - n2)
+                hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
+                hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
+                pull_d = float(self.cfg.demount_axial_distance) * 1.2
+                mid1 = start_pos + np.array([0.0, 0.0, up], dtype=np.float64)
+                mid2 = mid1 - hub_axis * pull_d
+                p1, q1 = self._generate_nominal_trajectory(
+                    (start_pos, sq), (mid1, sq), total_steps=n1,
+                    lift=0.0, orient_front_load_k=0.0,
+                )
+                p2, q2 = self._generate_nominal_trajectory(
+                    (mid1, sq), (mid2, sq), total_steps=n2,
+                    lift=0.0, orient_front_load_k=0.0,
+                )
+                p3, q3 = self._generate_nominal_trajectory(
+                    (mid2, sq), (end_pos, eq), total_steps=n3,
+                    lift=lift, orient_front_load_k=front_load_k,
+                )
+                traj_pos = np.vstack([p1, p2[1:], p3[1:]])
+                traj_quat = np.vstack([q1, q2[1:], q3[1:]])
+            else:
+                traj_pos, traj_quat = self._generate_nominal_trajectory(
+                    (start_pos, sq), (end_pos, eq),
+                    total_steps=n, lift=lift, orient_front_load_k=front_load_k,
+                )
+            # 2026-06-04 — for the *live* stage use the cached baked-FK path
+            # computed at replan time (no re-bake here — re-baking perturbed
+            # the sim and broke zero-action mount).
+            if (
+                stage == int(self.task_stage)
+                and self._viz_traj_pos is not None
+                and bool(getattr(
+                    self.cfg, "planner_nominal_from_baked_fk", True,
+                ))
+            ):
+                traj_pos = np.asarray(self._viz_traj_pos, dtype=np.float64)
+                traj_quat = np.asarray(self._viz_traj_quat, dtype=np.float64)
             out[stage] = np.asarray(traj_pos, dtype=np.float64)
             start_pos = np.asarray(traj_pos[-1], dtype=np.float64)
             start_quat = np.asarray(traj_quat[-1], dtype=np.float64)
@@ -1648,8 +1745,14 @@ class TyroEnv(gym.Env):
         # a tested compromise: high enough to clear the base+plinth at
         # z = -0.30 + ~0.30 (plinth) ≈ 0 m, low enough that the arched
         # midpoint stays in reach.
+        full_cycle = bool(getattr(self.cfg, "full_cycle", False))
+        st = int(self.task_stage)
         lift = 0.0
-        if int(self.task_stage) == 1:
+        # Arch the long traverses over the UR10 base column. Legacy: S1
+        # carry only. Full cycle: S1 carry, S3 hub→HOME retract, S4
+        # HOME→hub re-approach, S6 hub→rack return all swing over the base.
+        lift_stages = (1, 3, 4, 6) if full_cycle else (1,)
+        if st in lift_stages:
             lift = float(getattr(self.cfg, "planner_stage1_lift", 0.2))
         # **2026-06-02 (D4 — yaw front-loading)** — Stage 1 (cradle→hub
         # carry) and Stage 3 (hub→cradle return) both require a 90 °
@@ -1666,8 +1769,13 @@ class TyroEnv(gym.Env):
         # cradle gate and gentle enough not to spike joint velocities
         # at trajectory start. ``planner_yaw_front_load_k <= 1.0``
         # disables the warp (linear SLERP fallback).
+        # Yaw front-loading only on legs that rotate the bore 90°: legacy
+        # S1 (carry +X→−Y) and S3 (return −Y→+X). Full cycle: S1 (carry)
+        # and S6 (return). The retract/re-approach legs (3,4) move the empty
+        # gripper, so no bore yaw is needed.
         front_load_k = 0.0
-        if int(self.task_stage) in (1, 3):
+        yaw_stages = (1, 6) if full_cycle else (1, 3)
+        if st in yaw_stages:
             front_load_k = float(getattr(
                 self.cfg, "planner_yaw_front_load_k", 2.5,
             ))
@@ -1690,23 +1798,77 @@ class TyroEnv(gym.Env):
                 # Stand off *along* the hub axis (−Y) so the final approach
                 # is a straight insertion into the wheel well.
                 standoff = hub_axis * d
-        traj_pos, traj_quat = self._generate_nominal_trajectory(
-            (np.asarray(start_pos, dtype=np.float64),
-             np.asarray(start_quat, dtype=np.float64)),
-            (np.asarray(end_pos, dtype=np.float64),
-             np.asarray(end_quat, dtype=np.float64)),
-            total_steps=n,
-            lift=lift,
-            orient_front_load_k=front_load_k,
-            approach_standoff=standoff,
+        start_pose = (
+            np.asarray(start_pos, dtype=np.float64),
+            np.asarray(start_quat, dtype=np.float64),
         )
+        end_pose = (
+            np.asarray(end_pos, dtype=np.float64),
+            np.asarray(end_quat, dtype=np.float64),
+        )
+        if full_cycle and st == 6:
+            # Three-segment return: (1) lift straight up to escape the
+            # near-singular hub-support pose, (2) pull axially clear of the
+            # hub/truck (same axis as the legacy demount leg), (3) arch over
+            # the base to the rack. A single straight/arched min-jerk from
+            # the singular start oscillates in place.
+            up = float(getattr(self.cfg, "planner_s6_liftup", 0.45))
+            f1 = float(getattr(self.cfg, "planner_s6_liftup_frac", 0.25))
+            f2 = float(getattr(self.cfg, "planner_s6_pull_frac", 0.25))
+            n1 = max(2, int(round(n * f1)))
+            n2 = max(2, int(round(n * f2)))
+            n3 = max(2, n - n1 - n2)
+            hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
+            hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
+            pull_d = float(self.cfg.demount_axial_distance) * 1.2
+            mid1_pos = start_pose[0] + np.array([0.0, 0.0, up], dtype=np.float64)
+            mid2_pos = mid1_pos - hub_axis * pull_d
+            seg1_pos, seg1_quat = self._generate_nominal_trajectory(
+                start_pose, (mid1_pos, start_pose[1]),
+                total_steps=n1, lift=0.0, orient_front_load_k=0.0,
+            )
+            seg2_pos, seg2_quat = self._generate_nominal_trajectory(
+                (mid1_pos, start_pose[1]), (mid2_pos, start_pose[1]),
+                total_steps=n2, lift=0.0, orient_front_load_k=0.0,
+            )
+            seg3_pos, seg3_quat = self._generate_nominal_trajectory(
+                (mid2_pos, start_pose[1]), end_pose,
+                total_steps=n3, lift=lift, orient_front_load_k=front_load_k,
+            )
+            traj_pos = np.vstack([seg1_pos, seg2_pos[1:], seg3_pos[1:]])
+            traj_quat = np.vstack([seg1_quat, seg2_quat[1:], seg3_quat[1:]])
+        else:
+            traj_pos, traj_quat = self._generate_nominal_trajectory(
+                start_pose, end_pose,
+                total_steps=n,
+                lift=lift,
+                orient_front_load_k=front_load_k,
+                approach_standoff=standoff,
+            )
         self._traj_pos = traj_pos
         self._traj_quat = traj_quat
         self.current_traj_step = 0
         self._traj_stall = 0
+        self._viz_traj_pos = None
+        self._viz_traj_quat = None
         if bool(getattr(self.cfg, "planner_precompute_joint_traj", True)):
-            self._traj_q = self._bake_planner_joint_trajectory(traj_pos, traj_quat)
-            self._traj_q = self._smooth_baked_joint_trajectory(self._traj_q)
+            # Full-cycle S6 return: seed the bake from the arm's current
+            # joints so baked_q[0] matches the actual post-S4 config (no
+            # branch jump at the singularity). Other stages keep the HOME
+            # seed that the forward carry is tuned for.
+            rest_override = None
+            if (
+                bool(getattr(self.cfg, "full_cycle", False))
+                and int(self.task_stage) == 6
+            ):
+                rest_override, _ = self.robot_A.joint_state()
+            baked_q, fk_pos, fk_quat = self._bake_planner_joint_trajectory(
+                traj_pos, traj_quat, rest_override=rest_override,
+            )
+            self._traj_q = self._smooth_baked_joint_trajectory(baked_q)
+            if fk_pos is not None:
+                self._viz_traj_pos = fk_pos
+                self._viz_traj_quat = fk_quat
         else:
             self._traj_q = None
 
@@ -1741,16 +1903,24 @@ class TyroEnv(gym.Env):
         self,
         traj_pos: np.ndarray,
         traj_quat: np.ndarray,
-    ) -> np.ndarray:
+        rest_override: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
         """IK each nominal waypoint once; chain warm-start for continuity.
 
         Runs inside a PyBullet state snapshot so intermediate
         ``resetJointState`` calls do not disturb the live sim. If a
         waypoint jumps to a distant IK branch (|Δq| > 0.8 rad), that
         index is re-solved once from ``HOME_POSE`` as rest.
+
+        When ``planner_nominal_from_baked_fk`` is True, also records the
+        FK EE pose at each waypoint (same snapshot pass — a second FK pass
+        after restore was measured to break zero-action mount).
         """
         ur = self.robot_A
         n = int(traj_pos.shape[0])
+        record_fk = bool(getattr(
+            self.cfg, "planner_nominal_from_baked_fk", True,
+        ))
         # Warm-start every waypoint from HOME (``arm.rest``) so the baked
         # solution matches the live per-step ``apply_palm_up_pose`` path
         # (which also rest-warm-starts and reliably tracks the nominal to
@@ -1759,7 +1929,19 @@ class TyroEnv(gym.Env):
         # joint state between waypoints so PyBullet's IK seed advances
         # along the trajectory.
         traj_q = np.zeros((n, ur.arm.lower.size), dtype=np.float64)
-        rest = ur.arm.rest.copy()
+        fk_pos = np.zeros((n, 3), dtype=np.float64) if record_fk else None
+        fk_quat = np.zeros((n, 4), dtype=np.float64) if record_fk else None
+        # Warm-start seed. Default is HOME (``arm.rest``) — matches the live
+        # per-step path and is the proven seed for the forward carry. The
+        # full-cycle S6 return overrides this with the *current* joint config
+        # so baked_q[0] coincides with the arm's actual post-S4 pose: without
+        # it the arm would jump from its below-approach branch to the rest
+        # branch at idx 0 and oscillate at the wrist singularity.
+        rest = (
+            np.asarray(rest_override, dtype=np.float64).copy()
+            if rest_override is not None
+            else ur.arm.rest.copy()
+        )
         palm_up = self._planner_palm_up_active()
         state_id = p.saveState(physicsClientId=self.client)
         try:
@@ -1783,10 +1965,53 @@ class TyroEnv(gym.Env):
                         targetValue=float(qv), targetVelocity=0.0,
                         physicsClientId=self.client,
                     )
+                if record_fk:
+                    ls = p.getLinkState(
+                        ur.uid, ur.EE_LINK_INDEX,
+                        computeForwardKinematics=True,
+                        physicsClientId=self.client,
+                    )
+                    fk_pos[i] = np.asarray(ls[4], dtype=np.float64)
+                    fk_quat[i] = np.asarray(ls[5], dtype=np.float64)
         finally:
             p.restoreState(stateId=state_id, physicsClientId=self.client)
             p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
-        return traj_q
+        return traj_q, fk_pos, fk_quat
+
+    def _fk_of_joint_traj(
+        self, traj_q: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Forward-kinematics EE ``(pos, quat)`` for each baked joint waypoint.
+
+        Runs inside a PyBullet state snapshot (the arm joints are reset to
+        each waypoint and the live sim is restored afterwards), so this is
+        side-effect free. Used to make the Cartesian nominal exactly equal
+        to the realised baked path — see ``planner_nominal_from_baked_fk``.
+        """
+        ur = self.robot_A
+        n = int(traj_q.shape[0])
+        fk_pos = np.zeros((n, 3), dtype=np.float64)
+        fk_quat = np.zeros((n, 4), dtype=np.float64)
+        state_id = p.saveState(physicsClientId=self.client)
+        try:
+            for i in range(n):
+                for jidx, qv in zip(ur.arm.indices, traj_q[i]):
+                    p.resetJointState(
+                        ur.uid, jidx,
+                        targetValue=float(qv), targetVelocity=0.0,
+                        physicsClientId=self.client,
+                    )
+                ls = p.getLinkState(
+                    ur.uid, ur.EE_LINK_INDEX,
+                    computeForwardKinematics=True,
+                    physicsClientId=self.client,
+                )
+                fk_pos[i] = np.asarray(ls[4], dtype=np.float64)
+                fk_quat[i] = np.asarray(ls[5], dtype=np.float64)
+        finally:
+            p.restoreState(stateId=state_id, physicsClientId=self.client)
+            p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
+        return fk_pos, fk_quat
 
     # ------------------------------------------------------------------
     # Domain randomization scaffold (Phase 1 → Sim2Real bridge)
@@ -2096,6 +2321,56 @@ class TyroEnv(gym.Env):
             physicsClientId=self.client,
         )
 
+    def _home_ee_pose(self) -> Tuple[np.ndarray, np.ndarray]:
+        """EE ``(pos, quat)`` at the UR10 HOME joint pose (cached FK).
+
+        Used as the S3 retract target in the full-cycle FSM. Runs inside a
+        state snapshot so it never disturbs the live sim.
+        """
+        if self._home_ee_cache is not None:
+            return self._home_ee_cache
+        ur = self.robot_A
+        state_id = p.saveState(physicsClientId=self.client)
+        try:
+            for jidx, qv in zip(ur.arm.indices, np.asarray(ur.HOME_POSE)):
+                p.resetJointState(
+                    ur.uid, jidx, targetValue=float(qv), targetVelocity=0.0,
+                    physicsClientId=self.client,
+                )
+            ls = p.getLinkState(
+                ur.uid, ur.EE_LINK_INDEX, computeForwardKinematics=True,
+                physicsClientId=self.client,
+            )
+            pos = np.asarray(ls[4], dtype=np.float64).copy()
+            quat = np.asarray(ls[5], dtype=np.float64).copy()
+        finally:
+            p.restoreState(stateId=state_id, physicsClientId=self.client)
+            p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
+        self._home_ee_cache = (pos, quat)
+        return self._home_ee_cache
+
+    def _begin_hold(self, steps: int, seated: str) -> None:
+        """Generic freeze-arm dwell used by the full-cycle tighten/loosen holds.
+
+        ``seated`` selects how the tire is clamped each step while the arm
+        is frozen:
+          * ``"hub"`` — bond the tire to the hub (tighten dwell); the seated
+            pose is the hub mount pose set by :pymeth:`_attach_tire_to_hub`.
+          * ``"current"`` — clamp the tire to its *current* pose (loosen
+            dwell); the tire is already grasped by the arm and sitting on
+            the hub, so we just hold it still.
+        """
+        if seated == "hub":
+            self._attach_tire_to_hub()
+        else:  # "current"
+            tp, to = self.scene.tire_pose()
+            self._mount_seated_pos = np.asarray(tp, dtype=np.float64).copy()
+            self._mount_seated_orn = np.asarray(to, dtype=np.float64).copy()
+        self._grasp_kinematic = False
+        self._mount_frozen_q, _ = self.robot_A.joint_state()
+        self._mount_hold_left = int(steps)
+        self._mount_hold_finish_term = False
+
     def _begin_mount_hold(self) -> None:
         """Seat the tire on the hub and freeze the arm in a holding pose.
 
@@ -2162,7 +2437,11 @@ class TyroEnv(gym.Env):
         events: Dict[str, Any] = {
             "picked_up": False, "mounted": False,
             "demounted": False, "landed": False,
+            # full-cycle FSM sub-events
+            "retracting": False, "reapproaching": False,
+            "regrasped": False, "loosened": False,
         }
+        full_cycle = bool(getattr(self.cfg, "full_cycle", False))
         ee_pos, _ = self.robot_A.ee_pose()
         tire_pos, _ = self.scene.tire_pose()
         ee_pos = np.asarray(ee_pos, dtype=np.float64)
@@ -2217,7 +2496,16 @@ class TyroEnv(gym.Env):
                 events["mounted"] = True
                 hold_steps = int(getattr(self.cfg, "mount_hold_steps", 0))
                 term_on = str(getattr(self.cfg, "terminate_on", "never")).lower()
-                if hold_steps > 0 and term_on == "mount":
+                if full_cycle:
+                    # S2 tighten-hold: bond tire to hub + freeze the arm
+                    # holding it for the tighten dwell. The arm keeps its
+                    # grasp constraint so the gripper visibly stays on the
+                    # tire while "Robot B tightens". Released at S2→S3.
+                    self._begin_hold(
+                        max(1, int(getattr(self.cfg, "mount_hold_steps", 40))),
+                        seated="hub",
+                    )
+                elif hold_steps > 0 and term_on == "mount":
                     self._begin_mount_hold()
                 elif bool(getattr(self.cfg, "pin_tire_on_mount", True)) and term_on == "mount":
                     self._pin_tire_at_hub_mount()
@@ -2225,6 +2513,15 @@ class TyroEnv(gym.Env):
                 self._prev_d_return = None
                 # v11: reset Stage 2 PB shaping accumulator.
                 self._prev_d_hub = None
+
+        elif self.task_stage == 2 and full_cycle:
+            # S2 tighten-hold → S3: once the dwell elapses, the arm lets
+            # go of the tire (which stays bonded to the hub) and retracts
+            # to HOME.
+            if self._mount_hold_left == 0:
+                self._release_grasp()
+                self.task_stage = 3
+                events["retracting"] = True
 
         elif self.task_stage == 2:
             # v6 demount: tire must travel ≥ ``demount_axial_distance`` away
@@ -2247,7 +2544,49 @@ class TyroEnv(gym.Env):
                     self._prev_d_approach = None
                     self._prev_d_return = None
 
-        elif self.task_stage == 3:
+        elif self.task_stage == 3 and full_cycle:
+            # S3 retract-to-HOME → S4: arm (empty) is near its HOME EE pose.
+            home_pos, _ = self._home_ee_pose()
+            if float(np.linalg.norm(ee_pos - home_pos)) < float(
+                getattr(self.cfg, "retract_home_tol", 0.10)
+            ):
+                self.task_stage = 4
+                events["reapproaching"] = True
+
+        elif self.task_stage == 4 and full_cycle:
+            # S4 re-approach + re-grasp → S5: EE reaches the tire's 6 o'clock
+            # (tire is sitting on the hub). Re-bond the tire to the EE in
+            # place, release the hub pin, then start the loosen dwell.
+            grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
+            regrasp_tol = float(getattr(self.cfg, "regrasp_radius_tol", 0.13))
+            if float(np.linalg.norm(ee_pos - grasp_target)) < regrasp_tol:
+                # Release the hub bond first so the (now loosened) tire is
+                # free, then re-establish the *canonical* EE grasp. Using
+                # ``_attach_tire_to_robot_A`` (rather than an in-place bond)
+                # re-snaps the tire to the proven pickup transform — COM at
+                # EE+(0,0,R), bore ‖ spawn +X — so the S6 return leg is the
+                # exact reverse of the validated S1 carry. An in-place bond
+                # instead captured a tilted EE↔tire offset that made the
+                # return EE target drift ~0.6 m off the rack and stall.
+                self._release_hub_mount()
+                self._attach_tire_to_robot_A()
+                self.task_stage = 5
+                events["regrasped"] = True
+                self._begin_hold(
+                    max(1, int(getattr(self.cfg, "loosen_hold_steps", 40))),
+                    seated="current",
+                )
+
+        elif self.task_stage == 5 and full_cycle:
+            # S5 loosen-hold → S6: dwell elapsed, carry the tire to the rack.
+            if self._mount_hold_left == 0:
+                self.task_stage = 6
+                events["loosened"] = True
+                self._prev_d_return = None
+
+        elif (self.task_stage == 3 and not full_cycle) or (
+            self.task_stage == 6 and full_cycle
+        ):
             d_return = float(np.linalg.norm(tire_pos - self._pickup_pos_world))
             lin_vel, _ = p.getBaseVelocity(
                 self.handles.tire, physicsClientId=self.client,
@@ -2271,12 +2610,21 @@ class TyroEnv(gym.Env):
         # *current* EE pose to the new stage's end-pose so the policy
         # always operates against a fresh min-jerk reference. ``landed``
         # is the terminal event and needs no replan (episode is over).
-        skip_mount_replan = (
+        # Full-cycle: ``mounted`` and ``regrasped`` begin arm-frozen holds
+        # (planner unused during the dwell), so they skip the replan.
+        skip_mount_replan = full_cycle or (
             events.get("mounted")
             and int(getattr(self.cfg, "mount_hold_steps", 0)) > 0
             and str(getattr(self.cfg, "terminate_on", "never")).lower() == "mount"
         )
-        if events.get("picked_up") or events.get("demounted"):
+        replan_now = (
+            events.get("picked_up")
+            or events.get("demounted")
+            or events.get("retracting")
+            or events.get("reapproaching")
+            or events.get("loosened")
+        )
+        if replan_now:
             self._replan_for_current_stage()
         elif events.get("mounted") and not skip_mount_replan:
             self._replan_for_current_stage()
@@ -2554,8 +2902,21 @@ class TyroEnv(gym.Env):
             and self._traj_pos is not None
             and self._traj_quat is not None
         )
-
-        if traj_ready:
+        # Full-cycle S3 retract: drive the (empty) arm straight to its HOME
+        # joints. The HOME EE pose sits low behind the base and its real
+        # orientation is not palm-up, so a min-jerk + palm-up-projected baked
+        # IK can't re-solve it (it stalls ~35 cm above HOME). A direct joint
+        # target is exact and obstacle-free for the unloaded gripper.
+        full_cycle_retract = (
+            bool(getattr(self.cfg, "full_cycle", False))
+            and int(self.task_stage) == 3
+        )
+        if full_cycle_retract:
+            home_q = np.asarray(self.robot_A.HOME_POSE, dtype=np.float64)
+            self.robot_A.drive_arm_targets(home_q)
+            hp, _ = self._home_ee_pose()
+            self.robot_A.last_target_pos = np.asarray(hp, dtype=np.float64).copy()
+        elif traj_ready:
             n = int(self._traj_pos.shape[0])
             idx = int(min(self.current_traj_step, n - 1))
             nominal_pos = np.asarray(self._traj_pos[idx], dtype=np.float64)
@@ -2592,11 +2953,21 @@ class TyroEnv(gym.Env):
             enable_rot = bool(getattr(
                 self.cfg, "planner_enable_rot_offset", False,
             ))
-            if enable_rot and len(action) >= 6 and not lock_palm_up:
+            if enable_rot and len(action) >= 6:
                 rot_scale = float(getattr(
                     self.cfg, "planner_rot_offset_scale", 0.15,
                 ))
-                aa = np.asarray(action[3:6], dtype=np.float64) * rot_scale
+                if lock_palm_up:
+                    # **2026-06-04 (Option B)** — palm-up tilt-lock keeps
+                    # tool +Z = world +Z, so the only meaningful rotational
+                    # DOF is yaw about world +Z. Let the policy steer just
+                    # that bore-alignment yaw via ``action[5]``; an Rz left-
+                    # multiply preserves the palm-up (tool +Z) constraint
+                    # while correcting the residual mount-angle error.
+                    dyaw = float(action[5]) * rot_scale
+                    aa = np.array([0.0, 0.0, dyaw], dtype=np.float64)
+                else:
+                    aa = np.asarray(action[3:6], dtype=np.float64) * rot_scale
                 rot_quat = axisangle3_to_quat(aa)
                 # Apply residual rotation in the world frame (left-mul).
                 # Quaternion *multiplication*, never addition — additive
@@ -2614,6 +2985,18 @@ class TyroEnv(gym.Env):
                 final_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
             residual_active = float(np.max(np.abs(action[0:3]))) >= 1e-4
+            # **2026-06-04 (Option B)** — a rotation-only residual (yaw under
+            # palm-up, or full axis-angle when unlocked) must also count as
+            # "active" so it routes through the per-step IK path; otherwise
+            # the baked-joint playback ignores it and the policy loses its
+            # yaw handle entirely.
+            if enable_rot and len(action) >= 6:
+                rot_mag = (
+                    abs(float(action[5])) if lock_palm_up
+                    else float(np.max(np.abs(action[3:6])))
+                )
+                if rot_mag >= 1e-4:
+                    residual_active = True
             use_dls = bool(getattr(self.cfg, "use_dls_cartesian_servo", False)) and (
                 residual_active
                 or bool(getattr(self.cfg, "planner_dls_always", False))
@@ -2871,8 +3254,33 @@ class TyroEnv(gym.Env):
         # gradient as the EE / tire close in on the goal. The PB term is
         # ``w_pb * (prev_d - curr_d)``; positive when progressing.
         pb_step = 0.0
+        full_cycle = bool(getattr(self.cfg, "full_cycle", False))
 
-        if self.task_stage == 0:
+        if full_cycle and self.task_stage in (2, 5):
+            # S2 tighten-hold / S5 loosen-hold — arm frozen, action ignored.
+            # No dense shaping; the dwell only gates the event bonuses.
+            b.align_A = 0.0
+            b.approach_A = 0.0
+        elif full_cycle and self.task_stage == 3:
+            # S3 retract-to-HOME — pull the (empty) EE toward its HOME pose.
+            home_pos, _ = self._home_ee_pose()
+            d_retract = float(np.linalg.norm(ee_pos - home_pos))
+            decay = max(float(rcfg.return_decay), 1e-3)
+            b.retract_A = float(rcfg.w_return) * float(np.exp(-d_retract / decay))
+            b.d_retract = d_retract
+            b.align_A = 0.0
+            b.approach_A = 0.0
+        elif full_cycle and self.task_stage == 4:
+            # S4 re-approach under hub — pull the EE toward the tire's
+            # 6 o'clock outer point (tire is seated on the hub).
+            grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
+            d_reapp = float(np.linalg.norm(ee_pos - grasp_target))
+            decay = max(float(rcfg.approach_decay), 1e-3)
+            b.reapproach_A = float(rcfg.w_approach) * float(np.exp(-d_reapp / decay))
+            b.d_reapproach = d_reapp
+            b.align_A = 0.0
+            b.approach_A = 0.0
+        elif self.task_stage == 0:
             # Stage 0 — approach: shape UR10 EE toward the tire's 6 o'clock outer point.
             grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
             d_approach = float(np.linalg.norm(ee_pos - grasp_target))
@@ -3008,6 +3416,12 @@ class TyroEnv(gym.Env):
             b.fsm_bonus += float(rcfg.R_mount)
         if fsm_events.get("demounted"):
             b.fsm_bonus += float(getattr(rcfg, "R_demount", 0.0))
+        if fsm_events.get("retracting"):
+            b.fsm_bonus += float(getattr(rcfg, "R_retract", 0.0))
+        if fsm_events.get("regrasped"):
+            b.fsm_bonus += float(getattr(rcfg, "R_regrasp", 0.0))
+        if fsm_events.get("loosened"):
+            b.fsm_bonus += float(getattr(rcfg, "R_loosen", 0.0))
         if fsm_events.get("landed"):
             # Final success bonus — prefer the new ``R_success`` field, fall
             # back to the legacy ``R_return`` alias for backwards compat.
@@ -3030,8 +3444,13 @@ class TyroEnv(gym.Env):
         # penalty over the entire return leg, drowning out the
         # ``return_A`` shaping signal and leaving no learnable gradient
         # toward the cradle landing.
+        # Full cycle: the rack-return leg is S6 (not S3) and the tire is on
+        # the hub / carried with bore ‖ −Y throughout S1..S5, so waive the
+        # vertical penalty there and only gate it near the rack in S6.
+        return_stage = 6 if full_cycle else 3
+        waive_stages = (1, 2, 3, 4, 5) if full_cycle else (1, 2)
         stage3_gate_on = True
-        if self.task_stage == 3:
+        if self.task_stage == return_stage:
             tire_pos_pen, _ = self.scene.tire_pose()
             d_cradle_pen = float(np.linalg.norm(
                 np.asarray(tire_pos_pen, dtype=np.float64)
@@ -3040,7 +3459,7 @@ class TyroEnv(gym.Env):
             stage3_gate_on = d_cradle_pen < float(getattr(
                 self.cfg, "stage3_vertical_gate_radius", 0.20,
             ))
-        if self.task_stage in (1, 2) or not stage3_gate_on:
+        if self.task_stage in waive_stages or not stage3_gate_on:
             b.vertical_pen = 0.0
         else:
             b.vertical_pen = -rcfg.w_vertical * float(vertical_err ** 2)
@@ -3080,12 +3499,27 @@ class TyroEnv(gym.Env):
         # (positive when Δd_hub > 0). Stage 3's PB return continues to
         # live in ``b.pb_shape`` (handled in the Stage 3 branch via
         # ``pb_step``), so we don't double-count here.
-        stage_dense_A = {
-            0: float(b.approach_A),
-            1: float(b.guide_A) + float(b.pb_carry),
-            2: float(b.demount) + float(b.pb_carry),
-            3: float(b.return_A) + float(b.landing),
-        }[int(self.task_stage)]
+        if full_cycle:
+            # 7-state FSM dense map. Holds (2,5) contribute nothing; retract
+            # (3) and re-approach (4) use their own kernels; return (6)
+            # mirrors the legacy stage-3 return.
+            stage_dense_map = {
+                0: float(b.approach_A),
+                1: float(b.guide_A) + float(b.pb_carry),
+                2: 0.0,
+                3: float(b.retract_A),
+                4: float(b.reapproach_A),
+                5: 0.0,
+                6: float(b.return_A) + float(b.landing),
+            }
+        else:
+            stage_dense_map = {
+                0: float(b.approach_A),
+                1: float(b.guide_A) + float(b.pb_carry),
+                2: float(b.demount) + float(b.pb_carry),
+                3: float(b.return_A) + float(b.landing),
+            }
+        stage_dense_A = stage_dense_map[int(self.task_stage)]
         common = ("coop", "sync_joint_A", "collision", "workspace",
                   "action", "jerk", "vertical_pen")
         b.dense_total_pre_mix = float(

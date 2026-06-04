@@ -1166,8 +1166,32 @@ def main() -> int:
         default=_cfg_defaults.max_steps,
         help=(
             "Episode horizon in env steps (overrides EnvConfig.max_steps). "
-            "Use ~200 for pickup-only runs, ~400 for full 4-stage FSM."
+            "Use ~200 for pickup-only runs, ~400 for full 4-stage FSM, "
+            "~1200 for the full-cycle 7-state FSM."
         ),
+    )
+    ap.add_argument(
+        "--full-cycle",
+        action="store_true",
+        default=bool(getattr(_cfg_defaults, "full_cycle", False)),
+        help=(
+            "Enable the extended 7-state mount/dismount FSM: pick → mount → "
+            "tighten-hold → retract-to-HOME → re-approach+re-grasp → "
+            "loosen-hold → return-to-rack. Requires --terminate-on never and "
+            "a long --max-steps (~1200)."
+        ),
+    )
+    ap.add_argument(
+        "--mount-hold-steps",
+        type=int,
+        default=None,
+        help="Tighten dwell (control steps) at the hub. Full cycle defaults to 40.",
+    )
+    ap.add_argument(
+        "--loosen-hold-steps",
+        type=int,
+        default=None,
+        help="Loosen dwell (control steps) before carrying the tire back.",
     )
 
     # Physics overrides (Bulleted defaults live in EnvConfig)
@@ -1271,6 +1295,11 @@ def main() -> int:
         )
         overrides["terminate_on_pickup"] = bool(args.terminate_on_pickup)
         overrides["terminate_on"] = str(args.terminate_on)
+        overrides["full_cycle"] = bool(getattr(args, "full_cycle", False))
+        if args.mount_hold_steps is not None:
+            overrides["mount_hold_steps"] = int(args.mount_hold_steps)
+        if args.loosen_hold_steps is not None:
+            overrides["loosen_hold_steps"] = int(args.loosen_hold_steps)
         overrides["use_planner_residual"] = bool(args.use_planner_residual)
         overrides["attached_spawn_when_easy"] = bool(args.attached_spawn_when_easy)
         overrides["max_steps"] = int(args.max_steps)
