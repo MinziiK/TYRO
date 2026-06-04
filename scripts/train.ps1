@@ -26,6 +26,7 @@ $defaultRun = "phase1_" + (Get-Date -Format "yyyyMMdd-HHmm")
 
 & $TYRO_PY -m src.train `
     --stage 3 --phase 1 `
+    --scene-layout fanuc_spacious `
     --num-envs 12 `
     --total-steps 2000000 `
     --run-name $defaultRun `

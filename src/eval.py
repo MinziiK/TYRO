@@ -105,6 +105,16 @@ def main() -> int:
         choices=("never", "pickup", "mount", "demount"),
         help="FSM early-success gate (default: EnvConfig.terminate_on, usually 'never').",
     )
+    ap.add_argument(
+        "--scene-layout",
+        type=str,
+        default="fanuc_spacious",
+        choices=("shipping", "fanuc_spacious"),
+        help=(
+            "Scene layout to render. Must match the checkpoint's training "
+            "layout (server runs default to 'fanuc_spacious')."
+        ),
+    )
     args = ap.parse_args()
     if args.easy_start and args.home_start:
         ap.error("Use only one of --easy-start or --home-start.")
@@ -114,6 +124,7 @@ def main() -> int:
         start_pos_curriculum_enable=True,
         start_pos_curriculum_mode="mix",
         contact_force_terminate_above=0.0,
+        scene_layout=str(args.scene_layout),
     )
     if args.terminate_on is not None:
         overrides["terminate_on"] = str(args.terminate_on)

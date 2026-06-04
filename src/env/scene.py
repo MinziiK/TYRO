@@ -61,6 +61,13 @@ class SceneHandles:
     #: it in collision checks (both for the robot arms and for the
     #: kinematically-driven tire). ``None`` when the back wall is disabled.
     cargo_back_wall: Optional[int] = None
+    #: **2026-06-05 (real floor pit)** — UIDs of the four rim slabs that
+    #: rebuild the normal-height floor *outside* the pit rectangle when
+    #: ``cfg.floor_pit_enable`` is True. Empty when the pit is disabled (the
+    #: floor is then a single infinite plane). These are solid bodies the arm
+    #: links must not punch through, so the env includes them in its
+    #: robot-vs-floor bad-collision check alongside ``plane``.
+    floor_rim: List[int] = field(default_factory=list)
 
     @property
     def target_bolt(self) -> BodyLinkRef:
@@ -107,11 +114,29 @@ class Scene:
             pybullet_data.getDataPath(), physicsClientId=self.client
         )
         floor_z = float(getattr(self.cfg, "floor_z", 0.0))
-        plane = p.loadURDF(
-            "plane.urdf",
-            basePosition=[0.0, 0.0, floor_z],
-            physicsClientId=self.client,
-        )
+        pit_enable = bool(getattr(self.cfg, "floor_pit_enable", False))
+        floor_rim_uids: List[int] = []
+        if pit_enable:
+            # Real pit: drop the infinite plane to the pit BOTTOM and rebuild
+            # the floor surface (top at floor_z) only OUTSIDE the pit rectangle
+            # as four rim slabs, leaving a genuine rectangular hole.
+            pit_depth = float(getattr(self.cfg, "floor_pit_depth", 0.90))
+            plane = p.loadURDF(
+                "plane.urdf",
+                basePosition=[0.0, 0.0, floor_z - pit_depth],
+                physicsClientId=self.client,
+            )
+            shape = str(getattr(self.cfg, "floor_pit_shape", "rect")).lower()
+            if shape == "circle":
+                floor_rim_uids = [self._make_floor_with_circular_hole(floor_z)]
+            else:
+                floor_rim_uids = self._make_floor_rim(floor_z)
+        else:
+            plane = p.loadURDF(
+                "plane.urdf",
+                basePosition=[0.0, 0.0, floor_z],
+                physicsClientId=self.client,
+            )
 
         hub_pos = np.array(self.cfg.hub_pos_nominal, dtype=np.float64)
         # ``_sample_offset_xyz`` = the legacy curriculum-phase XY noise
@@ -217,6 +242,7 @@ class Scene:
             target_bolt_idx=target_idx,
             tire_rack=rack_uids,
             cargo_back_wall=cargo_back_wall_uid,
+            floor_rim=floor_rim_uids,
         )
         return self.handles
 
@@ -614,6 +640,149 @@ class Scene:
         dz = pcz - hz0
         return (dy * dy + dz * dz) < r_sq
 
+    def _make_floor_with_circular_hole(self, floor_z: float) -> int:
+        """Solid floor plate (top at floor_z) with ONE circular hole.
+
+        Generates a watertight-ish triangle mesh of a large square plate with a
+        cylindrical hole punched over Robot A's column, writes it to a temp OBJ,
+        and loads it as a static concave trimesh (collision + visual). The arm
+        can descend through the hole into the pit (the infinite plane below sits
+        at ``floor_z − depth``); everywhere else the plate is solid so no arm
+        link can punch through the floor. Returns the body UID.
+        """
+        import os
+        import tempfile
+
+        cx, cy = (float(v) for v in self.cfg.floor_pit_center)
+        R = float(self.cfg.floor_pit_radius)
+        depth = float(getattr(self.cfg, "floor_pit_depth", 0.85))
+        L = float(getattr(self.cfg, "floor_pit_rim_extent", 12.0))
+        N = int(getattr(self.cfg, "floor_pit_circle_segments", 96))
+        N -= N % 4
+        N = max(N, 8)
+        top = floor_z
+        bot = floor_z - depth  # hole wall spans the full pit depth
+
+        # Build matched inner-circle and outer-square rings sharing the SAME
+        # angular order: for each angle, the outer point is where the ray from
+        # the pit centre hits the square boundary. This keeps the ring strip
+        # un-twisted (a per-edge square sampling vs angular circle sampling
+        # would skew triangles across the hole and create bogus collisions).
+        circ = []
+        sq = []
+        for i in range(N):
+            a = 2.0 * math.pi * i / N
+            ca, sa = math.cos(a), math.sin(a)
+            circ.append((cx + R * ca, cy + R * sa))
+            tx = ((L if ca > 0 else -L) - cx) / ca if abs(ca) > 1e-9 else 1e18
+            ty = ((L if sa > 0 else -L) - cy) / sa if abs(sa) > 1e-9 else 1e18
+            t = min(tx, ty)
+            sq.append((cx + t * ca, cy + t * sa))
+
+        verts: List[Tuple[float, float, float]] = []
+
+        def add(x, y, z):
+            verts.append((x, y, z))
+            return len(verts)  # 1-based for OBJ
+
+        # Vertex rings
+        out_t = [add(x, y, top) for (x, y) in sq]
+        in_t = [add(x, y, top) for (x, y) in circ]
+        in_b = [add(x, y, bot) for (x, y) in circ]
+        faces: List[Tuple[int, int, int]] = []
+        for i in range(N):
+            j = (i + 1) % N
+            # Top annulus (square outer -> circular inner)
+            faces.append((in_t[i], out_t[i], in_t[j]))
+            faces.append((out_t[i], out_t[j], in_t[j]))
+            # Inner cylindrical wall (top circle -> bottom circle)
+            faces.append((in_t[i], in_t[j], in_b[i]))
+            faces.append((in_t[j], in_b[j], in_b[i]))
+
+        fd, path = tempfile.mkstemp(suffix=".obj", prefix="floor_pit_")
+        with os.fdopen(fd, "w") as f:
+            for (x, y, z) in verts:
+                f.write(f"v {x:.5f} {y:.5f} {z:.5f}\n")
+            for (a, b, c) in faces:
+                f.write(f"f {a} {b} {c}\n")
+
+        rgba = tuple(getattr(
+            self.cfg, "floor_pit_rim_rgba", (0.55, 0.55, 0.58, 1.0),
+        ))
+        col = p.createCollisionShape(
+            p.GEOM_MESH, fileName=path, meshScale=[1, 1, 1],
+            flags=p.GEOM_FORCE_CONCAVE_TRIMESH, physicsClientId=self.client,
+        )
+        vis = p.createVisualShape(
+            p.GEOM_MESH, fileName=path, meshScale=[1, 1, 1], rgbaColor=rgba,
+            physicsClientId=self.client,
+        )
+        uid = p.createMultiBody(
+            baseMass=0.0,
+            baseCollisionShapeIndex=col,
+            baseVisualShapeIndex=vis,
+            basePosition=[0.0, 0.0, 0.0],
+            baseOrientation=[0.0, 0.0, 0.0, 1.0],
+            physicsClientId=self.client,
+        )
+        try:
+            os.remove(path)  # mesh is already parsed into the shapes
+        except OSError:
+            pass
+        return uid
+
+    def _make_floor_rim(self, floor_z: float) -> List[int]:
+        """Rebuild the floor surface OUTSIDE the pit rectangle as four slabs.
+
+        With ``cfg.floor_pit_enable`` the infinite plane is dropped to the pit
+        bottom; this lays four large box slabs (top at ``floor_z``) around the
+        pit rectangle ``[px0,px1] × [py0,py1]`` so everywhere except the pit
+        keeps a normal-height, solid floor. The slabs are static (mass 0) and
+        their top faces sit exactly at ``floor_z``. Returns their body UIDs.
+        """
+        px0, px1 = (float(v) for v in self.cfg.floor_pit_x_range)
+        py0, py1 = (float(v) for v in self.cfg.floor_pit_y_range)
+        L = float(getattr(self.cfg, "floor_pit_rim_extent", 12.0))
+        th = float(getattr(self.cfg, "floor_pit_rim_thickness", 0.20))
+        rgba = tuple(getattr(
+            self.cfg, "floor_pit_rim_rgba", (0.55, 0.55, 0.58, 1.0),
+        ))
+        hz = 0.5 * th
+        cz = floor_z - hz  # top face flush with floor_z
+        # (x0, x1, y0, y1) for the four bands surrounding the pit opening.
+        bands = [
+            (-L, px0, -L, L),    # −X strip (full height in Y)
+            (px1, L, -L, L),     # +X strip (full height in Y)
+            (px0, px1, -L, py0),  # −Y strip (between the X strips)
+            (px0, px1, py1, L),   # +Y strip (between the X strips)
+        ]
+        uids: List[int] = []
+        for (x0, x1, y0, y1) in bands:
+            if (x1 - x0) <= 1e-4 or (y1 - y0) <= 1e-4:
+                continue
+            hx = 0.5 * (x1 - x0)
+            hy = 0.5 * (y1 - y0)
+            cx = 0.5 * (x0 + x1)
+            cy = 0.5 * (y0 + y1)
+            col = p.createCollisionShape(
+                p.GEOM_BOX, halfExtents=[hx, hy, hz],
+                physicsClientId=self.client,
+            )
+            vis = p.createVisualShape(
+                p.GEOM_BOX, halfExtents=[hx, hy, hz], rgbaColor=rgba,
+                physicsClientId=self.client,
+            )
+            uid = p.createMultiBody(
+                baseMass=0.0,
+                baseCollisionShapeIndex=col,
+                baseVisualShapeIndex=vis,
+                basePosition=[cx, cy, cz],
+                baseOrientation=[0.0, 0.0, 0.0, 1.0],
+                physicsClientId=self.client,
+            )
+            uids.append(uid)
+        return uids
+
     def _make_robot_stand(
         self,
         base_pos: Tuple[float, float, float],
@@ -750,6 +919,51 @@ class Scene:
                 physicsClientId=self.client,
             )
             uids.append(uid)
+
+        # Open-corridor cradle: prop each thin top bar up from the floor with
+        # a vertical post placed BEHIND the bar (−X, the far side away from
+        # the FANUC base at +X). The arm threads in from the +X side and dips
+        # between the bars to the 6 o'clock grasp point, so a post on the −X
+        # back face never enters the approach corridor (neither the forearm
+        # nor the tool chuck reaches behind the tire). See
+        # cfg.tire_rack_support_posts.
+        if bool(getattr(self.cfg, "tire_rack_support_posts", False)):
+            floor_z = float(getattr(self.cfg, "floor_z", 0.0))
+            post_xy = tuple(
+                float(x) for x in getattr(
+                    self.cfg, "tire_rack_post_half_extents_xy", (0.10, 0.05))
+            )
+            for cx, cy, cz in centers:
+                bar_bottom = cz - he[2]
+                post_h = bar_bottom - floor_z
+                if post_h <= 1e-4:
+                    continue  # bar already rests on the floor; no post needed
+                # Post spans the bar's full Y width; placed flush against the
+                # bar's −X (back) face and running down to the floor.
+                post_he = [post_xy[0], he[1], post_h / 2.0]
+                post_cx = cx - he[0] - post_xy[0]
+                post_cz = floor_z + post_h / 2.0
+                pcol = p.createCollisionShape(
+                    p.GEOM_BOX, halfExtents=post_he,
+                    physicsClientId=self.client,
+                )
+                pvis = p.createVisualShape(
+                    p.GEOM_BOX, halfExtents=post_he, rgbaColor=list(rgba),
+                    physicsClientId=self.client,
+                )
+                puid = p.createMultiBody(
+                    baseMass=0.0,
+                    baseCollisionShapeIndex=pcol,
+                    baseVisualShapeIndex=pvis,
+                    basePosition=[post_cx, cy, post_cz],
+                    baseOrientation=[0.0, 0.0, 0.0, 1.0],
+                    physicsClientId=self.client,
+                )
+                p.changeDynamics(
+                    puid, -1, lateralFriction=1.0, spinningFriction=0.005,
+                    physicsClientId=self.client,
+                )
+                uids.append(puid)
         return uids
 
     def _spawn_tire(self) -> int:

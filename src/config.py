@@ -427,6 +427,36 @@ class EnvConfig:
     #   * Lift travel ................ ~0 cm  (pickup ↔ hub Z gap < 1 cm)
     #: World Z height of the ground plane (Robot B-centric).
     floor_z: float = -0.60
+    #: **2026-06-05 (real floor pit)** — when ``floor_pit_enable`` is True the
+    #: infinite ground plane is lowered to ``floor_z − floor_pit_depth`` (the
+    #: pit BOTTOM) and the normal-height floor (top at ``floor_z``) is rebuilt
+    #: only OUTSIDE the pit rectangle as four rim slabs. This carves a genuine
+    #: rectangular hole into the floor where Robot A's buried base/column and
+    #: its low arm links live: the arm can descend inside the pit freely, while
+    #: the rim slabs physically stop any link from punching through the floor
+    #: *outside* the pit. The pit XY rectangle must enclose every below-floor
+    #: arm point across the pickup+carry motion (measured ≈ x∈[−3.06,−0.30],
+    #: y∈[−0.98,1.03]); depth must clear the deepest link (link_1 ≈ base_z +
+    #: 0.27 ⇒ −0.83 at base_z=−1.10). Robot B (origin) sits on a rim slab.
+    floor_pit_enable: bool = False
+    floor_pit_depth: float = 0.90
+    #: Pit opening shape: "rect" (four rim slabs around a rectangle) or
+    #: "circle" (a generated floor plate with a single circular hole over
+    #: Robot A's column). The circular pit is sized so it contains EVERY
+    #: below-floor arm point across the motion (so the solid floor outside it
+    #: blocks the arm from punching through), while staying clear of Robot B.
+    floor_pit_shape: str = "rect"
+    floor_pit_x_range: Tuple[float, float] = (-3.30, -0.15)
+    floor_pit_y_range: Tuple[float, float] = (-1.20, 1.25)
+    #: Circular-pit parameters (used when floor_pit_shape == "circle").
+    floor_pit_center: Tuple[float, float] = (-1.15, -0.10)
+    floor_pit_radius: float = 0.70
+    floor_pit_circle_segments: int = 96
+    #: Half-width of the surrounding floor slabs (so the visible floor still
+    #: looks effectively infinite) and their slab thickness.
+    floor_pit_rim_extent: float = 12.0
+    floor_pit_rim_thickness: float = 0.20
+    floor_pit_rim_rgba: Tuple[float, float, float, float] = (0.55, 0.55, 0.58, 1.0)
     robot_A_base_pos: Tuple[float, float, float] = (-0.80, 0.0, -0.30)
     robot_A_base_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     #: Panda sits at the world origin — the entire scene is expressed
@@ -1085,6 +1115,20 @@ class EnvConfig:
     #: floor + 0.60 m = 0.00 m world.
     tire_rack_half_extents: Tuple[float, float, float] = (0.15, 0.05, 0.30)
     tire_rack_rgba: Tuple[float, float, float, float] = (0.22, 0.24, 0.28, 1.0)
+    #: **2026-06-04 (open-corridor cradle)** — when True the two rails are
+    #: built as thin top *bars* (``tire_rack_half_extents`` z is small) that
+    #: only touch the tire at the seating height, and each bar is propped up
+    #: from the floor by a vertical post placed on its OUTER face (away from
+    #: the Y=0 centerline). This leaves the inner-lower region — the corridor
+    #: the FANUC forearm sweeps through to reach the 6 o'clock grasp point —
+    #: completely open, so ``link_5`` no longer collides with a full-height
+    #: rail column. The post never enters the arm corridor (it sits beyond
+    #: the tire's tread on the outer side). Off by default (legacy full
+    #: column rails for the shipping layout).
+    tire_rack_support_posts: bool = False
+    #: Outer support-post half-extents (X, Y, Z is auto-derived to span
+    #: floor → bar bottom). Only used when ``tire_rack_support_posts``.
+    tire_rack_post_half_extents_xy: Tuple[float, float] = (0.10, 0.05)
 
     # Bolt surface properties (helps avoid unrealistic sticking on micro-contacts).
     bolt_lateral_friction: float = 0.8
@@ -1118,6 +1162,21 @@ class EnvConfig:
     fanuc_position_gain: float = 1.0
     fanuc_velocity_gain: float = 1.0
     fanuc_joint_slew_max_rad: float = 0.08
+    #: Per-joint POSITION_CONTROL torque caps (N·m), order j1..j6. The real
+    #: R-2000iC/210F is a 210 kg-payload arm so the big joints can be driven
+    #: very hard; these are deliberately conservative sim defaults. Raise via
+    #: ``fanuc_torque_scale`` (global multiplier) or override the list outright.
+    #: NOTE (scripts/diag_torque_tracking.py): the 100 kg baked carry already
+    #: reaches the mount target at scale 1.0 (EE end err = baked residual), so
+    #: the carry is NOT torque-limited — the realised-path quality is governed
+    #: by the velocity cap + PD gains, and scales ≥ ~4× actually DESTABILISE the
+    #: stiff position PD (overshoot/whip). Increase only with care.
+    fanuc_arm_motor_forces: Tuple[float, ...] = (
+        2000.0, 2000.0, 1500.0, 400.0, 400.0, 200.0,
+    )
+    #: Global multiplier applied to ``fanuc_arm_motor_forces``. 1.0 = datasheet-
+    #: conservative default; bump (e.g. 1.5–2.0) for extra static-load headroom.
+    fanuc_torque_scale: float = 1.0
     #: EE link name for IK / grasp parent (FANUC + wheel tool).
     fanuc_ee_link_name: str = "wheel_tool_tip"
     #: Optional 6-joint HOME override (rad). ``None`` keeps the class default
@@ -1125,6 +1184,14 @@ class EnvConfig:
     #: palm-up ready pose so the wheel tool sits ~0.9 m high (not stretched
     #: to ~2.45 m). Re-tune via ``scripts/audit_fanuc_layout.py``.
     fanuc_home_pose: Optional[Tuple[float, ...]] = None
+    #: Optional 6-joint **physical reset** override (rad) — the config the arm is
+    #: parked in at episode reset. DECOUPLED from ``fanuc_home_pose``: the latter
+    #: still seeds ``arm.rest`` (IK warm-start) and defines the palm-up
+    #: ``FINAL_LOCK_QUATERNION``, while this only sets where the arm physically
+    #: sits at reset. Needed because the canonical IK-seed home folds the wrist
+    #: below the floor outside the narrow column pit; this lifts it clear.
+    #: ``None`` ⇒ reset to ``fanuc_home_pose`` (legacy behaviour).
+    fanuc_reset_pose: Optional[Tuple[float, ...]] = None
     #: Grasp anchor: tire COM = EE + (0, 0, tire_outer_radius) in world +Z
     #: when bore is vertical (same convention as UR10 palm-up grasp).
     grasp_com_offset_world: Tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -1428,8 +1495,14 @@ class EnvConfig:
 def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     """Widen hub/cargo/cradle for FANUC reach; 100 kg tire physics.
 
-    Robot B stays at world origin (0,0,0). FANUC base retreats to −X so
-    hub reach ≈ 75% of 2.65 m (vs UR10 87% at shipping layout).
+    **2026-06-05 (Robot-B-origin frame)** — the whole layout is expressed with
+    Robot B (UR10e) at the WORLD ORIGIN (0,0,0). The previous frame had B at
+    (0.20, 0.40, 0); every world coordinate below was rigidly translated by
+    (−0.20, −0.40, 0) so B lands on the origin. Because it is a pure rigid
+    XY translation the physical scene — every reach, clearance, the pit, the
+    grasp/carry/mount geometry — is byte-for-byte unchanged; only the frame
+    origin moved. The observation frame (``obs_reference_pos``) stays at
+    (0,0,0), now coincident with B's base.
     """
     cfg.scene_layout = "fanuc_spacious"
     cfg.robot_a_kind = "fanuc_r2000ic"
@@ -1438,26 +1511,215 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.fanuc_ee_link_name = "wheel_tool_tip"
     cfg.ur10_lock_tool_up = False
     cfg.fanuc_lock_tool_up = False
-    #: Folded palm-up ready pose — wheel tool sits ~0.9 m high (was ~2.45 m
-    #: with the stretched-up class default). EE z≈0.88, tool +Z ≈ world +Z.
+    #: Folded palm-up ready pose. Defines ``arm.rest`` (the IK warm-start branch
+    #: every baked trajectory uses) and the palm-up ``FINAL_LOCK_QUATERNION`` for
+    #: grasp/mount — KEEP this canonical so trajectories/grasp stay valid.
     cfg.fanuc_home_pose = (0.381, -1.05, -1.522, 0.0, 2.066, -1.189)
+    #: **2026-06-05 (decoupled physical reset pose)** — the canonical home above
+    #: folds the wrist (link_4/5) out toward +x where, with the narrow column-only
+    #: circular pit (R=0.65), it dipped ~12–21 cm below the floor JUST OUTSIDE the
+    #: pit edge → a 276 kN floor-plate contact tripped contact_force termination
+    #: on every home-start reset (step 1). This lifts the whole arm over the pit
+    #: centre (≈19.7 cm min floor clearance, 0 self-collision pairs) WITHOUT
+    #: touching the IK seed / grasp orientation. Found via scripts/find_home_pose.py.
+    cfg.fanuc_reset_pose = (1.7830, -0.9519, -0.2671, 2.0266, 2.1763, -0.7752)
 
-    cfg.robot_A_base_pos = (-1.50, 0.0, -0.30)
-    cfg.hub_pos_nominal = (0.0, 1.20, 0.22)
+    #: FANUC base BURIED to Z=−1.10. **2026-06-04 (mount-reach fix)** — at
+    #: −0.95 the buried wrist could position the 6-o'clock pickup anchor (low
+    #: target) but could NOT dip the gripper to the MOUNT pose under the hub
+    #: with the required palm-up −90° yaw: the Stage-1 carry stalled with the
+    #: EE 12 cm / 15° off the mount target (pose-IK infeasible), so the tire
+    #: never seated on the hub. Burying 0.15 m deeper drops the whole reach
+    #: band so the gripper reaches the under-hub mount pose at < 3 cm / 4°
+    #: while the pickup grasp anchor still resolves to 0.0 cm. (Verified via
+    #: scripts/probe_mount_reach.py across base-Z × hub Y-Z.)
+    #: X stays at −1.10 (compact cell); still +1.10 m clear of Robot B.
+    #: **2026-06-05 (un-bury for a narrower/shallower pit + lower rack)** — with
+    #: the hub at 1.10 the base no longer needs the full −1.10 burial to reach
+    #: the under-hub mount: −0.90 still resolves the mount pose at 0.1 cm/0.1°
+    #: (−0.70 fails at 5.2 cm — scripts/check_reach_target.py). Un-burying 0.20 m
+    #: raises the whole arm so (a) the deepest below-floor point rises −0.76 →
+    #: −0.56 (pit depth 0.85 → 0.65) and the below-floor footprint shrinks to
+    #: R≈0.40 (narrower circular pit), and (b) the forearm clears the floor at a
+    #: LOWER pickup (1.00 instead of 1.34 → much lower rack).
+    #: (B-origin frame: world (−1.10, 0.0, −0.90) − (0.20, 0.40, 0).)
+    cfg.robot_A_base_pos = (-1.30, -0.40, -0.90)
+    #: Ground plane at Z=0 — flush with Robot B's base (origin), so B stands
+    #: directly on the floor with no stand pillar. The FANUC base (Z=−0.95)
+    #: sits *below* the plane (intentionally buried for reach/height); since
+    #: base_z < floor_z no support pillar is drawn for it either.
+    cfg.floor_z = 0.0
+    #: **2026-06-05 (real pit)** — carve a genuine rectangular hole into the
+    #: floor around the FANUC base so the buried column lives in a pit while
+    #: the surrounding floor (rim slabs, top at z=0) physically blocks any arm
+    #: link from punching through outside the pit. Depth 0.95 m clears the
+    #: deepest link (link_1 ≈ base_z+0.27 = −0.83). The XY rectangle encloses
+    #: the whole below-floor arm sweep across pickup+carry (≈ x∈[−3.06,−0.30],
+    #: y∈[−0.98,1.03]) plus margin, while keeping Robot B (origin) and the
+    #: pit's +X rim edge (−0.15) safely apart. (scripts/diag_pit_extent.py)
+    #: **2026-06-05 (circular column pit)** — per request the pit is a single
+    #: CIRCLE over Robot A's column, not a big rectangle. This is only feasible
+    #: because the pickup (→1.04) and hub (→1.10) are raised so the forearm
+    #: (link_4/5) no longer dips below the floor while reaching the pickup or
+    #: the under-hub mount: with those raises EVERY below-floor arm point falls
+    #: within ~0.62 m of (−1.15,−0.10) (measured via scripts/measure_pit_footprint
+    #: .py). Radius must clear the FAT lower-arm (link_2) cross-section as it
+    #: passes through the hole, not just the contact point: a sweep with
+    #: scripts/verify_pit.py shows R=0.80 already gives 0 penetrations and R=0.90
+    #: leaves the arm everywhere ≥5 cm clear of the wall, so 0.90 is used for a
+    #: tracking-error margin. It still leaves ~0.13 m of solid floor between the
+    #: hole rim and Robot B's pedestal at the origin. Depth 0.85 clears the
+    #: deepest arm point (base pedestal ≈ −0.76). The solid floor outside the
+    #: circle physically blocks any arm link from punching through.
+    cfg.floor_pit_enable = True
+    cfg.floor_pit_shape = "circle"
+    cfg.floor_pit_depth = 0.65
+    #: (B-origin frame: was (−1.15, 0.05); −(0.20, 0.40).)
+    cfg.floor_pit_center = (-1.35, -0.35)
+    cfg.floor_pit_radius = 0.65
+    #: Hub at Y=0.70, Z=0.85. **2026-06-04 (raise + pull-in for mount)** —
+    #: raising the hub so a grasped tire can actually be inserted requires
+    #: BOTH (a) the gripper to dip under the hub to (0, hub_y, hub_z − R), and
+    #: (b) Robot B at the origin to still reach the bolts. These conflict at
+    #: hub_y=0.95: any hub_z ≥ 0.85 pushes B past full stretch (≥ 103 %). The
+    #: resolution is to pull the hub IN to Y=0.70 (bolts closer to B) and lift
+    #: to Z=0.85: B's farthest bolt ≈ 1.20 m ≈ 92 % reach (comfortable, with
+    #: orientation freedom to drive the nut) while the FANUC (base now −1.10)
+    #: reaches the under-hub mount pose at ≈ 3 cm / 4°. A mounted tire's lowest
+    #: point sits at 0.85 − 0.525 = 0.325 m (32.5 cm floor clearance) so it no
+    #: longer clips the ground. (scripts/probe_mount_reach.py joint Y-Z sweep.)
+    #: **2026-06-04 (−X carry clearance)** — hub (and the vehicle that tracks
+    #: it) are pulled to X=−0.30. With Robot A and the pickup FIXED, this
+    #: changes the carry path to the relocated hub and roughly doubles the
+    #: tire↔vehicle clearance along the ideal baked carry (3.6 → 8.8 cm) — the
+    #: 3.6 cm baseline was far too tight to survive the heavy-tire tracking
+    #: error, so the carry rammed the vehicle. Shifting in X (not Y) is cheap
+    #: for Robot B at the origin: hub-to-origin distance is dominated by Y/Z,
+    #: so B's farthest-bolt reach moves only 92 → 95 %, whereas a +Y shift of
+    #: the same size would push B past full stretch. (probe_carry_clearance.py)
+    #: NOTE: a second, now-dominant blocker remains — the 100 kg tire exceeds
+    #: what the torque/velocity-limited FANUC can track on the baked carry, so
+    #: even with vehicle collision disabled the zero-action carry stalls ~48 cm
+    #: short of the hub. That is a control/tuning + policy concern, not layout.
+    #: **2026-06-04 (user-forced +Y)** — hub also pushed +Y to 0.85 and −X to
+    #: −0.50 per explicit request for more carry clearance (≈ 12.6 cm). WARNING:
+    #: this BREAKS the "Robot B reaches every bolt" constraint — at hub_y=0.85
+    #: the farthest bolt is ≈ 107 % of B's 1.30 m reach (B can no longer drive
+    #: those nuts from the origin). Kept because the user prioritised carry
+    #: clearance over B's bolt reach for this iteration. (probe_carry_clearance)
+    #: **2026-06-05 (user-requested further raise)** — hub lifted 0.85 → 0.95.
+    #: This RAISES the mounted-tire floor clearance to 0.95 − 0.525 = 0.425 m
+    #: and lifts the under-hub mount target, which (because the FANUC base is
+    #: buried for that very reach) gives a little headroom to UN-bury the base
+    #: later for a shallower pit. NOTE: it does NOT reduce the current pit DEPTH
+    #: — the deepest arm point is link_1 ≈ base_z+0.27, fixed by base burial,
+    #: not by hub height. It also pushes Robot B further past full stretch.
+    #: **2026-06-05 (circular-pit rework)** — hub raised 0.95 → 1.10. Raising
+    #: the under-hub mount target lifts the carrying forearm so link_4/5 stay
+    #: ABOVE the floor during the carry/mount (a precondition for the column-
+    #: only circular pit). FANUC pickup+mount IK both resolve to 0.0 cm at this
+    #: hub Z with the buried base (scripts/check_reach_target.py). Cost: Robot B
+    #: at the origin now sits at ~121 % of full stretch for the farthest bolt
+    #: (cannot drive those nuts) — acceptable for Phase 1 (B frozen at HOME);
+    #: B reach must be revisited before Phase ≥2 cooperative nut-driving.
+    #: **2026-06-05 (lower hub+cargo −z)** — hub lowered 1.10 → 1.00 per request
+    #: to drop the whole hub/cargo set. 1.00 is the floor: FANUC mount IK still
+    #: resolves (1.9 cm / 2°) but 0.90 fails (5.2 cm) at base_z=−0.90. The lower
+    #: mount target (0.475) keeps the below-floor geometry column-only (R≈0.41 <
+    #: pit R=0.65 — scripts/measure_pit_footprint.py), and the mounted tire
+    #: still clears the floor by 0.475 m.
+    #: (B-origin frame: world (−0.50, 0.85, 1.00) − (0.20, 0.40, 0).)
+    cfg.hub_pos_nominal = (-0.70, 0.45, 1.00)
     cfg.tire_mount_pos = cfg.hub_pos_nominal
-    cfg.tire_pickup_pos = (-2.40, 0.0, 0.3913)
-    cfg.vehicle_center_world = (0.0, 1.45, 0.78)
+    #: Tire / rack at X=−2.90 — a compact ~1.8 m from the (pulled-in) FANUC
+    #: base. Far enough to stay out of the inner reach deadzone (baked palm-up
+    #: grasp error 6.5 cm < 8 cm approach gate) yet much closer than the 3.80 m
+    #: full-stretch placement. RAISED by +0.45 (pickup 0.3913 → 0.8413) so the
+    #: big tire (R=0.525) sits in the locked-tool-up wrist's reachable band.
+    #: **2026-06-05 (circular-pit rework)** — pickup RAISED 0.8413 → 1.04. At
+    #: the old height the reaching forearm (link_4/5) dipped ~13–15 cm below the
+    #: floor out at the pickup (x≈−2.9), far from the column, which a column-
+    #: only pit could not contain. Raising the pickup lifts that whole reach
+    #: above the floor (link_4/5 below-floor depth → ~0; verified via
+    #: scripts/measure_pit_footprint.py) so the only remaining below-floor
+    #: geometry is the buried column cluster. Grasp IK still resolves to 0.0 cm.
+    #: NOTE: with the base un-buried to −0.90 the forearm clears the floor at a
+    #: pickup of 1.00 (at the old −1.10 burial it needed 1.34), so the rack can
+    #: sit much lower while the below-floor geometry stays confined to the
+    #: column. (scripts/measure_pit_footprint.py base/pickup sweep.)
+    #: (B-origin frame: world (−2.90, 0.0, 1.00) − (0.20, 0.40, 0).)
+    cfg.tire_pickup_pos = (-3.10, -0.40, 1.00)
+    #: Vehicle body tracks the hub (kept +0.25 m behind in Y, +0.56 m above in
+    #: Z so the wheel-well cutout stays centred on the hub): hub
+    #: (−0.50,0.85,0.85) → vehicle (−0.50, 1.10, 1.41).
+    #: (B-origin frame: world (−0.50, 1.10, 1.56) − (0.20, 0.40, 0).)
+    cfg.vehicle_center_world = (-0.70, 0.70, 1.56)
     cfg.cargo_back_wall_y_offset = 0.35
-    cfg.tire_rack_inner_center = (-2.40, 0.40, -0.30)
-    cfg.tire_rack_outer_center = (-2.40, -0.40, -0.30)
+    #: **2026-06-05 (align wall bottom with cargo bottom)** — the back wall
+    #: (he_z=0.50) was centred at the hub (1.10) so its bottom hung at 0.60,
+    #: i.e. 0.56 m BELOW the cargo box bottom (vehicle_center_z 1.66 − he_z 0.50
+    #: = 1.16) — it looked like it was drooping below the cargo. Centring it at
+    #: 1.66 puts its bottom flush with the cargo bottom (1.16) and its z-span
+    #: exactly on the cargo box [1.16, 2.16]. It still overlaps the upper ~46 cm
+    #: of a hub-mounted tire (top at 1.10+0.525=1.625) so it keeps blocking +Y
+    #: over-push. **2026-06-05** — tracks the lowered cargo (vehicle z 1.56),
+    #: so the wall bottom (1.56−0.50=1.06) stays flush with the cargo bottom.
+    cfg.cargo_back_wall_center_z = 1.56
+    #: Cradle rails stand on the Z=0 floor; their TOP corner must touch the
+    #: tire tread at the rail's Y offset (the tire rests on the two rails at
+    #: y=±0.40, NOT on its y=0 bottom). Seating contract:
+    #:     rack_top = tire_com_z − √(R² − (inner_y − he_y)²)
+    #:             = 0.8413 − √(0.525² − 0.35²) = 0.8413 − 0.3913 = 0.450
+    #: With the rail standing on the floor (bottom = 0): he_z = top/2 = 0.225,
+    #: center = he_z = 0.225.
+    #: **2026-06-04 (open-corridor cradle — fixes the link_5↔rail block)**
+    #: The full-height rail columns physically blocked the FANUC forearm
+    #: (``link_5``) from dipping between the rails to the tire's 6 o'clock
+    #: grasp point — the baked palm-up approach stalled ~25 cm short (Y off
+    #: by 0.61 m) so the Stage-0 grasp never fired (pickup success ≈ 0).
+    #: Fix: build the rails as thin top *bars* that touch the tire only at
+    #: the seating height (top edge at z = 0.450 = the y=±0.35 tread contact),
+    #: propped up from the floor by support posts on their OUTER faces. The
+    #: inner-lower region is now open, so the forearm threads straight to the
+    #: grasp anchor and the grasp fires (verified @ step ~89, home start).
+    #: Bar: he=(0.10, 0.05, 0.025); top = center_z + he_z = 0.425 + 0.025 =
+    #: 0.450. Posts auto-span floor (0) → bar bottom (0.40) on the outer side.
+    #: **2026-06-05 (pickup 1.00)** — rails seat the tire COM at z=1.00.
+    #: rack_top = 1.00 − √(0.525² − 0.35²) = 1.00 − 0.3913 = 0.6087;
+    #: bar center_z = 0.6087 − 0.025 = 0.584. Posts span the solid floor (0) up
+    #: to the bar bottom (0.559).
+    cfg.tire_rack_half_extents = (0.10, 0.05, 0.025)
+    #: (B-origin frame: world (−2.90, ±0.40, 0.584) − (0.20, 0.40, 0).)
+    cfg.tire_rack_inner_center = (-3.10, 0.00, 0.584)
+    cfg.tire_rack_outer_center = (-3.10, -0.80, 0.584)
+    cfg.tire_rack_support_posts = True
+    cfg.tire_rack_post_half_extents_xy = (0.10, 0.05)
 
-    #: Push Robot B (UR10e) far out of the FANUC carry corridor (pickup −X →
-    #: hub +Y). Phase 1 freezes B at HOME so it is a pure obstacle here; the
-    #: obs frame is pinned to world origin (below) so this move does not warp
-    #: the observation scaling. NOTE: this is too far for Phase-2 hub bolting
-    #: (UR10e reach ~1.3 m → hub ~1.9 m); bring B back near the hub when
-    #: Phase 2 begins.
-    cfg.robot_B_base_pos = (1.40, 0.0, -0.30)
+    #: **2026-06-04 (carry arch vs vehicle)** — the Stage-1 carry goes from the
+    #: pickup (z≈0.86) DOWN to the under-hub mount (z=0.325); the default 0.35 m
+    #: up-arch lofted the grasped tire to z≈1.13 and rammed it into the raised
+    #: vehicle underbody (bottom at z=0.91), stalling the carry. A small 0.10 m
+    #: arch keeps the tire clear of Robot B while staying below the vehicle.
+    cfg.planner_stage1_lift = 0.10
+
+    #: Robot B (UR10e) sits at the WORLD ORIGIN and reaches all hub bolts (see
+    #: hub placement above). Phase 1 still freezes B at HOME; the obs frame is
+    #: pinned to the origin (below), which now coincides with B's base.
+    #: **2026-06-05 (B shifted +Y to reach all bolts)** — at the origin the
+    #: UR10e could not reach the farthest hub bolt (worst-bolt IK 7.2 cm). With
+    #: the hub at (−0.5, 0.85, 1.10) a Y-sweep (scripts/sweep_robotB_y.py) shows
+    #: every bolt becomes reachable for base y ∈ [0.20, 1.40]; y=0.60 is the
+    #: most comfortable (worst-bolt IK ≈ 0.7 mm). The observation frame stays
+    #: pinned to the world origin so positional channels are unaffected.
+    #: **2026-06-05 (push B further +x/−y for tire clearance)** — B moved to
+    #: (0.20, 0.40): the furthest +x/−y from the hub that still reaches every
+    #: bolt (worst-bolt IK ≈ 0.9 mm; Bx=0.40 misses by 13 cm). This pulls B off
+    #: the carry/mount corridor so the carried tire clears it with more margin.
+    #: (scripts/sweep_b_and_hubz.py.)
+    #: Robot B (UR10e) now sits AT the world origin (was (0.20, 0.40, 0)); the
+    #: whole layout above was translated by −(0.20, 0.40, 0) to land it here.
+    cfg.robot_B_base_pos = (0.0, 0.0, 0.0)
+    #: Observation frame == world origin == Robot B's base.
     cfg.obs_reference_pos = (0.0, 0.0, 0.0)
 
     cfg.tire_mass = cfg.tire_mass_heavy
@@ -1542,6 +1804,10 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     legacy_action_dim = overrides.pop("legacy_action_dim", None)
     legacy_obs_dim = overrides.pop("legacy_obs_dim", None)
     cfg = EnvConfig(**overrides)
+    # Snapshot the caller's explicit overrides so they remain authoritative
+    # over the layout presets below. ``scene_layout`` is excluded (re-applying
+    # it would just re-select the same layout, harmless, but kept for clarity).
+    user_overrides = {k: v for k, v in overrides.items() if k != "scene_layout"}
     cfg.reward = make_reward_config(stage, phase)
     cfg.use_shaping = (stage == 4)
     cfg.curriculum.phase = phase
@@ -1582,4 +1848,12 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     layout = str(getattr(cfg, "scene_layout", "shipping")).lower()
     if layout in ("fanuc_spacious", "fanuc", "spacious"):
         apply_fanuc_spacious_layout(cfg)
+        # **2026-06-05 (override-precedence fix)** — the layout function sets a
+        # whole batch of presets (incl. ``contact_force_terminate_above`` = 50 kN,
+        # robot poses, torque, gains). Previously it ran AFTER ``EnvConfig(**
+        # overrides)`` and silently CLOBBERED explicit CLI flags — e.g. train.ps1's
+        # ``--contact-force-done 0`` was overwritten back to 50 kN. Re-apply the
+        # caller's explicit overrides so CLI flags always win over layout presets.
+        for k, v in user_overrides.items():
+            setattr(cfg, k, v)
     return cfg

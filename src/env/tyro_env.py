@@ -387,6 +387,21 @@ class TyroEnv(gym.Env):
         self.robot_A = make_robot_a(self.client, self.cfg)
         self.robot_B = make_robot_b(self.client, self.cfg)
 
+        # When Robot A's base is intentionally buried below the ground plane
+        # (e.g. the FANUC spacious layout sinks it to lower the working EE and
+        # clear the inner reach deadzone), its base/lower links overlap the
+        # infinite plane and would emit huge spurious contact forces — tripping
+        # the contact-force termination on step 1. Disable A↔plane collision in
+        # that case; the arm works well above the floor so it never needs it.
+        if float(self.cfg.robot_A_base_pos[2]) < float(self.cfg.floor_z) - 1e-6:
+            plane_uid = self.handles.plane
+            n_links = p.getNumJoints(self.robot_A.uid, physicsClientId=self.client)
+            for link in range(-1, n_links):
+                p.setCollisionFilterPair(
+                    self.robot_A.uid, plane_uid, link, -1, 0,
+                    physicsClientId=self.client,
+                )
+
         # Vertical reference quaternion sourced from ``cfg.tire_spawn_rpy``.
         # Used by ``_pin_tire_to_world`` at reset/landing so the tire
         # returns to the spawn pose. ``_tire_vertical_error`` compares the
@@ -3145,14 +3160,19 @@ class TyroEnv(gym.Env):
     # Termination
     # ------------------------------------------------------------------
     def _in_bad_collision(self) -> bool:
-        # Robot bodies vs ground plane.
+        # Robot bodies vs ground plane (and, with a real pit, the rim slabs
+        # that form the floor surface outside the pit — an arm link punching
+        # through them is just as bad as punching the infinite plane).
+        floor_bodies = [self.handles.plane]
+        floor_bodies.extend(getattr(self.handles, "floor_rim", []) or [])
         for robot in (self.robot_A, self.robot_B):
-            cps = p.getContactPoints(bodyA=robot.uid, bodyB=self.handles.plane,
-                                     physicsClientId=self.client)
-            for cp in cps:
-                # link 0 / -1 is the base; foot contact is fine, but mid-arm isn't.
-                if cp[3] > 1:    # link index on robot side
-                    return True
+            for floor_uid in floor_bodies:
+                cps = p.getContactPoints(bodyA=robot.uid, bodyB=floor_uid,
+                                         physicsClientId=self.client)
+                for cp in cps:
+                    # link 0 / -1 is the base; foot contact is fine, mid-arm isn't.
+                    if cp[3] > 1:    # link index on robot side
+                        return True
         # Robot A vs Robot B — ignore base-link grazing (large arms).
         min_link = int(getattr(self.cfg, "robot_ab_collision_min_link", 2))
         cps = p.getContactPoints(bodyA=self.robot_A.uid, bodyB=self.robot_B.uid,

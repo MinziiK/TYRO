@@ -164,7 +164,14 @@ class Robot:
         )
 
     def reset_to_home(self) -> None:
-        for idx, q in zip(self.arm.indices, self.arm.rest):
+        # Physical reset config. ``_reset_pose`` (when set) is DECOUPLED from
+        # ``arm.rest``: the latter still seeds IK / defines the palm-up lock,
+        # while this is only where the arm is parked at reset. Falls back to
+        # ``arm.rest`` (legacy) when no separate reset pose was installed.
+        pose = getattr(self, "_reset_pose", None)
+        if pose is None:
+            pose = self.arm.rest
+        for idx, q in zip(self.arm.indices, pose):
             p.resetJointState(self.uid, idx, targetValue=float(q),
                               targetVelocity=0.0, physicsClientId=self.client)
         # Seed the absolute IK target with the HOME EE forward kinematics.
@@ -1020,6 +1027,11 @@ class FanucR2000icRobot(UR10Robot):
             getattr(cfg, "fanuc_joint_slew_max_rad",
                     getattr(cfg, "ur10_joint_slew_max_rad", 0.08))
         )
+        # Config-driven per-joint torque caps × global scale (see EnvConfig).
+        _forces = getattr(cfg, "fanuc_arm_motor_forces",
+                          (2000.0, 2000.0, 1500.0, 400.0, 400.0, 200.0))
+        _scale = float(getattr(cfg, "fanuc_torque_scale", 1.0))
+        self._motor_forces = [float(f) * _scale for f in _forces]
         self._cmd_q: Optional[np.ndarray] = None
 
         urdf = str(getattr(cfg, "fanuc_urdf", ""))
@@ -1049,14 +1061,56 @@ class FanucR2000icRobot(UR10Robot):
             # uses the override.
             self.arm.rest = np.array(self.HOME_POSE, dtype=np.float64)
         self._cmd_q = None
+        self._disable_tool_arm_self_collision()
+        # Park at the CANONICAL home first so FINAL_LOCK_QUATERNION (the palm-up
+        # grasp orientation) and arm.rest (IK warm-start) are taken from it.
         self.reset_to_home()
         home_pos, home_quat = self.ee_pose()
         self.FINAL_LOCK_QUATERNION = tuple(float(x) for x in home_quat)
         self.TOOL_UP_QUATERNION = self.FINAL_LOCK_QUATERNION
+        # Install the DECOUPLED physical reset pose (collision-free over the
+        # narrow pit) and re-park there. arm.rest stays = canonical home, so all
+        # baked trajectories and the grasp orientation are unchanged.
+        reset_override = getattr(cfg, "fanuc_reset_pose", None)
+        if reset_override is not None:
+            self._reset_pose = np.array(
+                [float(x) for x in reset_override], dtype=np.float64
+            )
+            self.reset_to_home()
         print(
             f"[{self.NAME}] EE_LINK_INDEX={self.EE_LINK_INDEX}  "
             f"HOME tool0={tuple(round(v, 3) for v in home_pos)}"
         )
+
+    def _disable_tool_arm_self_collision(self) -> None:
+        """Turn off collision between the bolted-on wheel tool and the arm.
+
+        The primitive wheel-gripper chuck (radius ~0.12 m) is fixed to
+        ``tool0`` and geometrically overlaps the bulky FANUC wrist links
+        (link_5 / link_6) by ~2 cm in every pose — a real end-effector is
+        bolted to the flange and never collides with it, but PyBullet's
+        ``URDF_USE_SELF_COLLISION`` reports a constant ~50 kN penetration
+        impulse that would trip the contact-force termination. Tool links
+        (``wg_*``, ``tool0``, ``flange``, ``wheel_tool_tip``) are filtered
+        against the six arm links so only genuine arm-vs-world contacts remain.
+        """
+        arm_link_names = {f"link_{i}" for i in range(1, 7)}
+        arm_links: List[int] = []
+        tool_links: List[int] = []
+        for j in range(p.getNumJoints(self.uid, physicsClientId=self.client)):
+            info = p.getJointInfo(self.uid, j, physicsClientId=self.client)
+            child = info[12]
+            name = child.decode() if isinstance(child, (bytes, bytearray)) else str(child)
+            if name in arm_link_names:
+                arm_links.append(j)
+            elif name.startswith("wg_") or name in ("tool0", "flange", "wheel_tool_tip"):
+                tool_links.append(j)
+        for a in arm_links:
+            for t in tool_links:
+                p.setCollisionFilterPair(
+                    self.uid, self.uid, a, t, 0,
+                    physicsClientId=self.client,
+                )
 
     def _link_index_for_child_link(self, link_name: str) -> int:
         for j in range(p.getNumJoints(self.uid, physicsClientId=self.client)):
@@ -1071,7 +1125,7 @@ class FanucR2000icRobot(UR10Robot):
         return self._joints_by_name([f"joint_{i}" for i in range(1, 7)])
 
     def _arm_motor_forces(self) -> List[float]:
-        return [2000.0, 2000.0, 1500.0, 400.0, 400.0, 200.0]
+        return list(self._motor_forces)
 
     def apply_palm_up_locked(self, pos) -> None:
         self.apply_absolute_ee(pos, self.FINAL_LOCK_QUATERNION)

@@ -1186,6 +1186,18 @@ def main() -> int:
         help='Robot A model: "ur10" (default) or "fanuc_r2000ic".',
     )
     ap.add_argument(
+        "--fanuc-torque-scale",
+        type=float,
+        default=None,
+        help=(
+            "Global multiplier on FANUC per-joint torque caps (default 1.0). "
+            "The R-2000iC/210F is a 210 kg-payload arm so 1.5-2.0 is physically "
+            "fine; note the 100 kg carry already reaches the mount target at 1.0 "
+            "(see scripts/diag_torque_tracking.py) and scales >=4 destabilise the "
+            "stiff position PD."
+        ),
+    )
+    ap.add_argument(
         "--robot-b-kind",
         type=str,
         default=None,
@@ -1269,6 +1281,8 @@ def main() -> int:
             overrides["tire_mass"] = args.tire_mass
         if args.robot_a_kind is not None:
             overrides["robot_a_kind"] = str(args.robot_a_kind)
+        if getattr(args, "fanuc_torque_scale", None) is not None:
+            overrides["fanuc_torque_scale"] = float(args.fanuc_torque_scale)
         if getattr(args, "robot_b_kind", None) is not None:
             overrides["robot_b_kind"] = str(args.robot_b_kind)
         if getattr(args, "scene_layout", None) is not None:
