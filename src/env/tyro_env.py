@@ -1093,6 +1093,12 @@ class TyroEnv(gym.Env):
         #    via ``_try_stage_transitions`` based on env state.
         self.task_stage = 1
         self._pickup_bonus_paid = True
+        # If the grasp above was created as a kinematic upright lock
+        # (Stage-0 sync), promote it to a rigid JOINT_FIXED bond now that
+        # we are entering the carry stage — the per-step upright sync does
+        # not run outside the kinematic stages, so the tire would otherwise
+        # be unconstrained during the carry.
+        self._maybe_promote_to_fixed_grasp()
         # Re-seed PB shaping accumulators so the first Stage-1 step
         # doesn't see a stale ``_prev_d_A``.
         self._prev_d_approach = None
@@ -1173,6 +1179,14 @@ class TyroEnv(gym.Env):
         self.task_stage = 1
         self._pickup_bonus_paid = True
         self._begin_kinematic_grasp()
+        # The hot-start lands directly in the carry stage (task_stage = 1),
+        # which is not a kinematic-sync stage, so the per-step upright lock
+        # never runs. Promote the kinematic grasp to a rigid JOINT_FIXED
+        # bond exactly as the pickup→carry FSM transition does
+        # (``_try_stage_transitions`` → ``_maybe_promote_to_fixed_grasp``);
+        # otherwise the tire is left completely unconstrained during the
+        # carry and the arm flies to the hub empty-handed (S1 stall).
+        self._maybe_promote_to_fixed_grasp()
         self._prev_d_approach = None
         self._prev_d_return = None
         self._prev_d_A = None

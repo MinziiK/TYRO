@@ -1729,6 +1729,20 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: arch keeps the tire clear of Robot B while staying below the vehicle.
     cfg.planner_stage1_lift = 0.10
 
+    #: **2026-06-05 (coaxial −Y insertion for FANUC mount)** — with the
+    #: heavy tire rigidly grasped (JOINT_FIXED, see kinematic_tire_lock_stages
+    #: = (0,) below), the default arch carry swings the tire toward the hub
+    #: *laterally* (from −X), so the tire's outer rim (R=0.525) catches the
+    #: hub_mount base (radius 0.21) and the carry jams ~0.75 m short — the
+    #: tire never reaches a mountable pose (prior runs: ~0 % success). A
+    #: rigid-transform collision sweep (scripts/diag_s1_stall.py) confirms
+    #: that routing through a pre-hub via-point 0.70 m along −Y makes the
+    #: final approach a coaxial straight +Y insertion that is collision-free
+    #: through the wheel well (the hub pilot/peg, r=0.21, then fits the tire
+    #: bore, r=0.282). This gives the PPO residual a feasible nominal to
+    #: refine instead of one that drives the tire into the truck structure.
+    cfg.planner_stage1_approach_standoff = 0.70
+
     #: Robot B (UR10e) sits at the WORLD ORIGIN and reaches all hub bolts (see
     #: hub placement above). Phase 1 still freezes B at HOME; the obs frame is
     #: pinned to the origin (below), which now coincides with B's base.
