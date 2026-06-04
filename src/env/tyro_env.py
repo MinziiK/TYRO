@@ -358,6 +358,17 @@ class TyroEnv(gym.Env):
         # stall budget once Stage 1 fires).
         self._mount_done_step = None
         self._demount_bonus_paid = False
+        # 6-stage remount cycle bookkeeping (only consumed when
+        # ``cfg.remount_cycle_enable``). S2 = empty retract to HOME after
+        # the W1 tighten hold; S3 = re-approach + re-grip the hub tire;
+        # S4 = W2 loosen hold then demount. The W1/W2 holds reuse the
+        # ``_mount_hold_left`` freeze/clamp machinery.
+        self._retract_bonus_paid = False
+        self._regrip_bonus_paid = False
+        self._retract_release_done = False
+        self._demount_replan_done = False
+        self._home_ee_pos = None
+        self._home_ee_quat = None
         p.setGravity(*self.cfg.gravity, physicsClientId=self.client)
         p.setTimeStep(1.0 / self.cfg.sim_freq_hz, physicsClientId=self.client)
         # PyBullet expects ``globalCFM`` (solver-wide CFM); there is no ``contactCFM`` kwarg.
@@ -429,6 +440,14 @@ class TyroEnv(gym.Env):
         # Park both robots at HOME — Robot A is NOT yet grasping the tire.
         self.robot_A.reset_to_home()
         self.robot_B.reset_to_home()
+
+        # Cache the canonical HOME EE pose of Robot A *before* any
+        # curriculum easy-start teleports the arm. The 6-stage remount
+        # cycle (S2) retracts the empty gripper back to this pose after
+        # releasing the freshly-mounted tire.
+        _home_ee_pos, _home_ee_quat = self.robot_A.ee_pose()
+        self._home_ee_pos = np.asarray(_home_ee_pos, dtype=np.float64).copy()
+        self._home_ee_quat = np.asarray(_home_ee_quat, dtype=np.float64).copy()
 
         # Stage 0 starting-pose curriculum. Two operating modes
         # (``cfg.start_pos_curriculum_mode``):
@@ -1450,6 +1469,31 @@ class TyroEnv(gym.Env):
             and self._grasp_t_ee_tire_quat is not None
         )
 
+        # 6-stage remount cycle (opt-in). Remap the inserted stages onto
+        # the legacy pose generators:
+        #   S2 (retract) → empty-handed HOME EE pose (handled inline below).
+        #   S3 (regrip)  → same EE pose that grasps the hub-mounted tire
+        #                  (== legacy Stage 1 mount end pose).
+        #   S4 (demount) → legacy Stage 2 pull-off pose.
+        #   S5 (return)  → legacy Stage 3 cradle-return pose.
+        if bool(getattr(self.cfg, "remount_cycle_enable", False)):
+            if stage == 2:
+                home_pos = getattr(self, "_home_ee_pos", None)
+                home_quat = getattr(self, "_home_ee_quat", None)
+                if home_pos is not None and home_quat is not None:
+                    return (
+                        np.asarray(home_pos, dtype=np.float64).copy(),
+                        np.asarray(home_quat, dtype=np.float64).copy(),
+                    )
+                # Fallback: FK of the canonical rest pose is unavailable
+                # here, so hold at the current EE (no-op retract).
+                cur_pos, cur_quat = self.robot_A.ee_pose()
+                return (
+                    np.asarray(cur_pos, dtype=np.float64),
+                    np.asarray(cur_quat, dtype=np.float64),
+                )
+            stage = {3: 1, 4: 2, 5: 3}.get(int(stage), int(stage))
+
         if stage == 0:
             tire_p = np.asarray(self.cfg.tire_pickup_pos, dtype=np.float64)
             end_pos = tire_p + np.array([0.0, 0.0, -R], dtype=np.float64)
@@ -1695,7 +1739,12 @@ class TyroEnv(gym.Env):
         # at trajectory start. ``planner_yaw_front_load_k <= 1.0``
         # disables the warp (linear SLERP fallback).
         front_load_k = 0.0
-        if int(self.task_stage) in (1, 3):
+        # Carry (+X→−Y) and return (−Y→+X) legs need the 90° yaw front-
+        # loaded. In the 6-stage cycle the return leg is Stage 5.
+        _front_load_stages = (1, 5) if bool(
+            getattr(self.cfg, "remount_cycle_enable", False)
+        ) else (1, 3)
+        if int(self.task_stage) in _front_load_stages:
             front_load_k = float(getattr(
                 self.cfg, "planner_yaw_front_load_k", 2.5,
             ))
@@ -2189,7 +2238,9 @@ class TyroEnv(gym.Env):
         events: Dict[str, Any] = {
             "picked_up": False, "mounted": False,
             "demounted": False, "landed": False,
+            "retracted": False, "regripped": False,
         }
+        remount = bool(getattr(self.cfg, "remount_cycle_enable", False))
         ee_pos, _ = self.robot_A.ee_pose()
         tire_pos, _ = self.scene.tire_pose()
         ee_pos = np.asarray(ee_pos, dtype=np.float64)
@@ -2242,16 +2293,119 @@ class TyroEnv(gym.Env):
                 self.task_stage = 2
                 self._mount_done_step = int(self._step_count)
                 events["mounted"] = True
-                hold_steps = int(getattr(self.cfg, "mount_hold_steps", 0))
-                term_on = str(getattr(self.cfg, "terminate_on", "never")).lower()
-                if hold_steps > 0 and term_on == "mount":
-                    self._begin_mount_hold()
-                elif bool(getattr(self.cfg, "pin_tire_on_mount", True)) and term_on == "mount":
-                    self._pin_tire_at_hub_mount()
+                if remount:
+                    # 6-stage cycle: seat + bond the tire to the hub and
+                    # freeze the arm holding it while "Robot B tightens the
+                    # nuts" (W1). After the hold elapses (handled in the
+                    # Stage-2 block below) the grasp is released and the
+                    # empty gripper retracts to HOME.
+                    self._attach_tire_to_hub()
+                    self._grasp_kinematic = False
+                    self._mount_frozen_q, _ = self.robot_A.joint_state()
+                    self._mount_hold_left = int(
+                        getattr(self.cfg, "tighten_hold_steps", 0)
+                    )
+                    self._mount_hold_finish_term = False
+                else:
+                    hold_steps = int(getattr(self.cfg, "mount_hold_steps", 0))
+                    term_on = str(getattr(self.cfg, "terminate_on", "never")).lower()
+                    if hold_steps > 0 and term_on == "mount":
+                        self._begin_mount_hold()
+                    elif bool(getattr(self.cfg, "pin_tire_on_mount", True)) and term_on == "mount":
+                        self._pin_tire_at_hub_mount()
                 self._prev_d_approach = None
                 self._prev_d_return = None
                 # v11: reset Stage 2 PB shaping accumulator.
                 self._prev_d_hub = None
+
+        elif self.task_stage == 2 and remount:
+            # 6-stage cycle S2 — empty-handed retract to HOME after W1.
+            # ``step()`` decrements ``_mount_hold_left`` and freezes the arm
+            # while the hold is active; once it elapses we release the grasp
+            # (tire stays bonded to the hub) and let the planner drive the
+            # empty gripper back to the cached HOME EE pose.
+            if self._mount_hold_left <= 0:
+                if not self._retract_release_done:
+                    self._release_grasp()
+                    self._retract_release_done = True
+                    # Replan now (task_stage == 2 → HOME end pose) so the
+                    # planner pulls the empty arm away from the hub.
+                    self._replan_for_current_stage()
+                home = getattr(self, "_home_ee_pos", None)
+                if home is not None:
+                    d_home = float(np.linalg.norm(ee_pos - np.asarray(home, dtype=np.float64)))
+                    if (d_home < float(getattr(self.cfg, "home_return_radius_tol", 0.12))
+                            and not self._retract_bonus_paid):
+                        self._retract_bonus_paid = True
+                        self.task_stage = 3
+                        events["retracted"] = True
+                        self._prev_d_approach = None
+                        self._prev_d_return = None
+
+        elif self.task_stage == 3 and remount:
+            # 6-stage cycle S3 — re-approach + re-grip the hub-mounted tire.
+            # The tire sits at ``tire_mount_pos`` (bore ‖ hub axis); its
+            # 6 o'clock outer point is the grasp anchor. On contact we bond
+            # the tire back to the EE, release the hub bond and start the
+            # W2 loosen hold.
+            grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
+            if (float(np.linalg.norm(ee_pos - grasp_target))
+                    < float(getattr(self.cfg, "regrip_radius_tol", 0.10))
+                    and not self._regrip_bonus_paid):
+                self._create_grasp_constraint_in_place(force_fixed=True)
+                self._release_hub_mount()
+                self._regrip_bonus_paid = True
+                self.task_stage = 4
+                events["regripped"] = True
+                # Hold steady while "Robot B loosens the nuts" (W2).
+                self._grasp_kinematic = False
+                self._mount_frozen_q, _ = self.robot_A.joint_state()
+                self._mount_hold_left = int(getattr(self.cfg, "loosen_hold_steps", 0))
+                self._mount_hold_finish_term = False
+                self._mount_done_step = int(self._step_count)
+                self._prev_d_approach = None
+                self._prev_d_return = None
+                self._prev_d_hub = None
+
+        elif self.task_stage == 4 and remount:
+            # 6-stage cycle S4 — demount: after W2, pull the tire clear of
+            # the hub along the hub axis.
+            if self._mount_hold_left <= 0:
+                if not self._demount_replan_done:
+                    # Replan toward the demount pull-off pose once W2 ends.
+                    self._replan_for_current_stage()
+                    self._demount_replan_done = True
+                hub_pos, _ = self.scene.hub_pose()
+                d_hub = float(np.linalg.norm(
+                    tire_pos - np.asarray(hub_pos, dtype=np.float64)
+                ))
+                if (d_hub > float(self.cfg.demount_axial_distance)
+                        and not self._demount_bonus_paid):
+                    self._demount_bonus_paid = True
+                    self.task_stage = 5
+                    events["demounted"] = True
+                    self._prev_d_approach = None
+                    self._prev_d_return = None
+
+        elif self.task_stage == 5 and remount:
+            # 6-stage cycle S5 — carry to the rack + soft landing (success).
+            d_return = float(np.linalg.norm(tire_pos - self._pickup_pos_world))
+            lin_vel, _ = p.getBaseVelocity(
+                self.handles.tire, physicsClientId=self.client,
+            )
+            descend_speed = abs(float(lin_vel[2]))
+            landed = (
+                d_return < float(getattr(
+                    self.cfg, "rack_return_radius_tol",
+                    self.cfg.return_radius_tol,
+                ))
+                and descend_speed < self.cfg.landing_speed_max
+            )
+            if landed:
+                self._release_grasp()
+                _, cur_orn = self.scene.tire_pose()
+                self._pin_tire_to_world(tire_pos, cur_orn)
+                events["landed"] = True
 
         elif self.task_stage == 2:
             # v6 demount: tire must travel ≥ ``demount_axial_distance`` away
@@ -2300,10 +2454,21 @@ class TyroEnv(gym.Env):
         # is the terminal event and needs no replan (episode is over).
         skip_mount_replan = (
             events.get("mounted")
-            and int(getattr(self.cfg, "mount_hold_steps", 0)) > 0
-            and str(getattr(self.cfg, "terminate_on", "never")).lower() == "mount"
+            and (
+                # In the 6-stage cycle the arm is frozen holding during the
+                # W1 tighten hold; the replan toward HOME is issued inline
+                # when the hold elapses (Stage-2 block above).
+                remount
+                or (
+                    int(getattr(self.cfg, "mount_hold_steps", 0)) > 0
+                    and str(getattr(self.cfg, "terminate_on", "never")).lower() == "mount"
+                )
+            )
         )
-        if events.get("picked_up") or events.get("demounted"):
+        # ``retracted`` (S2 → S3) needs a fresh plan toward the regrip
+        # anchor. ``demounted`` toward the rack-return / pull-off pose.
+        if (events.get("picked_up") or events.get("demounted")
+                or events.get("retracted")):
             self._replan_for_current_stage()
         elif events.get("mounted") and not skip_mount_replan:
             self._replan_for_current_stage()
@@ -2919,8 +3084,43 @@ class TyroEnv(gym.Env):
         # gradient as the EE / tire close in on the goal. The PB term is
         # ``w_pb * (prev_d - curr_d)``; positive when progressing.
         pb_step = 0.0
+        remount = bool(getattr(self.cfg, "remount_cycle_enable", False))
+        ts = int(self.task_stage)
 
-        if self.task_stage == 0:
+        if remount and ts == 2:
+            # 6-stage S2 — retract empty gripper toward HOME. Reuse the
+            # bounded return kernel (slot ``return_A``) keyed on the
+            # EE→HOME distance so the policy is rewarded for pulling the
+            # arm clear of the hub after releasing the mounted tire.
+            home = getattr(self, "_home_ee_pos", None)
+            d_home = (
+                float(np.linalg.norm(ee_pos - np.asarray(home, dtype=np.float64)))
+                if home is not None else 0.0
+            )
+            decay = max(float(rcfg.return_decay), 1e-3)
+            b.return_A = float(rcfg.w_return) * float(np.exp(-d_home / decay))
+            b.d_return = d_home
+            if self._prev_d_return is not None and rcfg.w_pb_return > 0.0:
+                pb_step = float(rcfg.w_pb_return) * float(self._prev_d_return - d_home)
+            self._prev_d_return = d_home
+            b.align_A = 0.0
+            b.approach_A = 0.0
+            b.d_approach = 0.0
+        elif remount and ts == 3:
+            # 6-stage S3 — re-approach the hub-mounted tire's 6 o'clock
+            # grasp anchor. Reuse the Stage-0 approach kernel.
+            grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
+            d_approach = float(np.linalg.norm(ee_pos - grasp_target))
+            decay = max(float(rcfg.approach_decay), 1e-3)
+            b.approach_A = float(rcfg.w_approach) * float(np.exp(-d_approach / decay))
+            b.d_approach = d_approach
+            if self._prev_d_approach is not None and rcfg.w_pb_approach > 0.0:
+                pb_step = float(rcfg.w_pb_approach) * float(
+                    self._prev_d_approach - d_approach
+                )
+            self._prev_d_approach = d_approach
+            b.align_A = 0.0
+        elif self.task_stage == 0:
             # Stage 0 — approach: shape UR10 EE toward the tire's 6 o'clock outer point.
             grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
             d_approach = float(np.linalg.norm(ee_pos - grasp_target))
@@ -2978,9 +3178,10 @@ class TyroEnv(gym.Env):
             b.align_A = 0.0
             b.approach_A = 0.0
             b.d_approach = 0.0
-        elif self.task_stage == 2:
+        elif self.task_stage == 2 or (remount and ts == 4):
             # Stage 2 — demount: reward GROWING distance from hub centre
             # so the policy axially pulls the tire clear of the studs.
+            # (6-stage cycle: S4 reuses this kernel after the W2 hold.)
             # Kernel: r = w_pull * (1 - exp(-d_hub / pull_decay))
             #   d_hub = 0    →  0.0
             #   d_hub = τ    →  ~0.63 · w_pull
@@ -3054,6 +3255,14 @@ class TyroEnv(gym.Env):
             b.fsm_bonus += float(rcfg.R_pickup)
         if fsm_events.get("mounted"):
             b.fsm_bonus += float(rcfg.R_mount)
+        # 6-stage cycle intermediate bonuses (fall back to mount/pickup
+        # magnitudes when dedicated fields are not set).
+        if fsm_events.get("retracted"):
+            b.fsm_bonus += float(getattr(rcfg, "R_retract",
+                                         getattr(rcfg, "R_mount", 0.0)))
+        if fsm_events.get("regripped"):
+            b.fsm_bonus += float(getattr(rcfg, "R_regrip",
+                                         getattr(rcfg, "R_pickup", 0.0)))
         if fsm_events.get("demounted"):
             b.fsm_bonus += float(getattr(rcfg, "R_demount", 0.0))
         if fsm_events.get("landed"):
@@ -3078,8 +3287,14 @@ class TyroEnv(gym.Env):
         # penalty over the entire return leg, drowning out the
         # ``return_A`` shaping signal and leaving no learnable gradient
         # toward the cradle landing.
+        # The "cradle-return" stage is Stage 3 in the legacy FSM and
+        # Stage 5 in the 6-stage remount cycle. Likewise, every stage where
+        # the tire is held bore-aligned to the hub (carry/mount/retract/
+        # regrip/demount) must waive the vertical penalty.
+        return_stage = 5 if remount else 3
+        hub_aligned_stages = (1, 2, 3, 4) if remount else (1, 2)
         stage3_gate_on = True
-        if self.task_stage == 3:
+        if self.task_stage == return_stage:
             tire_pos_pen, _ = self.scene.tire_pose()
             d_cradle_pen = float(np.linalg.norm(
                 np.asarray(tire_pos_pen, dtype=np.float64)
@@ -3088,7 +3303,7 @@ class TyroEnv(gym.Env):
             stage3_gate_on = d_cradle_pen < float(getattr(
                 self.cfg, "stage3_vertical_gate_radius", 0.20,
             ))
-        if self.task_stage in (1, 2) or not stage3_gate_on:
+        if self.task_stage in hub_aligned_stages or not stage3_gate_on:
             b.vertical_pen = 0.0
         else:
             b.vertical_pen = -rcfg.w_vertical * float(vertical_err ** 2)

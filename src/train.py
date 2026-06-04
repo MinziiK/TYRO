@@ -1143,6 +1143,27 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--remount-cycle",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "remount_cycle_enable", False)),
+        help=(
+            "Full 6-stage Robot-A duty cycle: pick → mount → (W1 tighten) "
+            "release+retract to HOME → re-grip hub tire → (W2 loosen) "
+            "demount → carry to rack. Use with --terminate-on never and a "
+            "larger --max-steps (~1000). Off = legacy 4-stage FSM."
+        ),
+    )
+    ap.add_argument(
+        "--tighten-hold-steps", type=int,
+        default=int(getattr(_cfg_defaults, "tighten_hold_steps", 40)),
+        help="6-stage cycle W1 hold (steps) the arm holds after mount.",
+    )
+    ap.add_argument(
+        "--loosen-hold-steps", type=int,
+        default=int(getattr(_cfg_defaults, "loosen_hold_steps", 40)),
+        help="6-stage cycle W2 hold (steps) the arm holds after re-grip.",
+    )
+    ap.add_argument(
         "--use-planner-residual",
         action=argparse.BooleanOptionalAction,
         default=bool(getattr(_cfg_defaults, "use_planner_residual", True)),
@@ -1312,6 +1333,9 @@ def main() -> int:
         )
         overrides["terminate_on_pickup"] = bool(args.terminate_on_pickup)
         overrides["terminate_on"] = str(args.terminate_on)
+        overrides["remount_cycle_enable"] = bool(args.remount_cycle)
+        overrides["tighten_hold_steps"] = int(args.tighten_hold_steps)
+        overrides["loosen_hold_steps"] = int(args.loosen_hold_steps)
         overrides["use_planner_residual"] = bool(args.use_planner_residual)
         overrides["attached_spawn_when_easy"] = bool(args.attached_spawn_when_easy)
         overrides["max_steps"] = int(args.max_steps)

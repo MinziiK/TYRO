@@ -947,6 +947,33 @@ class EnvConfig:
     #: descent speed < ``landing_speed_max`` (soft landing).
     return_radius_tol: float = 0.05
     landing_speed_max: float = 0.10
+
+    # ------------------------------------------------------------------
+    # **2026-06-05 — Full remount cycle (6-stage FSM).** OPT-IN extension
+    # of the 4-stage FSM that matches the complete Robot-A duty cycle:
+    #   S0 pick → S1 mount → S2 (hold W1=tighten) release+retract to HOME
+    #   → S3 re-approach + re-grip the hub tire → S4 (hold W2=loosen)
+    #   demount → S5 carry to rack + land.
+    # When ``remount_cycle_enable`` is False (default) the legacy 4-stage
+    # FSM (pick→mount→demount→return) is used unchanged so existing
+    # training/checkpoints are unaffected.
+    # ------------------------------------------------------------------
+    #: Master switch for the 6-stage pick→mount→retract→regrip→demount→return
+    #: cycle. Production full-task runs set this True with ``terminate_on=never``.
+    remount_cycle_enable: bool = False
+    #: W1 — steps the arm holds the tire seated on the hub after mount
+    #: ("Robot B tightening the nuts") before releasing + retracting to HOME.
+    #: 40 ≈ 2 s at 20 Hz.
+    tighten_hold_steps: int = 40
+    #: W2 — steps the arm holds the re-gripped hub tire ("Robot B loosening
+    #: the nuts") before pulling it off the hub. 40 ≈ 2 s at 20 Hz.
+    loosen_hold_steps: int = 40
+    #: S2 retract gate — EE must come within this of the HOME EE pose for the
+    #: empty-handed retract (S2 → S3) to fire.
+    home_return_radius_tol: float = 0.12
+    #: S3 regrip gate — EE must come within this of the hub-mounted tire's
+    #: 6-o'clock grasp anchor for the re-grip (S3 → S4) to fire.
+    regrip_radius_tol: float = 0.10
     #: Vertical tolerance applied only in Stages 0 / 2 (pickup pose +
     #: post-landing pose). Episodes terminate (penalty) when the tire's
     #: bore axis deviates from ``tire_spawn_axis_world`` by more than

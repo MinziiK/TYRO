@@ -1,9 +1,13 @@
 # TYRO — 듀얼암 타이어 마운팅 학습 환경
 
-UR10 (Robot A) + Franka Panda (Robot B) 두 팔이 트럭 휠 허브에 타이어를 끼우는
-PyBullet 시뮬레이션 환경과 PPO 학습 파이프라인입니다. 현재 **Phase 1** —
-UR10이 타이어를 픽업해 허브에 마운트하고 다시 거치대로 복귀시키는 단일 로봇
-시퀀스를 학습합니다 (Panda는 HOME에 동결).
+두 팔이 트럭 휠 허브에 타이어를 끼우는 PyBullet 시뮬레이션 환경과 PPO 학습
+파이프라인입니다. **운영 레이아웃은 FANUC R-2000iC (Robot A) + UR10e (Robot B)**
+(`--scene-layout fanuc_spacious`, Robot B base = 원점). 레거시 기본 레이아웃은
+UR10 (A) + Franka Panda (B) 입니다.
+
+현재 **Phase 1** — Robot A가 타이어를 픽업해 허브에 마운트하는 단일 로봇 시퀀스를
+학습합니다 (Robot B는 HOME에 동결). 마운트 후 빈손 HOME 복귀 → 재파지 → 분리 →
+거치까지 도는 **6단계 풀사이클**은 `--remount-cycle`로 켤 수 있습니다 (아래 참조).
 
 - 시뮬레이터: PyBullet, 240 Hz physics / 20 Hz control
 - 좌표계: **Robot B (Panda) base 중심** — 모든 절대 좌표가 Panda 베이스 기준
@@ -30,6 +34,60 @@ conda activate tyro
 
 pip install -r requirements.txt
 ```
+
+### ⚠️ 메시(mesh) 받기 — 필수
+
+이 저장소에는 **로봇 STL/DAE 메시가 포함돼 있지 않습니다** (`.gitignore` 제외).
+FANUC R-2000iC / UR10e URDF가 `../fanuc_ros`, `../ur_ros` 의 메시를 참조하므로
+새 머신(서버 포함)에서는 ROS-Industrial 저장소를 **반드시** 먼저 클론해야 합니다.
+안 하면 로봇 로드 단계에서 실패합니다.
+
+```bash
+python scripts/poc_fanuc_urdf.py --fetch     # FANUC R-2000iC 메시 (data/urdf/fanuc_ros)
+python scripts/fetch_ur10e.py --fetch          # UR10e 메시 (data/urdf/ur_ros)
+```
+
+> GPU 서버라면 CUDA용 torch로 재설치:
+> `pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu121`
+
+---
+
+## 🚀 서버에서 시작하기 (Quickstart)
+
+리눅스 서버 기준 0 → 학습까지 한 번에:
+
+```bash
+# 1) 코드 + 환경
+git clone https://github.com/MinziiK/TYRO.git && cd TYRO
+conda create -n tyro python=3.10 -y && conda activate tyro
+pip install -r requirements.txt
+pip install --force-reinstall torch --index-url https://download.pytorch.org/whl/cu121  # GPU
+
+# 2) 메시 fetch (필수)
+python scripts/poc_fanuc_urdf.py --fetch
+python scripts/fetch_ur10e.py --fetch
+
+# 3) 로드/물리 검증 (학습 전 1회)
+python scripts/check_all_phases_feasible.py        # IK 도달성
+python scripts/check_dynamic_feasibility.py        # 리셋·S0~S3 충돌/추종
+
+# 4-a) 4단계(픽업→마운트) 학습 — 가장 빠르게 수렴 (기본)
+python -m src.train --stage 3 --phase 1 --scene-layout fanuc_spacious \
+  --num-envs 12 --total-steps 2000000 --device cuda --run-name phase1_mount
+
+# 4-b) 6단계 풀사이클(픽업→마운트→복귀→재파지→디마운트→거치) 학습
+python scripts/check_remount_cycle.py              # 먼저 6단계 기구 검증
+python -m src.train --stage 3 --phase 1 --scene-layout fanuc_spacious \
+  --remount-cycle --terminate-on never --max-steps 1000 \
+  --num-envs 12 --total-steps 5000000 --device cuda --run-name phase1_fullcycle
+
+# 5) 모니터링 / 회수
+tensorboard --logdir runs/ --port 6006             # success_rate, ik_residual 등
+#   체크포인트: runs/<run-name>/best/ , final.zip → scp/rsync 로 회수
+```
+
+리눅스에서는 `scripts/train.ps1`(Windows 전용) 대신 위의 `python -m src.train ...`
+명령을 직접 사용합니다. 토크를 키우려면 `--fanuc-torque-scale 1.5` 등을 추가합니다.
 
 ---
 
@@ -149,6 +207,34 @@ TYRO/
 | `pickup` | Stage 0 → 1 전이 (R_pickup 지급 후) | Stage 0 단독 학습 / 디버깅 |
 | `mount` (**2026-06-01 기본**) | Stage 1 → 2 전이 | Mount-only / 플래너+잔차 초기 학습 |
 | `demount` | Stage 2 → 3 전이 | 디마운트 분리 학습 |
+
+### Phase 1 — 6단계 풀사이클 (`--remount-cycle`, 2026-06-05)
+
+기본 4단계 FSM은 타이어를 **계속 잡은 채** 픽업→마운트→디마운트→복귀를 돕니다.
+실제 Robot A의 전체 작업(타이어 장착 후 **빈손으로 HOME 복귀**, 너트 체결 대기,
+다시 와서 **재파지**, 너트 풀기 대기, 분리 후 거치)을 그대로 모사하려면
+`remount_cycle_enable=True` (CLI `--remount-cycle`)로 **6단계 FSM**을 켭니다.
+기존 4단계 학습/체크포인트는 그대로 유지됩니다 (플래그 OFF가 기본).
+
+| Stage | 동작 | 그랩/본드 | 대기 | 전이 게이트 |
+|---|---|---|---|---|
+| **0** PICK | HOME → 거치대 타이어 파지 | → grasp | — | `‖EE − grasp_target‖ < approach_tol` |
+| **1** MOUNT | 운반 → 허브 삽입 | grasp → 허브 본드 | — | `‖tire − hub‖ < mount_tol` AND `θ < δ_A` |
+| **2** RETRACT | (**W1** 너트체결) 그랩 해제 → 빈손 HOME 복귀 | release | `tighten_hold_steps` | `‖EE − HOME‖ < home_return_radius_tol` |
+| **3** REGRIP | HOME → 허브 타이어 재파지 | → regrasp, 허브 본드 해제 | — | `‖EE − grasp_target‖ < regrip_radius_tol` |
+| **4** DEMOUNT | (**W2** 너트풀기) 허브에서 분리 | grasp | `loosen_hold_steps` | `d_hub > demount_axial_distance` |
+| **5** RETURN | 거치대로 운반 → 안착 (성공) | → release | — | `‖tire − pickup‖ < rack_return_radius_tol` AND `|v_z| < landing_speed_max` |
+
+- 이벤트: `picked_up → mounted → retracted → regripped → demounted → landed`.
+  `retracted`/`regripped`는 sparse 보너스(`R_retract`/`R_regrip`, 기본 R_mount/R_pickup 폴백) 지급.
+- W1(체결)·W2(풀기) 대기는 팔을 그 자리에 고정(`_mount_hold_left` freeze/clamp 재사용)하고
+  타이어를 시트 포즈에 클램프 — Robot B가 너트를 조이고/푸는 시간을 모사.
+- HOME EE 포즈는 reset 직후 캐싱(`_home_ee_pos`) → S2 빈손 복귀 목표.
+- vertical-pose 패널티는 보어가 허브축에 정합된 S1~S4에서 면제, S5(거치 복귀)에서만 게이트.
+- **권장 설정**: `--terminate-on never --max-steps 1000` (6단계 ≈ 680+α 스텝 필요).
+  먼저 4단계 mount를 수렴시킨 체크포인트를 `--resume`으로 이어 6단계로 확장하면 안정적.
+- 검증: `python scripts/check_remount_cycle.py` — attached hot-start(S1)에서 시작해
+  zero-residual 베이크 플래너로 S1→S5 전 구간 전이/그랩 생명주기/접촉력을 감사.
 
 ### 픽업 게이트 타임스텝 커리큘럼 (opt-in)
 
