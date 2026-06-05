@@ -614,10 +614,10 @@ class UR10Robot(Robot):
         which keeps bond reaction forces in the physically expected
         range (a few N for the 0.5 kg tire).
 
-        The post-step ``enforce_palm_up_wrists`` safety net (called
-        from ``TyroEnv.step``) handles the rare case where PD
-        undershoots and the achieved wrist values drift off the
-        palm-up manifold.
+        The post-step ``enforce_palm_up_pose`` safety net (called from
+        ``TyroEnv.step`` via ``_enforce_robot_a_palm_up``) handles the
+        rare case where PD undershoots and the achieved tool axis drifts
+        off the palm-up manifold.
         """
         target_pos = np.asarray(pos, dtype=np.float64).reshape(3)
         target_orn = list(self.FINAL_LOCK_QUATERNION)
@@ -682,66 +682,6 @@ class UR10Robot(Robot):
 
         self.drive_arm_targets(arm_targets)
 
-    def enforce_palm_up_wrists(self, tool_z_threshold: float = 0.999) -> None:
-        """Geometric safety net: snap wrist_1/2/3 to the palm-up formula
-        ONLY when the IK-driven gripper has drifted off the palm-up
-        manifold by more than ``acos(tool_z_threshold)`` (default ≈ 2.5°).
-
-        ``tool_z_threshold`` is the dot product of the gripper's tool +Z
-        axis with the world +Z axis; 1.0 = perfectly palm-up, 0.999 =
-        ~2.5° tilt. Most steps will be inside the threshold (IK with
-        HOME warm-start typically holds palm-up to numerical precision),
-        so the wrist override almost never fires — meaning
-        ``JOINT_FIXED`` rigid grasp + IK position accuracy work
-        normally and the tire is physically held upright by the bond.
-        On the rare step where IK saturates and palm-up slips, this
-        method snaps the wrists back via
-        ``resetJointState`` (with ``JOINT_FIXED`` the tire snaps with
-        them; the resulting physics impulse is small because the
-        deviation was small to begin with).
-        """
-        ee_pos, ee_orn = self.ee_pose()
-        R = np.array(p.getMatrixFromQuaternion(list(ee_orn))).reshape(3, 3)
-        tool_z_dot_world_z = float(R[2, 2])
-        if tool_z_dot_world_z >= tool_z_threshold:
-            return  # palm-up is healthy; do nothing.
-
-        states = p.getJointStates(
-            self.uid, self.arm.indices, physicsClientId=self.client,
-        )
-        q = np.array([s[0] for s in states], dtype=np.float64)
-        lift = float(q[1])
-        elbow = float(q[2])
-        w1 = float(np.clip(
-            -math.pi / 2.0 - lift - elbow,
-            float(self.arm.lower[3]), float(self.arm.upper[3]),
-        ))
-        w2 = float(np.clip(
-            0.0, float(self.arm.lower[4]), float(self.arm.upper[4]),
-        ))
-        w3 = float(np.clip(
-            -math.pi / 2.0,
-            float(self.arm.lower[5]), float(self.arm.upper[5]),
-        ))
-        for slot, val in zip((3, 4, 5), (w1, w2, w3)):
-            p.resetJointState(
-                self.uid,
-                self.arm.indices[slot],
-                targetValue=float(val),
-                targetVelocity=0.0,
-                physicsClientId=self.client,
-            )
-        wrist_indices = [self.arm.indices[s] for s in (3, 4, 5)]
-        p.setJointMotorControlArray(
-            self.uid, wrist_indices,
-            controlMode=p.POSITION_CONTROL,
-            targetPositions=[w1, w2, w3],
-            forces=[60.0, 60.0, 60.0],
-            positionGains=[1.0, 1.0, 1.0],
-            velocityGains=[1.0, 1.0, 1.0],
-            physicsClientId=self.client,
-        )
-
     def enforce_palm_up_pose(
         self,
         tool_z_threshold: float = 0.999,
@@ -769,9 +709,9 @@ class UR10Robot(Robot):
         the reachable carry and degrades to best-effort (no jump) exactly at
         the saturated insertion point.
 
-        Unlike :pymeth:`enforce_palm_up_wrists` (UR-specific closed-form
-        wrist projection) this is IK-based, so it is correct for the FANUC
-        arm (whose wrist kinematics differ) as well.
+        This is IK-based (re-solve at the achieved EE position with a
+        palm-up target), so it is correct for the FANUC arm regardless of
+        its wrist kinematics — no closed-form wrist formula required.
         """
         ee_pos, ee_orn = self.ee_pose()
         ee_pos = np.asarray(ee_pos, dtype=np.float64)
@@ -1255,9 +1195,6 @@ class FanucR2000icRobot(UR10Robot):
     def apply_palm_up_pose(self, pos, target_orn, warm_q=None) -> None:
         orn = target_orn if target_orn is not None else self.FINAL_LOCK_QUATERNION
         self.apply_absolute_ee(pos, orn)
-
-    def enforce_palm_up_wrists(self, tool_z_threshold: float = 0.999) -> None:
-        return
 
 
 def make_robot_b(client: int, cfg: EnvConfig) -> Robot:

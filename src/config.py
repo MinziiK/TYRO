@@ -1944,7 +1944,9 @@ def make_reward_config(stage: int, phase: int = 1) -> RewardConfig:
 
     Stage 1 — per-robot tasks only (align_A + reach_B).
     Stage 2 — + cooperation + UR10 cooperative sync penalty.
-    Stage 3 — + success bonus + collision/action/jerk penalties (full dense).
+    Stage 3 — + success bonus + action/jerk penalties (full dense).
+    Collision + workspace penalties are active in EVERY stage as of
+    2026-06-06 (see the note below; previously zeroed in stages 1/2).
     Stage 4 — add potential shaping (``shape_A/B``). By default the absolute
         distance penalty (``align_A + reach_B``) is *kept* as a dense baseline
         (Solution A: ``r = (Φ_t − Φ_{t−1}) − w · d``) — toggle off via
@@ -1956,20 +1958,26 @@ def make_reward_config(stage: int, phase: int = 1) -> RewardConfig:
     self-termination. phase ≥ 2 keeps the original weights (joint training).
     """
     rc = RewardConfig()
+    # **2026-06-06 (collision/workspace weights restored in stages 1/2)** —
+    # these used to be zeroed because, when ``collision_terminates=True``, a
+    # negative collision penalty plus collision-termination let the policy
+    # *escape* the negative dense baseline by deliberately crashing (the
+    # "self-termination" exploit). With ``collision_terminates=False`` (default
+    # now) a collision never ends the episode, so the penalty can no longer be
+    # gamed for self-termination — it only shapes the policy AWAY from hitting
+    # geometry. Keeping the default ``w_collision``/``w_workspace`` therefore
+    # gives the warmup stages real collision awareness with no downside.
+    # (Production pipeline uses stage 3, which already had these on.)
     if stage == 1:
         rc.w_c = 0.0
         rc.w_sync_joint_a = 0.0
         rc.R_success = 0.0
-        rc.w_collision = 0.0
-        rc.w_workspace = 0.0
         rc.w_action = 0.0
         rc.w_jerk = 0.0
         rc.mix_sparse_success = 0.0
         rc.mix_dense = 1.0
     elif stage == 2:
         rc.R_success = 0.0
-        rc.w_collision = 0.0
-        rc.w_workspace = 0.0
         rc.w_action = 0.0
         rc.w_jerk = 0.0
         rc.mix_sparse_success = 0.0

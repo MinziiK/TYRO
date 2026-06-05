@@ -194,7 +194,9 @@ TYRO/
 - Stage 1에서는 vertical-pose 패널티 면제 (보어 정합을 위한 자유 회전 허용)
 - Stage 2 디마운트는 마운트 후 `demount_stall_steps` 스톨 동안 `d_hub` 게이트가
   비활성화 — 가상 fastener-release 인터벌
-- 실패 종료 (충돌·workspace·contact-force) 시 `R_fail = −50` 일회성
+- 실패 종료 (workspace 이탈·contact-force 손상) 시 `R_fail = −50` 일회성.
+  **충돌은 기본적으로 종료시키지 않음**(`collision_terminates=False`) — per-step
+  `w_collision` 페널티만 부과 (위 "Phase 1 핵심 결정" 표 참조)
 
 ### terminate_on — 조기 종료 게이트
 
@@ -405,7 +407,7 @@ Stage 2(디마운트)·Stage 3(복귀) 코드는 env에 그대로 있으나, 위
 | `HOME_POSE` | palm-up cradle | 이전 HOME이 타이어 bore 내부(접촉력 즉시 종료) |
 | `apply_delta_ee` | `last_target_pos` 누적 (측정 EE 비누적) | 중력 sag가 IK 목표를 매 step 끌어내려 drift |
 | joint `forces` | 400/400/300/60/60/60 N·m | uniform 150 N·m → shoulder sag |
-| `collision_terminates` | True (플래너 모드) | 명목 궤적이 충돌-free이면 접촉 = 정책 오류 |
+| `collision_terminates` | **False** (기본) | 충돌은 **per-step 페널티(`w_collision`)만** 부과, 에피소드 종료 안 함. 명목 궤적이 충돌-free이므로 접촉은 정책 오류지만, 종료시키면 보상 baseline을 일부러 충돌해 탈출하는 "self-termination" 익스플로잇이 생겨 종료 대신 누적 페널티로 회피를 학습시킴 |
 | grasp 중 contact-force | tire↔UR10 제외 | JOINT_FIXED 의도 접촉이 step-1 kill 방지 |
 
 ---
@@ -565,6 +567,10 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 - **Robot B**: `ur10e_with_nut_tool.urdf` — 30 cm 소켓, EE=`tool_tip`, 전 볼트 **+Y 접근** (롤 자유 6-DOF IK 전부 OK, worst 0.7 cm / 0.8°). `scripts/check_all_phases_feasible.py`가 롤 고정 1자세만 쓰던 **오탐** 수정 → 롤 스윕.
 - **Robot A 그리퍼**: planner palm-up tilt-lock(S0~S3) + **`kinematic_tire_lock_stages=(0,1,2,3)`** — 100 kg 동적 본드가 마운트 끝에서 ~51 cm 포화·~15° droop 하던 문제 제거(베이크 추종 end err 0.1 cm, median tilt 0.01°). **`fanuc_enforce_palm_up_post_step`** 로 잔여 droop 보정(EE 위치 가드).
 - **허브 마운트**: `pin_tire_on_mount` + `JOINT_FIXED` 허브 본드 **유지** — 스터드만으로도 안착은 유지되나, 체결 중 강성·결정적 시트 포즈용.
+- **충돌 정책 정정**: 기본 `collision_terminates=False` — 충돌은 **per-step `w_collision` 페널티만**, 에피소드 종료 안 함(과거 README의 "True" 표기는 오기). 종료시키면 음의 dense baseline을 일부러 충돌해 탈출하는 self-termination 익스플로잇이 생기기 때문. workspace 이탈·contact-force 손상만 `R_fail` 종료.
+- **보상 가중치(stage 1/2)**: `w_collision`/`w_workspace`를 0 → 기본값(10/5) **복원**. self-termination 익스플로잇은 `collision_terminates=False` 로 사라졌으므로 워밍업 단계도 충돌 인지를 얻음(권장 `--stage 3` 파이프라인은 원래 켜져 있었음).
+- **palm-up 후처리 충돌 가시성**: post-step palm-up 재락(`resetJointState`)은 물리 step 없이 자세만 바꿔 `getContactPoints` 캐시가 1스텝 지연됐던 문제 → 보정 발생 시 `performCollisionDetection()` 로 같은-step 갱신.
+- **죽은 코드 제거**: UR 전용 폐쇄형 손목 투영 `enforce_palm_up_wrists` 삭제(IK 기반 `enforce_palm_up_pose` 로 대체됨).
 - **학습**: layout·obs·carry 동역학 변경 → **모든 기존 ckpt OOD**. 학습 전 `check_all_phases_feasible.py` + `check_dynamic_feasibility.py` 권장.
 
 ### 2026-06-04 — "오락가락" 근본 원인 규명 + 삽입 속도 제한 (측정 기반)

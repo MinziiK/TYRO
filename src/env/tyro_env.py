@@ -1228,7 +1228,7 @@ class TyroEnv(gym.Env):
             or self._grasp_kinematic
         )
 
-    def _enforce_robot_a_palm_up(self) -> None:
+    def _enforce_robot_a_palm_up(self) -> bool:
         """Post-step: keep the FANUC gripper palm-up (tool +Z = world +Z).
 
         Snaps the arm joints back onto the palm-up manifold (yaw free) when
@@ -1237,41 +1237,47 @@ class TyroEnv(gym.Env):
         the rigid ``JOINT_FIXED`` bond is not shocked. Gated by
         ``cfg.fanuc_enforce_palm_up_post_step``. No-op when the robot lacks
         the IK-based re-lock (e.g. Panda Robot B).
+
+        Returns ``True`` iff a palm-up correction was applied. The correction
+        is a ``resetJointState`` (no ``stepSimulation``), so the contact
+        cache that ``getContactPoints`` reads is stale for the new arm pose;
+        the caller refreshes it with ``performCollisionDetection`` when this
+        returns ``True`` so the same-step collision/force gates see the
+        corrected pose instead of lagging one step.
         """
         if not bool(getattr(self.cfg, "fanuc_enforce_palm_up_post_step", False)):
-            return
+            return False
         if self.robot_A is None:
-            return
+            return False
         enforce = getattr(self.robot_A, "enforce_palm_up_pose", None)
         if enforce is None:
-            return
+            return False
         thr = float(getattr(self.cfg, "fanuc_palm_up_tool_z_threshold", 0.999))
         corrected = bool(enforce(thr))
         if not corrected:
-            return
+            return False
         # The kinematic upright sync (stage 0) re-places the tire from the EE
         # itself, so only the JOINT_FIXED bond needs an explicit re-place.
-        if self._grasp_kinematic or self._grasp_constraint is None:
-            return
-        t_pos = getattr(self, "_grasp_t_ee_tire_pos", None)
-        t_quat = getattr(self, "_grasp_t_ee_tire_quat", None)
-        if t_pos is None or t_quat is None:
-            return
-        ee_pos, ee_orn = self.robot_A.ee_pose()
-        new_pos, new_orn = p.multiplyTransforms(
-            np.asarray(ee_pos, dtype=np.float64).tolist(),
-            np.asarray(ee_orn, dtype=np.float64).tolist(),
-            np.asarray(t_pos, dtype=np.float64).tolist(),
-            np.asarray(t_quat, dtype=np.float64).tolist(),
-        )
-        p.resetBasePositionAndOrientation(
-            self.handles.tire, list(new_pos), list(new_orn),
-            physicsClientId=self.client,
-        )
-        p.resetBaseVelocity(
-            self.handles.tire, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
-            physicsClientId=self.client,
-        )
+        if not (self._grasp_kinematic or self._grasp_constraint is None):
+            t_pos = getattr(self, "_grasp_t_ee_tire_pos", None)
+            t_quat = getattr(self, "_grasp_t_ee_tire_quat", None)
+            if t_pos is not None and t_quat is not None:
+                ee_pos, ee_orn = self.robot_A.ee_pose()
+                new_pos, new_orn = p.multiplyTransforms(
+                    np.asarray(ee_pos, dtype=np.float64).tolist(),
+                    np.asarray(ee_orn, dtype=np.float64).tolist(),
+                    np.asarray(t_pos, dtype=np.float64).tolist(),
+                    np.asarray(t_quat, dtype=np.float64).tolist(),
+                )
+                p.resetBasePositionAndOrientation(
+                    self.handles.tire, list(new_pos), list(new_orn),
+                    physicsClientId=self.client,
+                )
+                p.resetBaseVelocity(
+                    self.handles.tire, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+                    physicsClientId=self.client,
+                )
+        return True
 
     def _use_tire_upright_lock(self) -> bool:
         return bool(getattr(self.cfg, "lock_tire_upright_when_grasped", True))
@@ -2594,10 +2600,19 @@ class TyroEnv(gym.Env):
 
         for _ in range(self.cfg.decimation):
             p.stepSimulation(physicsClientId=self.client)
+        palm_up_corrected = False
         if self._mount_hold_left <= 0:
-            self._enforce_robot_a_palm_up()
+            palm_up_corrected = self._enforce_robot_a_palm_up()
         if self._grasp_kinematic and self._use_kinematic_tire_sync():
             self._sync_grasped_tire_upright()
+        # The palm-up re-lock / kinematic tire sync above move bodies via
+        # resetJointState / resetBasePositionAndOrientation WITHOUT a physics
+        # step, so the contact cache is stale for the new poses. Refresh it so
+        # this step's collision/contact-force gates see the corrected world
+        # (``getClosestPoints`` checks are already pose-current; this fixes the
+        # ``getContactPoints``-based robot-link checks).
+        if palm_up_corrected:
+            p.performCollisionDetection(physicsClientId=self.client)
 
         self._step_count += 1
         if self._mount_hold_left > 0:
