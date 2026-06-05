@@ -17,8 +17,8 @@ COMMON=(
   --start-pos-easy-prob-schedule-mid 0.7
   --start-pos-easy-prob-schedule-end 0.6
   # Mount-tol curriculum: the callback re-broadcasts these every rollout
-  # from EnvConfig() defaults (which DON'T see the fanuc_spacious layout
-  # overrides), so they MUST be passed on the CLI or the soft gate reverts
+  # from EnvConfig() scalar defaults, so they MUST be passed on the CLI or
+  # the soft gate reverts
   # to an unreachable 0.30 m. 0.55 m / 45deg: wider than hard gate but
   # narrower than the 0.70 m standoff so the +Y insertion leg runs first.
   --mount-radius-soft 0.55 --mount-angle-soft-deg 45

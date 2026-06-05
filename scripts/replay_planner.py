@@ -94,7 +94,7 @@ def main() -> int:
     ap.add_argument(
         "--scene-layout",
         type=str,
-        default=None,
+        default="fanuc_spacious",
         choices=("shipping", "fanuc_spacious"),
     )
     args = ap.parse_args()

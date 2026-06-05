@@ -75,9 +75,8 @@ def report_gripper() -> None:
 
 
 def main() -> int:
-    ship = EnvConfig()
+    ship = EnvConfig(scene_layout="shipping", robot_a_kind="ur10", robot_b_kind="panda")
     sp = EnvConfig()
-    apply_fanuc_spacious_layout(sp)
     report_layout("shipping (default UR10 layout)", ship)
     report_layout("fanuc_spacious", sp)
     print("\n--- spacious vs shipping deltas ---")

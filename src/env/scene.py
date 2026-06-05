@@ -826,7 +826,7 @@ class Scene:
         )
 
     def _make_panda_stand(self) -> Optional[int]:
-        kind = str(getattr(self.cfg, "robot_b_kind", "panda")).lower()
+        kind = str(getattr(self.cfg, "robot_b_kind", "ur10e")).lower()
         if kind in ("ur10e", "ur10_e", "ur_e"):
             radius = float(getattr(self.cfg, "ur10e_stand_radius", 0.12))
             rgba = tuple(getattr(
@@ -842,7 +842,7 @@ class Scene:
         )
 
     def _make_ur10_stand(self) -> Optional[int]:
-        kind = str(getattr(self.cfg, "robot_a_kind", "ur10")).lower()
+        kind = str(getattr(self.cfg, "robot_a_kind", "fanuc_r2000ic")).lower()
         if "fanuc" in kind or "r2000" in kind:
             radius = float(getattr(self.cfg, "fanuc_stand_radius", 0.28))
             rgba = tuple(getattr(

@@ -71,36 +71,72 @@ def pos_only_reach(robot, pos, restarts=48):
     return best
 
 
-def pose_reach(robot, pos, quat, restarts=64):
-    """Full 6-DOF IK -> (best pos residual m, tool-z axis error deg)."""
+def _quat_from_z_roll(z, roll):
+    """Unit quat (x,y,z,w) whose tool +Z = ``z``, rolled ``roll`` rad about it."""
+    z = np.asarray(z, float) / max(np.linalg.norm(z), 1e-9)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(z[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x0 = np.cross(ref, z); x0 /= max(np.linalg.norm(x0), 1e-9)
+    y0 = np.cross(z, x0)
+    cr, sr = np.cos(roll), np.sin(roll)
+    xr, yr = cr * x0 + sr * y0, -sr * x0 + cr * y0
+    m = np.column_stack([xr, yr, z])
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
+    if tr > 0:
+        s = np.sqrt(tr + 1.0) * 2; w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s; y = (m[0, 2] - m[2, 0]) / s; zz = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = np.sqrt(1 + m[0, 0] - m[1, 1] - m[2, 2]) * 2; w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s; y = (m[0, 1] + m[1, 0]) / s; zz = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = np.sqrt(1 + m[1, 1] - m[0, 0] - m[2, 2]) * 2; w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s; y = 0.25 * s; zz = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = np.sqrt(1 + m[2, 2] - m[0, 0] - m[1, 1]) * 2; w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s; y = (m[1, 2] + m[2, 1]) / s; zz = 0.25 * s
+    return [x, y, zz, w]
+
+
+def pose_reach(robot, pos, axis, n_roll=16, n_seed=4):
+    """Roll-FREE 6-DOF IK -> (best pos residual m, tool-z axis error deg).
+
+    A nut-runner spins freely about the bolt axis, so the only orientation
+    constraint is that the tool +Z is anti-parallel to the bolt axis (i.e.
+    aligned with ``axis``). We sweep the free roll DOF about ``axis`` and try
+    several IK seeds, keeping the solution with the smallest pos+axis error.
+    Fixing the roll (the old behaviour) produced spurious wrist-limit FAILs.
+    """
     rng = np.random.default_rng(11)
     lo, hi = robot.arm.lower, robot.arm.upper
-    want_z = _quat_axis(quat, "z")
+    want_z = np.asarray(axis, float) / max(np.linalg.norm(axis), 1e-9)
     best_pos, best_ang = 1e9, 180.0
-    for k in range(restarts):
-        seed = (robot.arm.rest if k == 0 else rng.uniform(lo, hi)).tolist()
-        ik = p.calculateInverseKinematics(
-            robot.uid, robot.EE_LINK_INDEX,
-            np.asarray(pos, float).tolist(), np.asarray(quat, float).tolist(),
-            lowerLimits=lo.tolist(), upperLimits=hi.tolist(),
-            jointRanges=robot.arm.range.tolist(), restPoses=seed,
-            maxNumIterations=400, residualThreshold=1e-6,
-            physicsClientId=robot.client,
-        )
-        q = np.clip(np.asarray(ik, float)[robot._ik_arm_slots], lo, hi)
-        st = p.saveState(physicsClientId=robot.client)
-        for s, qq in zip(robot.arm.indices, q):
-            p.resetJointState(robot.uid, int(s), float(qq),
-                              physicsClientId=robot.client)
-        ee, eq = robot.ee_pose()
-        dp = float(np.linalg.norm(np.asarray(ee, float) - np.asarray(pos, float)))
-        got_z = _quat_axis(eq, "z")
-        ang = float(np.degrees(np.arccos(np.clip(np.dot(got_z, want_z), -1, 1))))
-        p.restoreState(st, physicsClientId=robot.client)
-        p.removeState(st, physicsClientId=robot.client)
-        # prefer solutions that satisfy orientation, then position
-        if (ang < best_ang - 1.0) or (abs(ang - best_ang) <= 1.0 and dp < best_pos):
-            best_ang, best_pos = ang, dp
+    target = np.asarray(pos, float)
+    for ri in range(n_roll):
+        quat = _quat_from_z_roll(want_z, 2 * np.pi * ri / n_roll)
+        for k in range(n_seed):
+            seed = (robot.arm.rest if k == 0 else rng.uniform(lo, hi)).tolist()
+            ik = p.calculateInverseKinematics(
+                robot.uid, robot.EE_LINK_INDEX,
+                target.tolist(), quat,
+                lowerLimits=lo.tolist(), upperLimits=hi.tolist(),
+                jointRanges=robot.arm.range.tolist(), restPoses=seed,
+                maxNumIterations=400, residualThreshold=1e-6,
+                physicsClientId=robot.client,
+            )
+            q = np.clip(np.asarray(ik, float)[robot._ik_arm_slots], lo, hi)
+            st = p.saveState(physicsClientId=robot.client)
+            for s, qq in zip(robot.arm.indices, q):
+                p.resetJointState(robot.uid, int(s), float(qq),
+                                  physicsClientId=robot.client)
+            ee, eq = robot.ee_pose()
+            dp = float(np.linalg.norm(np.asarray(ee, float) - target))
+            got_z = _quat_axis(eq, "z")
+            ang = float(np.degrees(np.arccos(np.clip(np.dot(got_z, want_z), -1, 1))))
+            p.restoreState(st, physicsClientId=robot.client)
+            p.removeState(st, physicsClientId=robot.client)
+            if dp + 0.02 * ang < best_pos + 0.02 * best_ang:
+                best_pos, best_ang = dp, ang
+        if best_pos < 0.01 and best_ang < 3.0:
+            break
     return best_pos, best_ang
 
 
@@ -174,7 +210,8 @@ def main() -> int:
 
     pr("\n" + "=" * 74)
     pr("C) PHASE 2/3 — UR10e bolt approach with ORIENTATION (nut-runner pose)")
-    pr("   tool0 +Z driven anti-parallel to bolt axis; ang=tool-axis error")
+    pr("   tool +Z driven anti-parallel to bolt axis (approach direction);")
+    pr("   roll about the bolt axis is FREE (nut-runner spins) -> swept.")
     pr("=" * 74)
     env = TyroEnv(cfg=cfg, render=False, seed=0)
     env.set_start_pos_easy_prob(0.0)
@@ -184,34 +221,20 @@ def main() -> int:
     for i in range(cfg.n_bolts):
         bp, bq = env.scene.bolt_pose(i)
         baxis = _quat_axis(bq, "z")
-        # nut-runner approaches from outside: tool +Z points INTO the bolt,
-        # i.e. tool +Z = -bolt_axis. Build a target quat whose z = -baxis.
-        from src.env.robots import rpy_to_quat  # noqa
-        # construct quat aligning z-> -baxis via two-vector method
-        zt = -baxis / max(np.linalg.norm(baxis), 1e-9)
-        ref = np.array([1.0, 0.0, 0.0]) if abs(zt[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        xt = np.cross(ref, zt); xt /= max(np.linalg.norm(xt), 1e-9)
-        yt = np.cross(zt, xt)
-        Rm = np.column_stack([xt, yt, zt])
-        # rotation matrix -> quat
-        m = np.eye(4); m[:3, :3] = Rm
-        import math
-        tr = Rm[0, 0] + Rm[1, 1] + Rm[2, 2]
-        if tr > 0:
-            S = math.sqrt(tr + 1.0) * 2
-            qw = 0.25 * S; qx = (Rm[2, 1]-Rm[1, 2])/S; qy = (Rm[0, 2]-Rm[2, 0])/S; qz = (Rm[1, 0]-Rm[0, 1])/S
-        else:
-            qw, qx, qy, qz = 1.0, 0.0, 0.0, 0.0
-        tq = np.array([qx, qy, qz, qw], float)
+        # The nut-runner approaches the bolt head-on: the tool +Z points INTO
+        # the bolt, i.e. tool +Z = -bolt_axis (the approach direction). The
+        # spin about that axis is a free DOF, so pose_reach sweeps the roll.
+        approach = -baxis / max(np.linalg.norm(baxis), 1e-9)
         env.robot_B.reset_to_home()
-        dp, ang = pose_reach(env.robot_B, np.asarray(bp, float), tq)
+        dp, ang = pose_reach(env.robot_B, np.asarray(bp, float), approach)
         d = float(np.linalg.norm(np.asarray(bp, float) - b_base))
         worst_pos = max(worst_pos, dp); worst_ang = max(worst_ang, ang)
-        flag = "OK" if (dp < 0.03 and ang < 15) else ("pos!" if dp >= 0.03 else "ang!")
-        pr(f"  bolt{i:2d} d={d:.2f}m ({100*d/UR10E_REACH:3.0f}%)  "
+        flag = "OK" if (dp < 0.02 and ang < 5) else ("pos!" if dp >= 0.02 else "ang!")
+        pr(f"  bolt{i:2d} d={d:.2f}m ({100*d/UR10E_REACH:3.0f}%)  approach=("
+           f"{approach[0]:+.2f},{approach[1]:+.2f},{approach[2]:+.2f})  "
            f"pos={dp*100:5.1f}cm  tool_ang={ang:5.1f}deg  {flag}")
     pr(f"\n  WORST  pos={worst_pos*100:.1f}cm  tool_ang={worst_ang:.1f}deg  "
-       f"=> {'ALL nut poses feasible' if (worst_pos<0.03 and worst_ang<15) else 'CHECK'}")
+       f"=> {'ALL nut poses feasible' if (worst_pos<0.02 and worst_ang<5) else 'CHECK'}")
     env.close()
     pr("\nDONE")
     return 0

@@ -1,16 +1,16 @@
 # TYRO — 듀얼암 타이어 마운팅 학습 환경
 
 두 팔이 트럭 휠 허브에 타이어를 끼우는 PyBullet 시뮬레이션 환경과 PPO 학습
-파이프라인입니다. **운영 레이아웃은 FANUC R-2000iC (Robot A) + UR10e (Robot B)**
-(`--scene-layout fanuc_spacious`, Robot B base = 원점). 레거시 기본 레이아웃은
-UR10 (A) + Franka Panda (B) 입니다.
+파이프라인입니다. **기본 레이아웃은 FANUC R-2000iC (Robot A) + UR10e (Robot B)**
+(`scene_layout=fanuc_spacious`, **허브 중심 = 월드 원점**). 레거시 UR10 (A) + Panda (B)는
+`--scene-layout shipping --robot-a-kind ur10 --robot-b-kind panda` 로 사용합니다.
 
 현재 **Phase 1** — Robot A가 타이어를 픽업해 허브에 마운트하는 단일 로봇 시퀀스를
 학습합니다 (Robot B는 HOME에 동결). 마운트 후 빈손 HOME 복귀 → 재파지 → 분리 →
 거치까지 도는 **6단계 풀사이클**은 `--remount-cycle`로 켤 수 있습니다 (아래 참조).
 
 - 시뮬레이터: PyBullet, 240 Hz physics / 20 Hz control
-- 좌표계: **Robot B (Panda) base 중심** — 모든 절대 좌표가 Panda 베이스 기준
+- 좌표계: **허브 중심 = 월드 원점** (`hub_pos_nominal=(0,0,0)`, `obs_reference_pos=(0,0,0)`). Robot B(UR10e)는 `(0.90, −0.95, −0.30)` + 30 cm 너트러너
 - 관측 / 액션 (Phase 1): **obs 85-d / action 6-d** (PPO **잔차(residual)** 6, gripper는 FSM이 자동 제어)
   - obs 채널: 로봇 joints(qA·dqA, qB·dqB) + EE/타이어/허브/볼트 상대 pose + prev_action + mount tail 3 + hub_guide 3
   - legacy 체크포인트 호환: `(obs 82, act 6)` v6 이전, `(obs 83, act 7)` v5 sharp 시대 — `eval.py`가 자동 감지
@@ -317,17 +317,19 @@ Phase 1에서는 `freeze_robot_b=True`로 인해 자동으로:
 
 ---
 
-## 좌표 요약 (Robot B-centric)
+## 좌표 요약 (`fanuc_spacious`, 허브 = 원점, 2026-06-06)
 
-| 객체 | 위치 |
+| 객체 | 위치 (world) |
 |---|---|
-| Robot B (Panda) base | `(0, 0, 0)` ← 원점 |
-| Robot A (UR10) base | `(−0.80, 0, −0.30)` — 30 cm 플린스 |
-| 허브 중심 | `(0, +0.80, +0.22)` |
-| 타이어 픽업 COM | `(−1.90, 0, +0.225)` |
-| 타이어 거치대 (Y-split) | rail top Z = `−0.30` (UR10 base 평면과 동일) |
-| 카고 박스 중심 | `(0, +1.05, +0.78)` |
-| 바닥 평면 Z | `−0.60` |
+| **허브 중심** | `(0, 0, 0)` ← **월드 원점** · 관측 기준도 동일 |
+| Robot A (FANUC) base | `(−0.40, −1.50, −2.20)` — pit 기둥 위 |
+| Robot B (UR10e) base | `(0.90, −0.95, −0.30)` — 30 cm 너트러너 (`ur10e_with_nut_tool.urdf`) |
+| 타이어 픽업 COM | `(−2.20, −1.50, −0.30)` |
+| 타이어 거치대 (Y-split) | inner `(−2.20, −1.10, −0.716)` / outer `(−2.20, −1.90, −0.716)` |
+| 카고 박스 중심 | `(0, 0.25, 0.56)` |
+| 바닥 평면 Z | `−1.30` |
+
+> **이전 B-origin / Panda 레이아웃 좌표는 더 이상 유효하지 않음.** pre-2026-06-06 체크포인트는 좌표·동역학 모두 OOD → **신규 학습 필수**.
 
 ---
 
@@ -508,7 +510,9 @@ Phase 1 **학습 설계는 EE 명목 궤적 + PPO 잔차** (`_traj_pos` + `actio
 |---|---|---|
 | `planner_precompute_joint_traj` | `True` | 동일 — **action≈0일 때만** 관절 재생; PPO는 `apply_palm_up_pose(EE)` |
 | `apply_palm_up_pose` warm-start | **현재 관절** (`robots.py`) | HOME 아님 |
+| `kinematic_tire_lock_stages` | **`(0,1,2,3)`** (`fanuc_spacious`) | S0~S3 전 구간 EE→타이어 키네마틱 동기화 — 100 kg 동적 본드 PD 포화·그리퍼 droop 방지 |
 | `kinematic_tire_sync_alpha` | `0.65` | EMA로 타이어 pose 부드럽게 (1.0=즉시 스냅) |
+| `fanuc_enforce_palm_up_post_step` | **`True`** | 매 step 후 그리퍼 tool +Z = world +Z 재락 (yaw 자유) |
 | `ur10_joint_*_smooth_*` / PD gains | 꺼짐 / 1.0 | `replay_planner.py`에서만 조정 가능 |
 
 **권장**: 학습 일관성을 위해 장기적으로 `planner_precompute_joint_traj=False`로 **매 스텝 EE→IK**만 쓰는 것도 검토.  
@@ -554,6 +558,14 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 ## 변경 이력 (CHANGELOG) — 왜 바꿨는지
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
+
+### 2026-06-06 — 허브 원점 · UR10e 너트러너 · palm-up 캐리 · 검증 스크립트
+
+- **좌표**: 전 씬을 허브 중심 `(0,0,0)` 으로 평행이동 (`obs_reference_pos` 동일). Robot B `(0.90, −0.95, −0.30)`.
+- **Robot B**: `ur10e_with_nut_tool.urdf` — 30 cm 소켓, EE=`tool_tip`, 전 볼트 **+Y 접근** (롤 자유 6-DOF IK 전부 OK, worst 0.7 cm / 0.8°). `scripts/check_all_phases_feasible.py`가 롤 고정 1자세만 쓰던 **오탐** 수정 → 롤 스윕.
+- **Robot A 그리퍼**: planner palm-up tilt-lock(S0~S3) + **`kinematic_tire_lock_stages=(0,1,2,3)`** — 100 kg 동적 본드가 마운트 끝에서 ~51 cm 포화·~15° droop 하던 문제 제거(베이크 추종 end err 0.1 cm, median tilt 0.01°). **`fanuc_enforce_palm_up_post_step`** 로 잔여 droop 보정(EE 위치 가드).
+- **허브 마운트**: `pin_tire_on_mount` + `JOINT_FIXED` 허브 본드 **유지** — 스터드만으로도 안착은 유지되나, 체결 중 강성·결정적 시트 포즈용.
+- **학습**: layout·obs·carry 동역학 변경 → **모든 기존 ckpt OOD**. 학습 전 `check_all_phases_feasible.py` + `check_dynamic_feasibility.py` 권장.
 
 ### 2026-06-04 — "오락가락" 근본 원인 규명 + 삽입 속도 제한 (측정 기반)
 

@@ -1228,6 +1228,51 @@ class TyroEnv(gym.Env):
             or self._grasp_kinematic
         )
 
+    def _enforce_robot_a_palm_up(self) -> None:
+        """Post-step: keep the FANUC gripper palm-up (tool +Z = world +Z).
+
+        Snaps the arm joints back onto the palm-up manifold (yaw free) when
+        the heavy-tire load has drooped the stiff position PD off vertical,
+        then re-places the grasped tire via the cached EE↔tire transform so
+        the rigid ``JOINT_FIXED`` bond is not shocked. Gated by
+        ``cfg.fanuc_enforce_palm_up_post_step``. No-op when the robot lacks
+        the IK-based re-lock (e.g. Panda Robot B).
+        """
+        if not bool(getattr(self.cfg, "fanuc_enforce_palm_up_post_step", False)):
+            return
+        if self.robot_A is None:
+            return
+        enforce = getattr(self.robot_A, "enforce_palm_up_pose", None)
+        if enforce is None:
+            return
+        thr = float(getattr(self.cfg, "fanuc_palm_up_tool_z_threshold", 0.999))
+        corrected = bool(enforce(thr))
+        if not corrected:
+            return
+        # The kinematic upright sync (stage 0) re-places the tire from the EE
+        # itself, so only the JOINT_FIXED bond needs an explicit re-place.
+        if self._grasp_kinematic or self._grasp_constraint is None:
+            return
+        t_pos = getattr(self, "_grasp_t_ee_tire_pos", None)
+        t_quat = getattr(self, "_grasp_t_ee_tire_quat", None)
+        if t_pos is None or t_quat is None:
+            return
+        ee_pos, ee_orn = self.robot_A.ee_pose()
+        new_pos, new_orn = p.multiplyTransforms(
+            np.asarray(ee_pos, dtype=np.float64).tolist(),
+            np.asarray(ee_orn, dtype=np.float64).tolist(),
+            np.asarray(t_pos, dtype=np.float64).tolist(),
+            np.asarray(t_quat, dtype=np.float64).tolist(),
+        )
+        p.resetBasePositionAndOrientation(
+            self.handles.tire, list(new_pos), list(new_orn),
+            physicsClientId=self.client,
+        )
+        p.resetBaseVelocity(
+            self.handles.tire, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+            physicsClientId=self.client,
+        )
+
     def _use_tire_upright_lock(self) -> bool:
         return bool(getattr(self.cfg, "lock_tire_upright_when_grasped", True))
 
@@ -1514,40 +1559,19 @@ class TyroEnv(gym.Env):
             return end_pos, palm_up
 
         if stage == 1:
-            # **2026-06-02 (path-C planner-yaw alignment)** — the previous
-            # branch left the EE in HOME yaw (palm-up at shoulder_pan = π,
-            # tool +Y ‖ world +X) throughout Stage 1, which delivered the
-            # tire to the hub centre with bore axis still ‖ world +X
-            # (cradle spawn orientation) — 90° off from ``hub_axis_world``
-            # (world −Y). The mount angle gate had to be widened to 100°
-            # to compensate, leaving the policy without a clean alignment
-            # signal.
-            #
-            # With the kinematic upright lock (``_sync_grasped_tire_upright``)
-            # the tire's yaw rigidly tracks the gripper's yaw. So if the
-            # planner end-pose rotates the EE ``-90°`` about world +Z
-            # (i.e. shoulder_pan target = π/2 instead of π), the tool +Y
-            # axis swings to world −Y and the tire bore — which was
-            # locked perpendicular to tool +X under the cradle grasp —
-            # also rotates to world −Y, **physically aligning with the
-            # hub axis**. The min-jerk + SLERP planner then produces a
-            # smooth carry trajectory that simultaneously translates
-            # cradle → hub *and* yaws the tire bore +X → −Y, exactly
-            # the motion the user requested.
+            # Mount end-pose: gripper UNDER the tire (6-o'clock), palm-up
+            # (tool +Z ‖ world +Z).  Use ``palm_up`` (= FINAL_LOCK from
+            # ``fanuc_home_pose`` FK) with **0° extra yaw** — do NOT apply
+            # the UR10-era −90° Z rotation here.  On FANUC that rotation
+            # kept palm-up (Z-rot preserves tool +Z) but swung tool +X
+            # 90° away from ``hub_axis_world`` (scripts/diag_mount_yaw_palm.py:
+            # 0° → bore ‖ hub 0.5°, −90° → 90° off).  ``_tilt_lock_palm_up_quat``
+            # still enforces tool +Z = world +Z on every planner step.
             R = float(self.cfg.tire_outer_radius)
             hub_pos = np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
             end_pos = hub_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
-            # Yaw the palm-up quaternion by −π/2 about world +Z so the
-            # gripper (and therefore the locked-upright tire) ends up
-            # with bore ‖ ``hub_axis_world``.
-            yaw_rot = axisangle3_to_quat(
-                np.array([0.0, 0.0, -math.pi / 2.0], dtype=np.float64),
-            )
-            end_quat = quat_multiply(
-                np.asarray(yaw_rot, dtype=np.float64),
-                palm_up,
-            )
-            return end_pos, np.asarray(end_quat, dtype=np.float64)
+            end_quat = np.asarray(palm_up, dtype=np.float64)
+            return end_pos, end_quat
 
         if stage == 2:
             # **2026-06-05 (demount = exact reverse of the Stage-1 insertion)**
@@ -2570,6 +2594,8 @@ class TyroEnv(gym.Env):
 
         for _ in range(self.cfg.decimation):
             p.stepSimulation(physicsClientId=self.client)
+        if self._mount_hold_left <= 0:
+            self._enforce_robot_a_palm_up()
         if self._grasp_kinematic and self._use_kinematic_tire_sync():
             self._sync_grasped_tire_upright()
 

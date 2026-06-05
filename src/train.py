@@ -1204,7 +1204,7 @@ def main() -> int:
         type=str,
         default=None,
         choices=("ur10", "fanuc_r2000ic"),
-        help='Robot A model: "ur10" (default) or "fanuc_r2000ic".',
+        help='Robot A model: "fanuc_r2000ic" (default) or legacy "ur10".',
     )
     ap.add_argument(
         "--fanuc-torque-scale",
@@ -1223,14 +1223,14 @@ def main() -> int:
         type=str,
         default=None,
         choices=("panda", "ur10e"),
-        help='Robot B model: "panda" (default) or "ur10e".',
+        help='Robot B model: "ur10e" (default) or legacy "panda".',
     )
     ap.add_argument(
         "--scene-layout",
         type=str,
         default=None,
         choices=("shipping", "fanuc_spacious"),
-        help='Scene layout: "shipping" (legacy) or "fanuc_spacious" (FANUC+UR10e).',
+        help='Scene layout: "fanuc_spacious" (default) or legacy "shipping" (UR10+Panda).',
     )
 
     # IO

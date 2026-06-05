@@ -1166,13 +1166,12 @@ class EnvConfig:
     ur10_search_path: str = str(URDF_DIR / "ur10_robot")
     panda_urdf: str = "franka_panda/panda.urdf"  # resolved via pybullet_data
 
-    #: Robot A model: ``"ur10"`` (default legacy) or ``"fanuc_r2000ic"``.
-    robot_a_kind: str = "ur10"
-    #: Robot B model: ``"panda"`` (legacy) or ``"ur10e"``.
-    robot_b_kind: str = "panda"
-    #: ``"shipping"`` = UR10 legacy layout; ``"fanuc_spacious"`` = widened hub/cargo
-    #: with FANUC base retreated (see ``apply_fanuc_spacious_layout``).
-    scene_layout: str = "shipping"
+    #: Robot A model: ``"fanuc_r2000ic"`` (default) or legacy ``"ur10"``.
+    robot_a_kind: str = "fanuc_r2000ic"
+    #: Robot B model: ``"ur10e"`` (default) or legacy ``"panda"``.
+    robot_b_kind: str = "ur10e"
+    #: ``"fanuc_spacious"`` = FANUC + UR10e (default); ``"shipping"`` = UR10 + Panda.
+    scene_layout: str = "fanuc_spacious"
     fanuc_urdf: str = str(URDF_DIR / "fanuc_r2000ic" / "r2000ic210f_wheeltool.urdf")
     fanuc_search_path: str = str(URDF_DIR / "fanuc_r2000ic")
     fanuc_mesh_support_path: str = str(
@@ -1183,6 +1182,20 @@ class EnvConfig:
     fanuc_stand_rgba: Tuple[float, float, float, float] = (0.32, 0.34, 0.38, 1.0)
     #: FANUC defaults to full 6-DOF planner IK (no UR10 palm-up wrist lock).
     fanuc_lock_tool_up: bool = False
+    #: **2026-06-06 (post-step palm-up re-lock)** — kinematically snap the
+    #: FANUC gripper back to palm-up (tool +Z = world +Z, yaw free) after the
+    #: physics sub-steps whenever the achieved tool +Z has drooped past
+    #: ``fanuc_palm_up_tool_z_threshold``. The 100 kg grasped tire makes the
+    #: stiff position PD settle ~15° off palm-up at the far mount-insertion
+    #: reach (a steady-state tilt that extra wrist torque cannot remove and
+    #: that higher position gain only destabilises). This guarantees the
+    #: gripper stays +Z while still allowing free rotation about vertical.
+    #: The grasped tire is re-placed via the cached EE↔tire transform so the
+    #: rigid bond is not shocked. Off ⇒ legacy command-only palm-up.
+    fanuc_enforce_palm_up_post_step: bool = False
+    #: Dot(tool +Z, world +Z) below which the post-step re-lock fires.
+    #: 0.999 ≈ 2.5°, 0.9998 ≈ 1.1°.
+    fanuc_palm_up_tool_z_threshold: float = 0.999
     fanuc_motor_max_velocity_rad_s: float = 1.0
     fanuc_joint_target_smooth_alpha: float = 1.0
     fanuc_joint_max_step_rad: float = 0.0
@@ -1226,6 +1239,15 @@ class EnvConfig:
     ur10e_urdf: str = str(URDF_DIR / "ur10e_robot" / "ur10e.urdf")
     ur10e_search_path: str = str(URDF_DIR / "ur10e_robot")
     ur10e_mesh_support_path: str = str(URDF_DIR / "ur_ros" / "ur_e_description")
+    #: Length (m) of the nut-runner socket extension bolted to the UR10e
+    #: ``tool0`` flange along +Z (the bolt/approach axis). 0 = bare flange.
+    #: When > 0 the EE frame resolves to the ``tool_tip`` link (the socket
+    #: tip) so IK targets the nut, and the extra reach lets Robot B's base
+    #: sit further -Y while still reaching every hub bolt (≈ 1:1 trade with
+    #: -Y base displacement, since the tool points +Y back toward the hub).
+    #: Requires a URDF carrying the matching ``nut_runner``/``tool_tip``
+    #: links (see ``ur10e_with_nut_tool.urdf``).
+    ur10e_nut_tool_length: float = 0.0
     ur10e_stand_radius: float = 0.12
     ur10e_stand_rgba: Tuple[float, float, float, float] = (0.35, 0.38, 0.42, 1.0)
     ur10e_motor_max_velocity_rad_s: float = 1.0
@@ -1518,18 +1540,35 @@ class EnvConfig:
     def spawn_cargo_box(self, v: bool) -> None:
         self.spawn_vehicle_primitive_box = bool(v)
 
+    def __post_init__(self) -> None:
+        layout = str(getattr(self, "scene_layout", "fanuc_spacious")).lower()
+        if layout in ("fanuc_spacious", "fanuc", "spacious"):
+            apply_fanuc_spacious_layout(self)
+
 
 def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     """Widen hub/cargo/cradle for FANUC reach; 100 kg tire physics.
 
-    **2026-06-05 (Robot-B-origin frame)** — the whole layout is expressed with
-    Robot B (UR10e) at the WORLD ORIGIN (0,0,0). The previous frame had B at
-    (0.20, 0.40, 0); every world coordinate below was rigidly translated by
-    (−0.20, −0.40, 0) so B lands on the origin. Because it is a pure rigid
-    XY translation the physical scene — every reach, clearance, the pit, the
-    grasp/carry/mount geometry — is byte-for-byte unchanged; only the frame
-    origin moved. The observation frame (``obs_reference_pos``) stays at
-    (0,0,0), now coincident with B's base.
+    **2026-06-06 (HUB-origin frame)** — the whole layout is now expressed with
+    the HUB CENTER at the WORLD ORIGIN (0,0,0). The previous frame had B (UR10e)
+    at the origin and the hub at (−0.90, 0.20, 1.30); every absolute world
+    coordinate below was rigidly translated by Δ = (+0.90, −0.20, −1.30) so the
+    hub lands on the origin. Because it is a pure rigid translation the physical
+    scene — every reach, clearance, the pit, the grasp/carry/mount geometry, and
+    every runtime-computed planner trajectory (all derived from these landmarks)
+    — is byte-for-byte unchanged; only the frame origin moved. Following the
+    established re-anchoring convention, ``obs_reference_pos`` stays numerically
+    at (0,0,0), so it is now coincident with the hub and observations are
+    hub-centric (positional obs channels shift by Δ vs the old B-origin frame —
+    retrain / re-evaluate checkpoints accordingly).
+
+    Post-translation landmark cheat-sheet (world coords, hub = origin):
+        hub          (0.00,  0.00,  0.00)
+        Robot B base (0.90, -0.80, -0.30)   UR10e + 0.30 m nut tool
+        Robot A base (-0.40, -1.50, -2.20)  FANUC (buried in pit)
+        pickup       (-2.20, -1.50, -0.30)
+        vehicle      (0.00,  0.25,  0.56)
+        floor_z      -1.30
     """
     cfg.scene_layout = "fanuc_spacious"
     cfg.robot_a_kind = "fanuc_r2000ic"
@@ -1575,12 +1614,14 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: y=0.90). This is a rigid translation of EVERY absolute landmark, so all
     #: relative geometry (reach, clearances, the just-fixed pit) is invariant;
     #: only the world frame is re-anchored to Robot B. (was y=−0.40.)
-    cfg.robot_A_base_pos = (-1.30, -1.30, -0.90)
+    #: HUB-origin frame: world (-1.30, -1.30, -0.90) + Δ(0.90, -0.20, -1.30).
+    cfg.robot_A_base_pos = (-0.40, -1.50, -2.20)
     #: Ground plane at Z=0 — flush with Robot B's base (origin), so B stands
     #: directly on the floor with no stand pillar. The FANUC base (Z=−0.95)
     #: sits *below* the plane (intentionally buried for reach/height); since
     #: base_z < floor_z no support pillar is drawn for it either.
-    cfg.floor_z = 0.0
+    #: HUB-origin frame: floor 0.0 + Δz(-1.30).
+    cfg.floor_z = -1.30
     #: **2026-06-05 (real pit)** — carve a genuine rectangular hole into the
     #: floor around the FANUC base so the buried column lives in a pit while
     #: the surrounding floor (rim slabs, top at z=0) physically blocks any arm
@@ -1615,7 +1656,8 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: pedestal at the origin (+X edge at −0.45).
     cfg.floor_pit_depth = 0.95
     #: B→origin translation: y −0.35 → −1.25 (was −0.35).
-    cfg.floor_pit_center = (-1.35, -1.25)
+    #: HUB-origin frame: (-1.35, -1.25) + Δxy(0.90, -0.20).
+    cfg.floor_pit_center = (-0.45, -1.45)
     cfg.floor_pit_radius = 0.90
     #: Hub at Y=0.70, Z=0.85. **2026-06-04 (raise + pull-in for mount)** —
     #: raising the hub so a grasped tire can actually be inserted requires
@@ -1677,7 +1719,16 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: (scripts/sweep_hub_y.py: dY=0.90 → SEATED, worst-bolt 0.1 cm).
     #: (B-origin frame: world (−0.50, 1.75, 1.00) − (0.20, 0.40, 0).)
     #: B→origin translation: hub y 1.35 → 0.45 (was 1.35).
-    cfg.hub_pos_nominal = (-0.70, 0.45, 1.00)
+    #: **2026-06-06 (raised hub + nudge for palm-up mount)** — hub lifted
+    #: z 1.00 → 1.30 and pulled toward FANUC (x −0.70 → −0.90, y 0.45 → 0.20)
+    #: so palm-up mount IK resolves at 86 % reach / 1.5 cm (was 100 % reach /
+    #: 64 cm miss at the old pose). Cargo tracks the same Δ=(−0.20, −0.25, +0.30).
+    #: Robot B moves to (−0.90, −0.30, 0.80) on a pedestal so all 10 bolts
+    #: reach at 64 % (was unreachable from the origin). ``obs_reference_pos``
+    #: stays at the world origin. (scripts/sweep_layout_feasibility.py,
+    #: scripts/validate_candidate_layout.py.)
+    #: HUB-origin frame: the hub IS the world origin now (was (-0.90,0.20,1.30)).
+    cfg.hub_pos_nominal = (0.0, 0.0, 0.0)
     cfg.tire_mount_pos = cfg.hub_pos_nominal
     #: Tire / rack at X=−2.90 — a compact ~1.8 m from the (pulled-in) FANUC
     #: base. Far enough to stay out of the inner reach deadzone (baked palm-up
@@ -1697,13 +1748,16 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: column. (scripts/measure_pit_footprint.py base/pickup sweep.)
     #: (B-origin frame: world (−2.90, 0.0, 1.00) − (0.20, 0.40, 0).)
     #: B→origin translation: pickup y −0.40 → −1.30 (was −0.40).
-    cfg.tire_pickup_pos = (-3.10, -1.30, 1.00)
+    #: HUB-origin frame: (-3.10, -1.30, 1.00) + Δ(0.90, -0.20, -1.30).
+    cfg.tire_pickup_pos = (-2.20, -1.50, -0.30)
     #: Vehicle body tracks the hub (kept +0.25 m behind in Y, +0.56 m above in
     #: Z so the wheel-well cutout stays centred on the hub): hub
     #: (−0.50,0.85,0.85) → vehicle (−0.50, 1.10, 1.41).
     #: (B-origin frame: world (−0.50, 2.00, 1.56) − (0.20, 0.40, 0).)
     #: B→origin translation: vehicle y 1.60 → 0.70 (was 1.60).
-    cfg.vehicle_center_world = (-0.70, 0.70, 1.56)
+    #: **2026-06-06** — tracks raised hub (+0.30 z, −0.25 y, −0.20 x).
+    #: HUB-origin frame: (-0.90, 0.45, 1.86) + Δ(0.90, -0.20, -1.30).
+    cfg.vehicle_center_world = (0.0, 0.25, 0.56)
     cfg.cargo_back_wall_y_offset = 0.35
     #: **2026-06-05 (align wall bottom with cargo bottom)** — the back wall
     #: (he_z=0.50) was centred at the hub (1.10) so its bottom hung at 0.60,
@@ -1714,7 +1768,9 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: of a hub-mounted tire (top at 1.10+0.525=1.625) so it keeps blocking +Y
     #: over-push. **2026-06-05** — tracks the lowered cargo (vehicle z 1.56),
     #: so the wall bottom (1.56−0.50=1.06) stays flush with the cargo bottom.
-    cfg.cargo_back_wall_center_z = 1.56
+    #: **2026-06-06** — tracks raised cargo centre (1.86).
+    #: HUB-origin frame: 1.86 + Δz(-1.30).
+    cfg.cargo_back_wall_center_z = 0.56
     #: Cradle rails stand on the Z=0 floor; their TOP corner must touch the
     #: tire tread at the rail's Y offset (the tire rests on the two rails at
     #: y=±0.40, NOT on its y=0 bottom). Seating contract:
@@ -1741,8 +1797,9 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.tire_rack_half_extents = (0.10, 0.05, 0.025)
     #: (B-origin frame: world (−2.90, ±0.40, 0.584) − (0.20, 0.40, 0).)
     #: B→origin translation: rack y {0.00,−0.80} → {−0.90,−1.70}.
-    cfg.tire_rack_inner_center = (-3.10, -0.90, 0.584)
-    cfg.tire_rack_outer_center = (-3.10, -1.70, 0.584)
+    #: HUB-origin frame: rack centers + Δ(0.90, -0.20, -1.30).
+    cfg.tire_rack_inner_center = (-2.20, -1.10, -0.716)
+    cfg.tire_rack_outer_center = (-2.20, -1.90, -0.716)
     cfg.tire_rack_support_posts = True
     cfg.tire_rack_post_half_extents_xy = (0.10, 0.05)
 
@@ -1788,7 +1845,32 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: origin (was y=0.90). The whole scene was translated −0.90 m in Y so B is
     #: the physical origin AND the observation reference, removing the prior
     #: split where the obs frame (origin) and B's sim base (y=0.90) disagreed.
-    cfg.robot_B_base_pos = (0.0, 0.0, 0.0)
+    #: **2026-06-06** — B stays at the origin XY but rises onto a 1.0 m
+    #: pedestal. With the raised+pulled-in hub (−0.90, 0.20, 1.30) all 10 bolts
+    #: now resolve at 0.0 cm IK / 87 % reach from (0, 0, 1.0); moving B in −Y
+    #: only WORSENS reach (hub is at +Y 0.20). ``obs_reference_pos`` stays at
+    #: the world origin so the policy frame is unchanged.
+    #: (scripts/validate_candidate_layout.py x=0 −y/z sweep.)
+    #: **2026-06-06 (nut-runner tool + B pushed -Y)** — a 30 cm socket
+    #: extension is bolted to the UR10e flange (``ur10e_with_nut_tool.urdf``,
+    #: ``ur10e_nut_tool_length=0.30``). The tool points +Z = +Y (toward the
+    #: hub), so it directly cancels a -Y base shift: with the tool, Robot B
+    #: can drive every bolt from a base ~0.6 m further -Y than bare, with the
+    #: worst-bolt 6-DOF IK ≈ 1 cm / <2°, while moving B off the carry/mount
+    #: corridor. (scripts: tool-length × base_y feasibility sweep.)
+    #: HUB-origin frame: B base was (0.0, -0.6, 1.0) in the B-origin frame;
+    #: + Δ(0.90, -0.20, -1.30) ⇒ (0.90, -0.80, -0.30).
+    cfg.ur10e_urdf = str(URDF_DIR / "ur10e_robot" / "ur10e_with_nut_tool.urdf")
+    cfg.ur10e_nut_tool_length = 0.30
+    #: **2026-06-06 (B nudged −Y for bolt-axis alignment + corridor margin)** —
+    #: shifted from y=−0.80 to −0.95. With the 30 cm nut-runner the tool +Z is
+    #: anti-parallel to the bolt axis (−Y), so pulling B further −Y *improves*
+    #: 6-DOF alignment (roll-free worst-bolt IK 0.66 cm/1.53° → 0.65 cm/0.42°)
+    #: while moving B further off the carry/mount corridor. All 10 bolts stay
+    #: reachable (worst ≤ 1 cm / < 1°). (focused −Y feasibility sweep.)
+    cfg.robot_B_base_pos = (0.90, -0.95, -0.30)
+    #: Observation reference stays numerically at the world origin — which is
+    #: now the HUB. Positional obs channels are therefore hub-centric.
     cfg.obs_reference_pos = (0.0, 0.0, 0.0)
 
     cfg.tire_mass = cfg.tire_mass_heavy
@@ -1799,6 +1881,10 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.contact_force_terminate_above = 50_000.0
     cfg.fanuc_position_gain = 0.85
     cfg.fanuc_velocity_gain = 1.15
+    #: Keep the FANUC gripper palm-up (tool +Z = world +Z) at all times; the
+    #: heavy-tire droop at the mount reach would otherwise tilt it ~15°.
+    cfg.fanuc_enforce_palm_up_post_step = True
+    cfg.fanuc_palm_up_tool_z_threshold = 0.9998
     #: **2026-06-05 (carry tracking)** — 0.8 rad/s left the 100 kg tire
     #: lagging the baked Min-Jerk by ~0.7 m (``ik_residual_A_mean``) while the
     #: traj index advanced every step; raise the cap so the arm can keep up.
@@ -1815,7 +1901,19 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.planner_waypoint_gate_enable = False
     cfg.planner_waypoint_pos_tol_m = 0.06
     cfg.planner_waypoint_max_stall = 15
-    cfg.kinematic_tire_lock_stages = (0,)
+    #: **2026-06-06 (kinematic carry restored for palm-up + reach)** — the
+    #: dynamic JOINT_FIXED carry (klock=(0,)) made the stiff position PD fight
+    #: the 100 kg tire: the arm saturated ~51 cm short of the mount target and
+    #: the gripper drooped ~15° off palm-up at the insertion reach (a steady
+    #: state that neither extra wrist torque nor the post-step palm-up re-lock
+    #: could fix cleanly — reorienting the gripper pivots the tire hanging
+    #: ~0.8 m off the wrist by ~20 cm). Re-writing the grasped tire pose every
+    #: step (kinematic lock on all carry/mount/return stages) removes that
+    #: load from the PD, so the arm tracks the palm-up baked joints to the
+    #: mount target (end err 51 cm → 0.1 cm) and the gripper stays palm-up
+    #: (worst tilt 15.6° → 5.6°, → 3.4° with the post-step re-lock below).
+    #: ``kinematic_tire_sync_alpha`` (0.65) smooths the per-step teleport.
+    cfg.kinematic_tire_lock_stages = (0, 1, 2, 3)
 
     #: **2026-06-05 (mount gate matched to carry tracking reach)** — with
     #: the 100 kg tire the zero-residual baked carry tracks to ~0.74 m of
@@ -1917,7 +2015,7 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     # normal forces from tire–EE fixed constraints → avoid instant episode death.
     if stage <= 2 and not cf_user_set:
         cfg.contact_force_terminate_above = 0.0
-    # Phase 1 = UR10 pick-and-place only. Freeze Panda at HOME unless the
+    # Phase 1 = Robot A pick-and-place only. Freeze Robot B at HOME unless the
     # caller explicitly opted out via ``freeze_robot_b=False``.
     if phase == 1 and not freeze_b_user_set:
         cfg.freeze_robot_b = True
@@ -1947,7 +2045,7 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
             cfg.obs.dim = tail
     if legacy_obs_dim is not None:
         cfg.obs.dim = int(legacy_obs_dim)
-    layout = str(getattr(cfg, "scene_layout", "shipping")).lower()
+    layout = str(getattr(cfg, "scene_layout", "fanuc_spacious")).lower()
     if layout in ("fanuc_spacious", "fanuc", "spacious"):
         apply_fanuc_spacious_layout(cfg)
         # **2026-06-05 (override-precedence fix)** — the layout function sets a

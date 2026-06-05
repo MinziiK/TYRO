@@ -21,6 +21,38 @@ from .utils import (
 )
 
 
+def _rotmat_to_quat(m: np.ndarray) -> np.ndarray:
+    """Rotation matrix (3x3, world<-tool columns) -> quat (x, y, z, w)."""
+    m = np.asarray(m, dtype=np.float64)
+    tr = float(m[0, 0] + m[1, 1] + m[2, 2])
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s
+        x = (m[2, 1] - m[1, 2]) / s
+        y = (m[0, 2] - m[2, 0]) / s
+        z = (m[1, 0] - m[0, 1]) / s
+    elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+        s = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / s
+        x = 0.25 * s
+        y = (m[0, 1] + m[1, 0]) / s
+        z = (m[0, 2] + m[2, 0]) / s
+    elif m[1, 1] > m[2, 2]:
+        s = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / s
+        x = (m[0, 1] + m[1, 0]) / s
+        y = 0.25 * s
+        z = (m[1, 2] + m[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / s
+        x = (m[0, 2] + m[2, 0]) / s
+        y = (m[1, 2] + m[2, 1]) / s
+        z = 0.25 * s
+    q = np.array([x, y, z, w], dtype=np.float64)
+    return q / max(float(np.linalg.norm(q)), 1e-12)
+
+
 @dataclass
 class JointGroup:
     """Subset of joints we drive with position control."""
@@ -710,6 +742,96 @@ class UR10Robot(Robot):
             physicsClientId=self.client,
         )
 
+    def enforce_palm_up_pose(
+        self,
+        tool_z_threshold: float = 0.999,
+        max_pos_shift: float = 0.03,
+    ) -> bool:
+        """Kinematically re-lock the gripper to palm-up (tool +Z = world +Z).
+
+        Arm-agnostic safety net. When the *achieved* tool +Z has drooped
+        off world +Z by more than ``acos(tool_z_threshold)`` — e.g. under
+        the heavy grasped-tire load, where the stiff position PD settles at
+        a steady-state tilt that extra motor torque cannot remove (raising
+        ``positionGain`` instead destabilises the PD) — re-solve IK for the
+        CURRENT achieved EE position with a palm-up target orientation
+        (tool +Z = world +Z; yaw preserved from the current tool +X, so the
+        free spin about vertical is untouched) and snap the arm joints onto
+        that solution. Position is preserved; only the tilt is removed.
+        Returns ``True`` iff a correction was applied.
+
+        **EE-position guard.** The candidate IK solution is accepted only
+        when it keeps the EE within ``max_pos_shift`` of the achieved
+        position. Near the saturated mount-insertion reach (the arm lagging
+        the 100 kg carry) a palm-up solution would otherwise require a large
+        EE move / IK branch jump, snapping the bonded tire tens of cm. The
+        guard makes the lock artefact-free: it holds palm-up cleanly through
+        the reachable carry and degrades to best-effort (no jump) exactly at
+        the saturated insertion point.
+
+        Unlike :pymeth:`enforce_palm_up_wrists` (UR-specific closed-form
+        wrist projection) this is IK-based, so it is correct for the FANUC
+        arm (whose wrist kinematics differ) as well.
+        """
+        ee_pos, ee_orn = self.ee_pose()
+        ee_pos = np.asarray(ee_pos, dtype=np.float64)
+        R = np.array(
+            p.getMatrixFromQuaternion(list(ee_orn)), dtype=np.float64,
+        ).reshape(3, 3)
+        if float(R[2, 2]) >= float(tool_z_threshold):
+            return False
+        # Palm-up target: tool +Z = world +Z, tool +X = current tool +X
+        # projected onto the world XY plane (preserves yaw / free spin).
+        tool_x = R[:, 0]
+        xy = np.array([tool_x[0], tool_x[1], 0.0], dtype=np.float64)
+        n_xy = float(np.linalg.norm(xy))
+        if n_xy < 1e-6:
+            palm_quat = np.asarray(self.FINAL_LOCK_QUATERNION, dtype=np.float64)
+        else:
+            x = xy / n_xy
+            z = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            y = np.cross(z, x)
+            palm_quat = _rotmat_to_quat(np.column_stack([x, y, z]))
+        cur_q, _ = self.joint_state()
+        ik = p.calculateInverseKinematics(
+            self.uid, self.EE_LINK_INDEX,
+            ee_pos.tolist(), palm_quat.tolist(),
+            lowerLimits=self.arm.lower.tolist(),
+            upperLimits=self.arm.upper.tolist(),
+            jointRanges=self.arm.range.tolist(),
+            restPoses=cur_q.tolist(),
+            maxNumIterations=200, residualThreshold=1e-5,
+            physicsClientId=self.client,
+        )
+        ik = np.asarray(ik, dtype=np.float64)
+        max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+        if len(ik) <= max_slot:
+            return False
+        q = np.clip(ik[self._ik_arm_slots], self.arm.lower, self.arm.upper)
+        # EE-position guard: verify in a snapshot before committing.
+        state_id = p.saveState(physicsClientId=self.client)
+        for idx, qv in zip(self.arm.indices, q):
+            p.resetJointState(
+                self.uid, idx, targetValue=float(qv), targetVelocity=0.0,
+                physicsClientId=self.client,
+            )
+        new_pos, new_orn = self.ee_pose()
+        pos_shift = float(np.linalg.norm(np.asarray(new_pos, dtype=np.float64) - ee_pos))
+        new_dot = float(np.array(
+            p.getMatrixFromQuaternion(list(new_orn)), dtype=np.float64,
+        ).reshape(3, 3)[2, 2])
+        accept = (
+            pos_shift <= float(max_pos_shift)
+            and new_dot > float(R[2, 2]) + 1e-4
+        )
+        if not accept:
+            p.restoreState(stateId=state_id, physicsClientId=self.client)
+            p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
+            return False
+        p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
+        self.drive_arm_targets(q)
+        return True
+
     def apply_palm_up_pose(self, pos, target_orn, warm_q=None) -> None:
         """Absolute-pose IK with **HOME-based warm start**, for palm-up.
 
@@ -968,7 +1090,7 @@ class UR10Robot(Robot):
 
 def make_robot_a(client: int, cfg: EnvConfig) -> Robot:
     """Factory for Robot A (UR10 default, optional FANUC R-2000iC)."""
-    kind = str(getattr(cfg, "robot_a_kind", "ur10")).lower().replace("-", "_")
+    kind = str(getattr(cfg, "robot_a_kind", "fanuc_r2000ic")).lower().replace("-", "_")
     if kind in ("fanuc", "fanuc_r2000ic", "fanuc_r2000ic210f", "r2000ic", "r2000ic210f"):
         return FanucR2000icRobot(client, cfg)
     return UR10Robot(client, cfg)
@@ -1140,7 +1262,7 @@ class FanucR2000icRobot(UR10Robot):
 
 def make_robot_b(client: int, cfg: EnvConfig) -> Robot:
     """Factory for Robot B (Panda default, optional UR10e)."""
-    kind = str(getattr(cfg, "robot_b_kind", "panda")).lower().replace("-", "_")
+    kind = str(getattr(cfg, "robot_b_kind", "ur10e")).lower().replace("-", "_")
     if kind in ("ur10e", "ur10_e", "ur_e"):
         return UR10eRobot(client, cfg)
     return PandaRobot(client, cfg)
@@ -1178,6 +1300,10 @@ class UR10eRobot(UR10Robot):
         self._joint_slew_max = float(
             getattr(cfg, "ur10_joint_slew_max_rad", 0.08)
         )
+        #: When a nut-runner socket is bolted on (``ur10e_nut_tool_length``
+        #: > 0) the EE frame is the socket tip (``tool_tip``) so IK targets
+        #: the nut, not the bare flange.
+        self._nut_tool_length = float(getattr(cfg, "ur10e_nut_tool_length", 0.0))
         self._cmd_q: Optional[np.ndarray] = None
 
         urdf = str(getattr(cfg, "ur10e_urdf", ""))
@@ -1196,7 +1322,12 @@ class UR10eRobot(UR10Robot):
             urdf_path=urdf,
             search_path=None,
         )
-        for link_name in ("tool0", "ee_link", "wrist_3_link"):
+        # Prefer the nut-runner socket tip when the tool is present so IK
+        # drives the nut, not the bare flange.
+        ee_link_candidates = ("tool0", "ee_link", "wrist_3_link")
+        if self._nut_tool_length > 0.0:
+            ee_link_candidates = ("tool_tip",) + ee_link_candidates
+        for link_name in ee_link_candidates:
             try:
                 self.EE_LINK_INDEX = self._link_index_for_child_link(link_name)
                 break
