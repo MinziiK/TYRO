@@ -41,7 +41,20 @@ fi
 echo "[pipeline] A checkpoint: $A_CKPT"
 
 echo "[pipeline] === Phase B: 6-stage full cycle (resume A) ==="
+# Speed: env collection is ~98.6% of wall time (scripts/profile_train.py),
+# gradient update only ~1.4%. So Phase B targets collection throughput:
+#   * --physics-num-sub-steps 8 : heavy-tire physics cost ~1.46x cheaper than
+#     the layout default 12 (measured 23.3->33.9 env-steps/s). Verified stable
+#     (tire seats, no force spikes/NaN) at 8 and 6 via
+#     scripts/check_substep_stability.py; 8 keeps a solver-accuracy margin for
+#     exploration-time contacts over the 5M-step run.
+#   * --num-envs 128 : ~1.3x more parallel collection (scripts/bench_vecenv_fps
+#     .py); near-free since the update phase is negligible. These flags come
+#     AFTER ${COMMON[@]} so argparse's last-value-wins overrides --num-envs 72.
+# Combined ~1.9x (Phase B ~11h -> ~6h). For max speed use 6 (~2x physics) at a
+# small stability margin cost.
 python -u -m src.train "${COMMON[@]}" \
+  --num-envs 128 --physics-num-sub-steps 8 \
   --remount-cycle --terminate-on never --max-steps 1000 \
   --total-steps 5000000 --run-name phase1_fullcycle \
   --resume "$A_CKPT" \
