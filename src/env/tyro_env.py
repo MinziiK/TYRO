@@ -1550,18 +1550,27 @@ class TyroEnv(gym.Env):
             return end_pos, np.asarray(end_quat, dtype=np.float64)
 
         if stage == 2:
-            hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
-            hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
-            tire_demount_pos = (
-                np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
-                - hub_axis * float(self.cfg.demount_axial_distance) * 1.2
+            # **2026-06-05 (demount = exact reverse of the Stage-1 insertion)**
+            # Stage 1's final leg is a coaxial straight push from the
+            # ``mount + standoff`` via-point (``−Y`` by
+            # ``planner_stage1_approach_standoff``) into the hub, holding the
+            # mount EE orientation fixed. The demount must be the EXACT reverse:
+            # take the Stage-1 mount end-pose and translate it straight back
+            # along the hub axis by the SAME standoff, keeping the orientation
+            # identical. This yields a pure −Y straight pull-off (no yaw, no
+            # x/z drift) instead of the previous ``_quat_align_z_to`` re-orient
+            # that bent the path. Falls back to ``demount_axial_distance`` only
+            # if no standoff is configured.
+            s1_pos, s1_quat = self._compute_stage_end_ee_pose(1)
+            so = self._hub_axis_standoff_vector()
+            if so is None:
+                hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
+                hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
+                so = hub_axis * float(self.cfg.demount_axial_distance) * 1.2
+            return (
+                np.asarray(s1_pos, dtype=np.float64) + so,
+                np.asarray(s1_quat, dtype=np.float64),
             )
-            tire_end_quat = _quat_align_z_to(hub_axis)
-            if have_grasp:
-                return self._ee_pose_for_tire_pose(
-                    tire_demount_pos, tire_end_quat,
-                )
-            return tire_demount_pos.copy(), palm_up
 
         # Stage 3 — cradle return, tire stands on rails.
         tire_end_pos = np.asarray(self.cfg.tire_pickup_pos, dtype=np.float64)
@@ -1579,6 +1588,7 @@ class TyroEnv(gym.Env):
                                      lift: float = 0.0,
                                      orient_front_load_k: float = 0.0,
                                      approach_standoff: Optional[np.ndarray] = None,
+                                     departure_standoff: Optional[np.ndarray] = None,
                                      ) -> Tuple[np.ndarray, np.ndarray]:
         """Build a ``(N, 3) / (N, 4)`` nominal EE trajectory.
 
@@ -1619,21 +1629,30 @@ class TyroEnv(gym.Env):
 
         start_arr = np.asarray(start_pos, dtype=np.float64).reshape(3)
         end_arr = np.asarray(end_pos, dtype=np.float64).reshape(3)
-        has_standoff = False
+        has_approach = False
+        has_departure = False
         if approach_standoff is not None:
             so = np.asarray(approach_standoff, dtype=np.float64).reshape(3)
-            has_standoff = float(np.linalg.norm(so)) > 1e-6
-        if has_standoff:
-            # General multi-via path (start, [apex], standoff, end). Only
-            # taken when an insertion standoff is requested (e.g. a future
-            # scene redesign); the shipping config leaves standoff = 0 so
-            # the original arch path below is used unchanged.
+            has_approach = float(np.linalg.norm(so)) > 1e-6
+        if departure_standoff is not None:
+            ds = np.asarray(departure_standoff, dtype=np.float64).reshape(3)
+            has_departure = float(np.linalg.norm(ds)) > 1e-6
+        if has_approach or has_departure:
+            # Multi-via path supporting:
+            #   * Stage 1 — [start, apex?, end+standoff, end] (+Y insertion)
+            #   * Stage 3 — [start, start+standoff, apex?, end] (−Y extraction
+            #     first, mirror of Stage 1)
             waypoints = [start_arr]
+            if has_departure:
+                ds = np.asarray(departure_standoff, dtype=np.float64).reshape(3)
+                waypoints.append(start_arr + ds)
             if float(lift) > 1e-6:
                 waypoints.append(
                     0.5 * (start_arr + end_arr)
                     + np.array([0.0, 0.0, float(lift)], dtype=np.float64))
-            waypoints.append(end_arr + so)
+            if has_approach:
+                so = np.asarray(approach_standoff, dtype=np.float64).reshape(3)
+                waypoints.append(end_arr + so)
             waypoints.append(end_arr)
             traj_pos = _multi_min_jerk_positions(waypoints, n)
         elif float(lift) > 1e-6:
@@ -1687,7 +1706,10 @@ class TyroEnv(gym.Env):
             end_pos = np.asarray(end_pos, dtype=np.float64)
             end_quat = np.asarray(end_quat, dtype=np.float64)
             lift = 0.0
-            if stage == 1:
+            if stage in (1, 3):
+                # Stage 3 (return) mirrors the Stage-1 carry arch in reverse:
+                # standoff → apex → cradle. Same lift keeps it the visual
+                # reverse of the orange carry.
                 lift = float(getattr(self.cfg, "planner_stage1_lift", 0.2))
             front_load_k = 0.0
             if stage in (1, 3):
@@ -1698,14 +1720,49 @@ class TyroEnv(gym.Env):
             if self._planner_palm_up_active(stage):
                 sq = self._tilt_lock_palm_up_quat(sq)
                 eq = self._tilt_lock_palm_up_quat(eq)
+            standoff = self._stage_approach_standoff(stage)
+            depart = self._stage_departure_standoff(stage)
             traj_pos, traj_quat = self._generate_nominal_trajectory(
                 (start_pos, sq), (end_pos, eq),
                 total_steps=n, lift=lift, orient_front_load_k=front_load_k,
+                approach_standoff=standoff,
+                departure_standoff=depart,
             )
             out[stage] = np.asarray(traj_pos, dtype=np.float64)
             start_pos = np.asarray(traj_pos[-1], dtype=np.float64)
             start_quat = np.asarray(traj_quat[-1], dtype=np.float64)
         return out
+
+    def _hub_axis_standoff_vector(self) -> Optional[np.ndarray]:
+        """``hub_axis_world * planner_stage1_approach_standoff``, or None."""
+        d = float(getattr(self.cfg, "planner_stage1_approach_standoff", 0.0))
+        if d <= 1e-6:
+            return None
+        hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
+        hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
+        return hub_axis * d
+
+    def _stage_approach_standoff(self, stage: int) -> Optional[np.ndarray]:
+        """Pre-hub via offset for Stage 1 (+Y insertion leg at trajectory end)."""
+        st = int(stage)
+        if bool(getattr(self.cfg, "remount_cycle_enable", False)):
+            st = {3: 1, 4: 2, 5: 3}.get(st, st)
+        if st != 1:
+            return None
+        return self._hub_axis_standoff_vector()
+
+    def _stage_departure_standoff(self, stage: int) -> Optional[np.ndarray]:
+        """Departure via offset (disabled).
+
+        **2026-06-05** — the coaxial −Y extraction leg now lives entirely in
+        Stage 2 (demount), whose end-pose is the Stage-1 mount pose translated
+        −Y by the standoff. Stage 3 therefore STARTS already at the standoff
+        via-point and only has to arc back to the cradle (the reverse of the
+        Stage-1 carry arch), so it needs no extra departure standoff. Returning
+        None keeps Stage 3 a clean ``standoff → apex → cradle`` mirror of the
+        carry instead of inserting a second redundant −Y leg.
+        """
+        return None
 
     def _replan_for_current_stage(self) -> None:
         """Rebuild the planner trajectory from the current EE pose.
@@ -1735,7 +1792,9 @@ class TyroEnv(gym.Env):
         # z = -0.30 + ~0.30 (plinth) ≈ 0 m, low enough that the arched
         # midpoint stays in reach.
         lift = 0.0
-        if int(self.task_stage) == 1:
+        if int(self.task_stage) in (1, 3):
+            # Stage 3 (return) arcs standoff → apex → cradle, the reverse of
+            # the Stage-1 carry arch (same lift).
             lift = float(getattr(self.cfg, "planner_stage1_lift", 0.2))
         # **2026-06-02 (D4 — yaw front-loading)** — Stage 1 (cradle→hub
         # carry) and Stage 3 (hub→cradle return) both require a 90 °
@@ -1771,16 +1830,8 @@ class TyroEnv(gym.Env):
             end_quat = self._tilt_lock_palm_up_quat(
                 np.asarray(end_quat, dtype=np.float64),
             )
-        standoff = None
-        if int(self.task_stage) == 1:
-            d = float(getattr(self.cfg, "planner_stage1_approach_standoff", 0.0))
-            if d > 1e-6:
-                hub_axis = np.asarray(
-                    self.cfg.hub_axis_world, dtype=np.float64)
-                hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
-                # Stand off *along* the hub axis (−Y) so the final approach
-                # is a straight insertion into the wheel well.
-                standoff = hub_axis * d
+        standoff = self._stage_approach_standoff(int(self.task_stage))
+        depart = self._stage_departure_standoff(int(self.task_stage))
         traj_pos, traj_quat = self._generate_nominal_trajectory(
             (np.asarray(start_pos, dtype=np.float64),
              np.asarray(start_quat, dtype=np.float64)),
@@ -1790,6 +1841,7 @@ class TyroEnv(gym.Env):
             lift=lift,
             orient_front_load_k=front_load_k,
             approach_standoff=standoff,
+            departure_standoff=depart,
         )
         self._traj_pos = traj_pos
         self._traj_quat = traj_quat

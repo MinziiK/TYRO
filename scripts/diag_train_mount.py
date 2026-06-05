@@ -45,7 +45,7 @@ def main() -> int:
     # Force easy (attached) spawn so we isolate the carry/mount path.
     env.set_start_pos_easy_prob(0.999)
     # Soft mount gate as the curriculum starts (0.30 m / 30 deg).
-    for ep in range(2):
+    for ep in range(1):
         env.reset()
         env.set_mount_tol(
             float(cfg.mount_radius_tol_soft),
@@ -61,24 +61,54 @@ def main() -> int:
         success = False
         last_stage = ts0
         stage_seq = [ts0]
-        for i in range(int(cfg.max_steps)):
+        import pybullet as p
+        mount_target = np.asarray(cfg.tire_mount_pos, float)
+        mtol = float(getattr(env, "_mount_radius_tol", cfg.mount_radius_tol))
+        atol = float(getattr(env, "_mount_angle_tol", cfg.reward.delta_A))
+
+        def _gate():
+            tp_ = np.asarray(env.scene.tire_pose()[0], float)
+            dm = float(np.linalg.norm(tp_ - mount_target))
+            th = float(np.arccos(np.clip(
+                np.dot(env.scene.tire_axis(), env.scene.hub_axis()),
+                -1.0, 1.0)))
+            return dm, th
+
+        dm0, th0 = _gate()
+        min_dm = dm0
+        min_th = th0
+        snap = {}
+        traj_n = int(env._traj_pos.shape[0]) if env._traj_pos is not None else -1
+        idx_snap = {}
+        cap = int(getattr(cfg, "max_steps", 600))
+        for i in range(cap):
             _, _, term, trunc, info = env.step(act)
-            tp = np.asarray(env.scene.tire_pose()[0], float)
-            hp = np.asarray(env.scene.hub_pose()[0], float)
-            d = float(np.linalg.norm(tp - hp))
-            min_d = min(min_d, d)
+            for ms in (100, 200, 300, 400, 500, 600):
+                if i + 1 == ms:
+                    idx_snap[ms] = int(env.current_traj_step)
+            dm, th = _gate()
+            min_dm = min(min_dm, dm)
+            min_th = min(min_th, th)
             st = int(info.get("task_stage", env.task_stage))
             if st != last_stage:
                 stage_seq.append(st)
                 last_stage = st
             if info.get("is_success"):
                 success = True
+            for ms in (100, 200, 300, 400, 600):
+                if i + 1 == ms:
+                    snap[ms] = (round(dm, 3), round(np.rad2deg(th), 1))
             if term or trunc:
                 break
-        print(f"ep{ep}: start_stage={ts0} grasped0={grasped0} "
-              f"d0={d0:.3f} min_d(tire,hub)={min_d:.3f} "
-              f"end_stage={last_stage} stages={stage_seq} "
-              f"success={success} steps={i+1} term={info.get('termination')}")
+        print(f"ep{ep}: start_stage={ts0} grasped0={grasped0} GATE mtol={mtol:.2f} "
+              f"atol={np.rad2deg(atol):.0f}deg | d_mount0={dm0:.3f} "
+              f"min_d_mount={min_dm:.3f} min_theta={np.rad2deg(min_th):.1f}deg | "
+              f"(d_mount,thetaDeg)@steps={snap} end_stage={last_stage} "
+              f"stages={stage_seq} success={success} steps={i+1}")
+        print(f"      TRAJ INDEX: reached {int(env.current_traj_step)}/{traj_n} "
+              f"waypoints (gate={getattr(cfg,'planner_waypoint_gate_enable',None)} "
+              f"max_stall={getattr(cfg,'planner_waypoint_max_stall',None)}) "
+              f"idx@steps={idx_snap}")
     env.close()
     return 0
 

@@ -30,8 +30,16 @@ def build_wheel_gripper_xml(
     pad_gap: float = 0.52,
     tip_offset_z: float = 0.06,
     mass: float = 8.0,
+    include_pads: bool = True,
 ) -> str:
-    """Chuck disk + 3 radial pads; tip at bore contact plane (+Z from tool0)."""
+    """Chuck disk + 3 radial pads; tip at bore contact plane (+Z from tool0).
+
+    ``include_pads=False`` omits the three radial pads entirely (no visual,
+    no collision). The pads never actually grasp — the tire is bonded with a
+    JOINT_FIXED constraint — so dropping them only removes the yellow cosmetic
+    cylinders and their (incidental) collision shapes. ``wheel_tool_tip`` (the
+    IK end-effector) is defined off ``wg_chuck`` and is unaffected.
+    """
     lines = [
         '<?xml version="1.0"?>',
         '<robot name="wheel_gripper">',
@@ -69,7 +77,7 @@ def build_wheel_gripper_xml(
         "    <child link=\"wg_chuck\"/>",
         "  </joint>",
     ]
-    for i in range(3):
+    for i in range(3 if include_pads else 0):
         ang = i * (2.0 * math.pi / 3.0)
         px = pad_gap * math.cos(ang)
         py = pad_gap * math.sin(ang)
@@ -129,9 +137,17 @@ def main() -> int:
         type=Path,
         default=repo / "data" / "urdf" / "wheel_gripper" / "wheel_gripper.urdf",
     )
+    ap.add_argument(
+        "--no-pads",
+        action="store_true",
+        help="Omit the 3 yellow radial grip pads (visual+collision).",
+    )
     args = ap.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(build_wheel_gripper_xml(), encoding="utf-8")
+    args.output.write_text(
+        build_wheel_gripper_xml(include_pads=not args.no_pads),
+        encoding="utf-8",
+    )
     print(f"[wheel_gripper] wrote {args.output}")
     return 0
 

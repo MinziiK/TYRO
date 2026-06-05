@@ -19,9 +19,9 @@ COMMON=(
   # Mount-tol curriculum: the callback re-broadcasts these every rollout
   # from EnvConfig() defaults (which DON'T see the fanuc_spacious layout
   # overrides), so they MUST be passed on the CLI or the soft gate reverts
-  # to an unreachable 0.30 m. Open to 0.85 m / 45deg (reachable by the
-  # zero-residual carry) and tighten to 0.04 m / 5deg over a longer ramp.
-  --mount-radius-soft 0.85 --mount-angle-soft-deg 45
+  # to an unreachable 0.30 m. 0.55 m / 45deg: wider than hard gate but
+  # narrower than the 0.70 m standoff so the +Y insertion leg runs first.
+  --mount-radius-soft 0.55 --mount-angle-soft-deg 45
   --mount-tol-ramp-steps 1500000
 )
 

@@ -1570,7 +1570,12 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: R≈0.40 (narrower circular pit), and (b) the forearm clears the floor at a
     #: LOWER pickup (1.00 instead of 1.34 → much lower rack).
     #: (B-origin frame: world (−1.10, 0.0, −0.90) − (0.20, 0.40, 0).)
-    cfg.robot_A_base_pos = (-1.30, -0.40, -0.90)
+    #: **2026-06-05 (B→origin parallel translation)** — whole scene shifted
+    #: −0.90 m in Y so Robot B's base lands exactly on the world origin (was at
+    #: y=0.90). This is a rigid translation of EVERY absolute landmark, so all
+    #: relative geometry (reach, clearances, the just-fixed pit) is invariant;
+    #: only the world frame is re-anchored to Robot B. (was y=−0.40.)
+    cfg.robot_A_base_pos = (-1.30, -1.30, -0.90)
     #: Ground plane at Z=0 — flush with Robot B's base (origin), so B stands
     #: directly on the floor with no stand pillar. The FANUC base (Z=−0.95)
     #: sits *below* the plane (intentionally buried for reach/height); since
@@ -1600,10 +1605,18 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: circle physically blocks any arm link from punching through.
     cfg.floor_pit_enable = True
     cfg.floor_pit_shape = "circle"
-    cfg.floor_pit_depth = 0.65
-    #: (B-origin frame: was (−1.15, 0.05); −(0.20, 0.40).)
-    cfg.floor_pit_center = (-1.35, -0.35)
-    cfg.floor_pit_radius = 0.65
+    #: **2026-06-05 (pit-rim collision fix)** — depth/radius had been shrunk to
+    #: 0.65/0.65 which left link_2 (J2 shoulder) jammed against the pit-mouth
+    #: rim at z=0 (peakF≈1484 N, scripts/diag_pit_link.py). The base column
+    #: sits at z=−0.90, so the pit must be at least that deep; depth 0.95
+    #: fully buries the column and clears link_1 (≈−0.83). Radius 0.90 clears
+    #: the fat lower-arm (link_2) cross-section with ≥5 cm wall margin
+    #: (scripts/verify_pit.py) and still leaves solid floor to Robot B's
+    #: pedestal at the origin (+X edge at −0.45).
+    cfg.floor_pit_depth = 0.95
+    #: B→origin translation: y −0.35 → −1.25 (was −0.35).
+    cfg.floor_pit_center = (-1.35, -1.25)
+    cfg.floor_pit_radius = 0.90
     #: Hub at Y=0.70, Z=0.85. **2026-06-04 (raise + pull-in for mount)** —
     #: raising the hub so a grasped tire can actually be inserted requires
     #: BOTH (a) the gripper to dip under the hub to (0, hub_y, hub_z − R), and
@@ -1655,7 +1668,15 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: mount target (0.475) keeps the below-floor geometry column-only (R≈0.41 <
     #: pit R=0.65 — scripts/measure_pit_footprint.py), and the mounted tire
     #: still clears the floor by 0.475 m.
-    #: (B-origin frame: world (−0.50, 0.85, 1.00) − (0.20, 0.40, 0).)
+    #: **2026-06-05 (+Y corridor widen, B↔hub spacing fixed)** — hub/cargo/
+    #: bolts/UR10e base translated +0.90 m along +Y to open the carry/mount
+    #: corridor (FANUC arm links were jamming cargo+hub_mount at the old
+    #: y=0.45 hub). Robot A + tire rack stay fixed; ``obs_reference_pos``
+    #: stays at the world origin so policy obs still treat B as the origin
+    #: frame. UR10e bolt reach is unchanged because B moves with the hub
+    #: (scripts/sweep_hub_y.py: dY=0.90 → SEATED, worst-bolt 0.1 cm).
+    #: (B-origin frame: world (−0.50, 1.75, 1.00) − (0.20, 0.40, 0).)
+    #: B→origin translation: hub y 1.35 → 0.45 (was 1.35).
     cfg.hub_pos_nominal = (-0.70, 0.45, 1.00)
     cfg.tire_mount_pos = cfg.hub_pos_nominal
     #: Tire / rack at X=−2.90 — a compact ~1.8 m from the (pulled-in) FANUC
@@ -1675,11 +1696,13 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: sit much lower while the below-floor geometry stays confined to the
     #: column. (scripts/measure_pit_footprint.py base/pickup sweep.)
     #: (B-origin frame: world (−2.90, 0.0, 1.00) − (0.20, 0.40, 0).)
-    cfg.tire_pickup_pos = (-3.10, -0.40, 1.00)
+    #: B→origin translation: pickup y −0.40 → −1.30 (was −0.40).
+    cfg.tire_pickup_pos = (-3.10, -1.30, 1.00)
     #: Vehicle body tracks the hub (kept +0.25 m behind in Y, +0.56 m above in
     #: Z so the wheel-well cutout stays centred on the hub): hub
     #: (−0.50,0.85,0.85) → vehicle (−0.50, 1.10, 1.41).
-    #: (B-origin frame: world (−0.50, 1.10, 1.56) − (0.20, 0.40, 0).)
+    #: (B-origin frame: world (−0.50, 2.00, 1.56) − (0.20, 0.40, 0).)
+    #: B→origin translation: vehicle y 1.60 → 0.70 (was 1.60).
     cfg.vehicle_center_world = (-0.70, 0.70, 1.56)
     cfg.cargo_back_wall_y_offset = 0.35
     #: **2026-06-05 (align wall bottom with cargo bottom)** — the back wall
@@ -1717,8 +1740,9 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: to the bar bottom (0.559).
     cfg.tire_rack_half_extents = (0.10, 0.05, 0.025)
     #: (B-origin frame: world (−2.90, ±0.40, 0.584) − (0.20, 0.40, 0).)
-    cfg.tire_rack_inner_center = (-3.10, 0.00, 0.584)
-    cfg.tire_rack_outer_center = (-3.10, -0.80, 0.584)
+    #: B→origin translation: rack y {0.00,−0.80} → {−0.90,−1.70}.
+    cfg.tire_rack_inner_center = (-3.10, -0.90, 0.584)
+    cfg.tire_rack_outer_center = (-3.10, -1.70, 0.584)
     cfg.tire_rack_support_posts = True
     cfg.tire_rack_post_half_extents_xy = (0.10, 0.05)
 
@@ -1757,10 +1781,14 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: bolt (worst-bolt IK ≈ 0.9 mm; Bx=0.40 misses by 13 cm). This pulls B off
     #: the carry/mount corridor so the carried tire clears it with more margin.
     #: (scripts/sweep_b_and_hubz.py.)
-    #: Robot B (UR10e) now sits AT the world origin (was (0.20, 0.40, 0)); the
-    #: whole layout above was translated by −(0.20, 0.40, 0) to land it here.
+    #: UR10e base follows the hub +0.90 m (+Y) so B↔bolt geometry is invariant.
+    #: ``obs_reference_pos`` stays at the world origin — policy obs still use B
+    #: as the reference frame even though B's sim base is at y=0.90.
+    #: **2026-06-05 (B→origin)** — Robot B's base now sits exactly on the world
+    #: origin (was y=0.90). The whole scene was translated −0.90 m in Y so B is
+    #: the physical origin AND the observation reference, removing the prior
+    #: split where the obs frame (origin) and B's sim base (y=0.90) disagreed.
     cfg.robot_B_base_pos = (0.0, 0.0, 0.0)
-    #: Observation frame == world origin == Robot B's base.
     cfg.obs_reference_pos = (0.0, 0.0, 0.0)
 
     cfg.tire_mass = cfg.tire_mass_heavy
@@ -1780,7 +1808,11 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.planner_traj_steps = 200
     #: Wait until the measured EE is near the nominal waypoint before advancing
     #: the traj index (prevents the index from outrunning the heavy load).
-    cfg.planner_waypoint_gate_enable = True
+    #: Baked joint traj advances one waypoint/step; the EE-arrival gate throttled
+    #: the index to ~1 step per 15 controls (arm lagging nominal by >6 cm) which
+    #: made carry painfully slow and never reached the +Y insertion leg within
+    #: 600 steps (diag_train_mount: idx 61/200 at timeout). Disable for FANUC.
+    cfg.planner_waypoint_gate_enable = False
     cfg.planner_waypoint_pos_tol_m = 0.06
     cfg.planner_waypoint_max_stall = 15
     cfg.kinematic_tire_lock_stages = (0,)
@@ -1791,11 +1823,11 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: insertion segment (the baked *nominal* reaches 0.07 m, but the live
     #: arm lags). The old 0.30 m soft mount gate is therefore unreachable
     #: from the carry start, so R_mount never fired in 2 M steps
-    #: (success_rate stuck at 0). Open the soft gate to 0.85 m / 45° so the
-    #: mount event fires from the start of training, then let the existing
-    #: curriculum tighten it to the hard 0.04 m / 5° over a longer ramp as
-    #: the policy's residual learns to close the final insertion.
-    cfg.mount_radius_tol_soft = 0.85
+    #: (success_rate stuck at 0). Soft gate must be **narrower than**
+    #: ``planner_stage1_approach_standoff`` (0.70 m): at 0.85 m the FSM
+    #: fired mount at the standoff via-point before the +Y insertion leg.
+    #: 0.55 m forces the coaxial insertion segment to run first.
+    cfg.mount_radius_tol_soft = 0.55
     cfg.mount_angle_tol_soft_rad = np.deg2rad(45.0)
     cfg.mount_tol_ramp_steps = 1_500_000
     #: Double the per-step residual authority (0.10→0.20 m) so the policy
