@@ -3539,6 +3539,22 @@ class TyroEnv(gym.Env):
             for cp in cps_t:
                 if len(cp) > 8 and float(cp[8]) < pen_tol:
                     return True
+        # **2026-06-06 (tire-vs-robotB)** — the carried tire must not clip
+        # Robot B (UR10e + 30 cm nut-runner). B is frozen at HOME in Phase 1
+        # but its tool reaches toward the hub (+Y), and the ±0.20 m policy
+        # residual can push the carried tire toward it. Like the cargo
+        # check above this uses ``getClosestPoints`` so it is correct under
+        # the kinematic upright lock (which teleports the tire post-step).
+        # tire-vs-robotA is intentionally NOT checked here — that is the
+        # gripper grasp contact.
+        if self.robot_B is not None:
+            cps_b = p.getClosestPoints(
+                bodyA=tire_uid, bodyB=self.robot_B.uid, distance=0.0,
+                physicsClientId=self.client,
+            )
+            for cp in cps_b:
+                if len(cp) > 8 and float(cp[8]) < pen_tol:
+                    return True
         return False
 
     def _max_contact_normal_force(self) -> float:
