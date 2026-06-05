@@ -41,6 +41,8 @@ def main() -> int:
     ap.add_argument("--cutout-back", type=float, default=None,
                     help="cargo_wheel_well_x_range_from_hub min (negative, e.g. -1.1)")
     ap.add_argument("--sweep-only", action="store_true")
+    ap.add_argument("--no-remount", action="store_true",
+                    help="reproduce the trainer stage3/phase1 path (remount off)")
     args = ap.parse_args()
     extra = {}
     if args.standoff is not None:
@@ -51,7 +53,7 @@ def main() -> int:
         extra["cargo_wheel_well_x_range_from_hub"] = (float(args.cutout_back), 0.85)
     cfg = make_env_config(
         stage=1, phase=1, scene_layout="fanuc_spacious",
-        remount_cycle_enable=True,
+        remount_cycle_enable=(not args.no_remount),
         terminate_on="never",
         reverse_curriculum_enable=False,
         start_pos_curriculum_enable=True,

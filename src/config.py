@@ -1784,6 +1784,24 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.planner_waypoint_pos_tol_m = 0.06
     cfg.planner_waypoint_max_stall = 15
     cfg.kinematic_tire_lock_stages = (0,)
+
+    #: **2026-06-05 (mount gate matched to carry tracking reach)** — with
+    #: the 100 kg tire the zero-residual baked carry tracks to ~0.74 m of
+    #: the hub before the position-controlled arm saturates on the fine
+    #: insertion segment (the baked *nominal* reaches 0.07 m, but the live
+    #: arm lags). The old 0.30 m soft mount gate is therefore unreachable
+    #: from the carry start, so R_mount never fired in 2 M steps
+    #: (success_rate stuck at 0). Open the soft gate to 0.85 m / 45° so the
+    #: mount event fires from the start of training, then let the existing
+    #: curriculum tighten it to the hard 0.04 m / 5° over a longer ramp as
+    #: the policy's residual learns to close the final insertion.
+    cfg.mount_radius_tol_soft = 0.85
+    cfg.mount_angle_tol_soft_rad = np.deg2rad(45.0)
+    cfg.mount_tol_ramp_steps = 1_500_000
+    #: Double the per-step residual authority (0.10→0.20 m) so the policy
+    #: can actively drive the heavy tire the last ~0.4 m into the gate that
+    #: the baked nominal alone cannot pull the lagging arm through.
+    cfg.planner_pos_offset_scale = 0.20
     cfg.obs.workspace_radius = 3.0
     cfg.grasp_com_offset_world = (0.0, 0.0, 1.0)
 

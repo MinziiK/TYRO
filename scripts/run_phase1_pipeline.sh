@@ -12,6 +12,17 @@ COMMON=(
   --num-envs 72 --n-steps 341 --batch-size 1024
   --device cuda
   --eval-freq 250000 --eval-episodes 5
+  # Keep more attached/easy (carry+mount) samples so the mount policy is
+  # mastered before hard pickup spawns dominate (Phase-A goal).
+  --start-pos-easy-prob-schedule-mid 0.7
+  --start-pos-easy-prob-schedule-end 0.6
+  # Mount-tol curriculum: the callback re-broadcasts these every rollout
+  # from EnvConfig() defaults (which DON'T see the fanuc_spacious layout
+  # overrides), so they MUST be passed on the CLI or the soft gate reverts
+  # to an unreachable 0.30 m. Open to 0.85 m / 45deg (reachable by the
+  # zero-residual carry) and tighten to 0.04 m / 5deg over a longer ramp.
+  --mount-radius-soft 0.85 --mount-angle-soft-deg 45
+  --mount-tol-ramp-steps 1500000
 )
 
 echo "[pipeline] === Phase A: mount-only ==="
