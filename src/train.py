@@ -858,6 +858,12 @@ def main() -> int:
     ap.add_argument("--max-grad-norm", type=float, default=0.5)
     ap.add_argument("--net-arch", type=str, default="256,256",
                     help="Comma-separated hidden layer widths for MlpPolicy.")
+    ap.add_argument("--log-std-init", type=float, default=0.0,
+                    help="Initial log-std of the Gaussian policy. 0.0 => std "
+                         "1.0 (SB3 default); -0.5 => std ~0.61 (tighter "
+                         "exploration so the stochastic residual stays near "
+                         "the already-good nominal and clears the tight mount "
+                         "gate). Transfers via policy-only resume.")
 
     # Pickup-gate curriculum (Stage 0 → 1 trigger) — opt-in; mount-only skips Stage 0.
     _cfg_defaults = EnvConfig()
@@ -1388,7 +1394,7 @@ def main() -> int:
     # Model
     # ------------------------------------------------------------------
     net_arch = [int(w) for w in args.net_arch.split(",") if w]
-    policy_kwargs = dict(net_arch=net_arch)
+    policy_kwargs = dict(net_arch=net_arch, log_std_init=args.log_std_init)
 
     if args.resume and args.resume_mode == "full":
         # Full resume: restore optimizer, LR/clip schedules, num_timesteps, and

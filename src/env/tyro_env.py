@@ -352,6 +352,19 @@ class TyroEnv(gym.Env):
         self._mount_hold_left = 0
         self._mount_frozen_q = None
         self._mount_hold_finish_term = False
+        # 2026-06-06 — mount-seat glide state. While ``_mount_seat_active``
+        # the tire is kinematically interpolated from ``_mount_seat_t0_*``
+        # (its grasped pose at gate fire) to ``_mount_seat_tgt_*`` (the exact
+        # seated hub pose) over ``_mount_seat_total`` env steps; the
+        # ``mounted`` event + bond are deferred until ``_mount_seat_left``
+        # reaches 0. Removes the instant snap teleport at the mount instant.
+        self._mount_seat_active = False
+        self._mount_seat_left = 0
+        self._mount_seat_total = 0
+        self._mount_seat_t0_pos = None
+        self._mount_seat_t0_orn = None
+        self._mount_seat_tgt_pos = None
+        self._mount_seat_tgt_orn = None
         # v6 (4-stage FSM) — also reset Stage-2 bookkeeping at the start
         # of every reset call so the demount stall counter never carries
         # state across episode boundaries (each new episode = fresh 20-step
@@ -394,6 +407,7 @@ class TyroEnv(gym.Env):
             cargo_xy_offset=tuple(self._dr_cargo_xy_offset.tolist()),
         )
         self.handles = self.scene.build()
+        self._maybe_disable_tire_hub_collision()
 
         self.robot_A = make_robot_a(self.client, self.cfg)
         self.robot_B = make_robot_b(self.client, self.cfg)
@@ -1566,17 +1580,45 @@ class TyroEnv(gym.Env):
 
         if stage == 1:
             # Mount end-pose: gripper UNDER the tire (6-o'clock), palm-up
-            # (tool +Z ‖ world +Z).  Use ``palm_up`` (= FINAL_LOCK from
-            # ``fanuc_home_pose`` FK) with **0° extra yaw** — do NOT apply
-            # the UR10-era −90° Z rotation here.  On FANUC that rotation
-            # kept palm-up (Z-rot preserves tool +Z) but swung tool +X
-            # 90° away from ``hub_axis_world`` (scripts/diag_mount_yaw_palm.py:
-            # 0° → bore ‖ hub 0.5°, −90° → 90° off).  ``_tilt_lock_palm_up_quat``
-            # still enforces tool +Z = world +Z on every planner step.
+            # (tool +Z ‖ world +Z) with a **−90° yaw about world +Z**.
+            #
+            # **2026-06-06 (yaw restored — fixes theta_A frozen at 90°).**
+            # The tire is carried upright (``+Z``) and its yaw rigidly tracks
+            # the gripper's yaw (true for BOTH the JOINT_FIXED grasp and the
+            # kinematic upright lock, which both rotate the bore about world
+            # +Z). The tire spawns with bore ‖ world +X; the hub axis is
+            # world −Y (``hub_axis_world``). So aligning the bore onto the hub
+            # needs a −90° world-Z yaw (+X → −Y). Commit 1074858 dropped this
+            # yaw (believing 0° already gave bore ‖ hub per an old
+            # diag_mount_yaw_palm.py reading), which left the bore stuck at +X
+            # → ``theta_A = 90°`` every step → the mount gate (θ < δ_A) could
+            # NEVER fire (training ran full 600-step episodes, success_rate 0).
+            # A yaw about world +Z preserves tool +Z, so palm-up / upright is
+            # unchanged — only the bore swings onto the hub axis.
             R = float(self.cfg.tire_outer_radius)
             hub_pos = np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
-            end_pos = hub_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
-            end_quat = np.asarray(palm_up, dtype=np.float64)
+            yaw_rot = axisangle3_to_quat(
+                np.array([0.0, 0.0, -np.pi / 2.0], dtype=np.float64)
+            )
+            end_quat = np.asarray(quat_multiply(
+                np.asarray(yaw_rot, dtype=np.float64),
+                np.asarray(palm_up, dtype=np.float64),
+            ), dtype=np.float64)
+            # **2026-06-06 (seat-gap fix)** — derive the END position from the
+            # actual cached grasp offset instead of the ``hub - R·ẑ``
+            # heuristic. The heuristic assumed the tire centre sits exactly R
+            # straight below the EE, but the real ``T_ee_tire`` offset differs
+            # by ~3 cm, so the baked nominal left the tire ~3 cm short of the
+            # hub even at zero residual (the leftover seat-glide slide). With
+            # the grasp transform, the EE end pose places the grasped tire
+            # centre exactly on ``tire_mount_pos`` (bore aligned by ``end_quat``
+            # as before). Falls back to the heuristic if no grasp is cached.
+            if have_grasp:
+                rel_pos = np.asarray(self._grasp_t_ee_tire_pos, dtype=np.float64)
+                world_off = Rotation.from_quat(end_quat).apply(rel_pos)
+                end_pos = hub_pos - np.asarray(world_off, dtype=np.float64)
+            else:
+                end_pos = hub_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
             return end_pos, end_quat
 
         if stage == 2:
@@ -2162,6 +2204,35 @@ class TyroEnv(gym.Env):
     # ------------------------------------------------------------------
     # FSM constraint helpers — world-pin (floor) ↔ grasp (UR10 EE)
     # ------------------------------------------------------------------
+    def _maybe_disable_tire_hub_collision(self) -> None:
+        """Filter out tire↔hub collision when ``disable_tire_hub_collision``.
+
+        The seated wheel disk (inner radius 0.10) geometrically overlaps the
+        hub flange cylinder (radius 0.21) because the lug circle (0.1675) sits
+        inside the flange footprint. Under the kinematic carry/seat this drove
+        a ~700 kN per-step tire↔hub contact impulse (the visible "bouncing off
+        the hub" jitter). The rigid ``_attach_tire_to_hub`` bond defines the
+        final seated state and the vehicle wheel-well cutout + cargo back wall
+        still constrain the gross approach, so the hub's collision against the
+        tire is filtered for the whole episode. Covers every hub/truck link
+        (flange base + bolt children).
+        """
+        if not bool(getattr(self.cfg, "disable_tire_hub_collision", False)):
+            return
+        if self.handles is None:
+            return
+        tire_uid = int(self.handles.tire)
+        hub_uid = int(self.handles.hub.uid)
+        try:
+            n_links = p.getNumJoints(hub_uid, physicsClientId=self.client)
+        except p.error:
+            n_links = 0
+        for link in range(-1, n_links):
+            p.setCollisionFilterPair(
+                tire_uid, hub_uid, -1, link, 0,
+                physicsClientId=self.client,
+            )
+
     def _pin_tire_to_world(self, pos: np.ndarray, orn: np.ndarray) -> None:
         """Park the tire at ``(pos, orn)`` and make it fully static.
 
@@ -2202,6 +2273,48 @@ class TyroEnv(gym.Env):
             )
             self._world_pin = None
 
+    def _seated_tire_orn(self) -> np.ndarray:
+        """Seated bore-aligned orientation that PRESERVES the carried roll.
+
+        **2026-06-06 (seat-spin fix)** — the carried tire (``_upright_tire_
+        quat_for_ee`` = ``Rz(yaw)·Ry(90°)``) holds a stable roll about the hub
+        axis (measured +180°), but the previous seated target
+        (``_quat_align_z_to(hub_axis)`` = minimal ``Rx(90°)``) sat at −90°
+        roll. Snapping/gliding to that target spun the tire ~90° about the hub
+        axis as it seated — the visible "tire rotating about Y while entering
+        the hub". This builds the seated orientation by applying only the
+        *minimal tilt correction* that maps the tire's current bore exactly
+        onto the hub axis, leaving the roll about that axis untouched. Since
+        the bore is already aligned to <0.3° at the mount gate, the correction
+        is tiny and seating becomes a pure axial insertion (no spin).
+        """
+        hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
+        hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
+        _, cur_orn = self.scene.tire_pose()
+        R = Rotation.from_quat(np.asarray(cur_orn, dtype=np.float64))
+        bore = R.apply([0.0, 0.0, 1.0])
+        bore = bore / max(float(np.linalg.norm(bore)), 1e-9)
+        v = np.cross(bore, hub_axis)
+        s = float(np.linalg.norm(v))
+        c = float(np.dot(bore, hub_axis))
+        if s < 1e-9:
+            # Already (anti)parallel: identity for aligned, 180° about any
+            # bore-perpendicular axis for the degenerate flip.
+            if c > 0.0:
+                return np.asarray(cur_orn, dtype=np.float64)
+            perp = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(float(np.dot(perp, hub_axis))) > 0.9:
+                perp = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            perp = perp - hub_axis * float(np.dot(perp, hub_axis))
+            perp = perp / max(float(np.linalg.norm(perp)), 1e-9)
+            delta = Rotation.from_rotvec(np.pi * perp)
+        else:
+            axis = v / s
+            angle = float(np.arctan2(s, c))
+            delta = Rotation.from_rotvec(angle * axis)
+        seated = delta * R
+        return np.asarray(seated.as_quat(), dtype=np.float64)
+
     def _attach_tire_to_hub(self) -> None:
         """Physically bond the seated tire to the hub (fixed constraint).
 
@@ -2209,12 +2322,13 @@ class TyroEnv(gym.Env):
         the tire keeps its dynamic mass but is rigidly held by the (fixed-
         base) hub, so it stays put while Robot B tightens the bolts. The
         tire is first snapped to the exact seated pose (``tire_mount_pos``,
-        bore ‖ ``hub_axis_world``) so the bond records a clean transform.
+        bore ‖ ``hub_axis_world``, roll preserved from the carry) so the bond
+        records a clean transform.
         """
         mount_pos = np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
         hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
         hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
-        mount_orn = _quat_align_z_to(hub_axis)
+        mount_orn = self._seated_tire_orn()
         self._mount_seated_pos = mount_pos.copy()
         self._mount_seated_orn = np.asarray(mount_orn, dtype=np.float64).copy()
 
@@ -2267,6 +2381,95 @@ class TyroEnv(gym.Env):
             maxForce=1.0e6, erp=1.0,
             physicsClientId=self.client,
         )
+
+    def _begin_mount_seat_glide(self, steps: int) -> None:
+        """Start a smooth kinematic slide of the tire onto the seated hub pose.
+
+        Records the tire's current grasped pose at the mount-gate fire and the
+        exact seated pose (``tire_mount_pos``, bore ‖ ``hub_axis_world``);
+        ``_advance_mount_seat_glide`` then interpolates between them over
+        ``steps`` env steps before ``_finalize_mount`` applies the bond. This
+        replaces the legacy instant snap (which teleported the tire the full
+        residual reach gap ~12-14 cm in one frame).
+        """
+        cur_pos, cur_orn = self.scene.tire_pose()
+        mount_pos = np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
+        # Roll-preserving seated orientation (see ``_seated_tire_orn``): only
+        # the tiny residual tilt is corrected, the carried roll about the hub
+        # axis is kept. With the bore already aligned to <0.3° at the gate the
+        # orientation barely changes, so the glide is a pure axial slide onto
+        # the hub — the tire no longer spins about the hub axis while the
+        # gripper holds still.
+        mount_orn = self._seated_tire_orn()
+        self._mount_seat_t0_pos = np.asarray(cur_pos, dtype=np.float64).copy()
+        self._mount_seat_t0_orn = np.asarray(cur_orn, dtype=np.float64).copy()
+        self._mount_seat_tgt_pos = mount_pos.copy()
+        self._mount_seat_tgt_orn = np.asarray(mount_orn, dtype=np.float64).copy()
+        self._mount_seat_total = int(max(1, steps))
+        self._mount_seat_left = int(max(1, steps))
+        self._mount_seat_active = True
+
+    def _advance_mount_seat_glide(self) -> None:
+        """Advance the in-progress mount-seat glide by one env step.
+
+        Interpolates the tire pose with smoothstep easing (position lerp,
+        normalized-lerp of the near-aligned bore quaternions) and clamps its
+        velocity to zero so the slide reads as a clean insertion.
+        """
+        if not self._mount_seat_active:
+            return
+        self._mount_seat_left = max(0, int(self._mount_seat_left) - 1)
+        done = self._mount_seat_total - self._mount_seat_left
+        frac = float(np.clip(done / max(1, self._mount_seat_total), 0.0, 1.0))
+        s = frac * frac * (3.0 - 2.0 * frac)
+        pos = (1.0 - s) * self._mount_seat_t0_pos + s * self._mount_seat_tgt_pos
+        q0 = self._mount_seat_t0_orn
+        q1 = self._mount_seat_tgt_orn
+        if float(np.dot(q0, q1)) < 0.0:
+            q1 = -q1
+        q = (1.0 - s) * q0 + s * q1
+        q = q / max(float(np.linalg.norm(q)), 1e-9)
+        p.resetBasePositionAndOrientation(
+            self.handles.tire, pos.tolist(), q.tolist(),
+            physicsClientId=self.client,
+        )
+        p.resetBaseVelocity(
+            self.handles.tire, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+            physicsClientId=self.client,
+        )
+
+    def _finalize_mount(self, remount: bool, events: Dict[str, Any]) -> None:
+        """Commit the mount: bond/pin the tire and emit the ``mounted`` event.
+
+        Called either immediately at the gate fire (legacy snap, when
+        ``mount_seat_glide_steps == 0``) or after the seat glide completes.
+        """
+        self._mount_bonus_paid = True
+        self.task_stage = 2
+        self._mount_done_step = int(self._step_count)
+        events["mounted"] = True
+        self._mount_seat_active = False
+        if remount:
+            # 6-stage cycle: seat + bond the tire to the hub and freeze the
+            # arm holding it while "Robot B tightens the nuts" (W1). After the
+            # hold elapses (handled in the Stage-2 block) the grasp is released
+            # and the empty gripper retracts to HOME.
+            self._attach_tire_to_hub()
+            self._grasp_kinematic = False
+            self._mount_frozen_q, _ = self.robot_A.joint_state()
+            self._mount_hold_left = int(getattr(self.cfg, "tighten_hold_steps", 0))
+            self._mount_hold_finish_term = False
+        else:
+            hold_steps = int(getattr(self.cfg, "mount_hold_steps", 0))
+            term_on = str(getattr(self.cfg, "terminate_on", "never")).lower()
+            if hold_steps > 0 and term_on == "mount":
+                self._begin_mount_hold()
+            elif bool(getattr(self.cfg, "pin_tire_on_mount", True)) and term_on == "mount":
+                self._pin_tire_at_hub_mount()
+        self._prev_d_approach = None
+        self._prev_d_return = None
+        # v11: reset Stage 2 PB shaping accumulator.
+        self._prev_d_hub = None
 
     def _begin_mount_hold(self) -> None:
         """Seat the tire on the hub and freeze the arm in a holding pose.
@@ -2384,35 +2587,23 @@ class TyroEnv(gym.Env):
             if getattr(self, "_phase_a_force_mount_first_step", False):
                 self._phase_a_force_mount_first_step = False
                 mounted = True
-            if mounted and not self._mount_bonus_paid:
-                self._mount_bonus_paid = True
-                self.task_stage = 2
-                self._mount_done_step = int(self._step_count)
-                events["mounted"] = True
-                if remount:
-                    # 6-stage cycle: seat + bond the tire to the hub and
-                    # freeze the arm holding it while "Robot B tightens the
-                    # nuts" (W1). After the hold elapses (handled in the
-                    # Stage-2 block below) the grasp is released and the
-                    # empty gripper retracts to HOME.
-                    self._attach_tire_to_hub()
-                    self._grasp_kinematic = False
-                    self._mount_frozen_q, _ = self.robot_A.joint_state()
-                    self._mount_hold_left = int(
-                        getattr(self.cfg, "tighten_hold_steps", 0)
-                    )
-                    self._mount_hold_finish_term = False
+            # 2026-06-06 — mount-seat glide. The arm reaches the stage-1 end
+            # pose ~10 cm short of the hub, so finalizing the mount with an
+            # instant ``resetBasePosition`` snap teleported the tire ~12-14 cm
+            # onto the hub in a single frame. Instead, slide the tire smoothly
+            # onto the seated pose over ``mount_seat_glide_steps`` env steps,
+            # then bond and emit ``mounted`` (so any mount-terminate still
+            # coincides with the tire actually being seated).
+            if self._mount_seat_active:
+                self._advance_mount_seat_glide()
+                if self._mount_seat_left <= 0:
+                    self._finalize_mount(remount, events)
+            elif mounted and not self._mount_bonus_paid:
+                glide_steps = int(getattr(self.cfg, "mount_seat_glide_steps", 0))
+                if glide_steps > 0:
+                    self._begin_mount_seat_glide(glide_steps)
                 else:
-                    hold_steps = int(getattr(self.cfg, "mount_hold_steps", 0))
-                    term_on = str(getattr(self.cfg, "terminate_on", "never")).lower()
-                    if hold_steps > 0 and term_on == "mount":
-                        self._begin_mount_hold()
-                    elif bool(getattr(self.cfg, "pin_tire_on_mount", True)) and term_on == "mount":
-                        self._pin_tire_at_hub_mount()
-                self._prev_d_approach = None
-                self._prev_d_return = None
-                # v11: reset Stage 2 PB shaping accumulator.
-                self._prev_d_hub = None
+                    self._finalize_mount(remount, events)
 
         elif self.task_stage == 2 and remount:
             # 6-stage cycle S2 — empty-handed retract to HOME after W1.
@@ -2448,13 +2639,23 @@ class TyroEnv(gym.Env):
             if (float(np.linalg.norm(ee_pos - grasp_target))
                     < float(getattr(self.cfg, "regrip_radius_tol", 0.10))
                     and not self._regrip_bonus_paid):
-                self._create_grasp_constraint_in_place(force_fixed=True)
+                # **2026-06-06 (kinematic demount carry)** — free the tire
+                # from the hub bond, then re-grasp it KINEMATICALLY (not a
+                # rigid JOINT_FIXED bond). A fixed bond forced the position
+                # PD to dynamically drag the 100 kg tire off the hub against
+                # the ~98 kN mount-seating penetration, which saturated the
+                # arm and pinned it (demount never fired). The kinematic lock
+                # teleports the tire to EE+offset each step (as S1–S3 do), so
+                # S4/S5 carry the tire without the drag/jam. ``stage 4`` is in
+                # ``kinematic_tire_lock_stages`` so the per-step sync runs.
                 self._release_hub_mount()
+                self._begin_kinematic_grasp()
                 self._regrip_bonus_paid = True
                 self.task_stage = 4
                 events["regripped"] = True
-                # Hold steady while "Robot B loosens the nuts" (W2).
-                self._grasp_kinematic = False
+                # Hold steady while "Robot B loosens the nuts" (W2). Keep the
+                # kinematic grasp (do NOT promote to fixed) so the demount
+                # pull-off below stays teleport-driven.
                 self._mount_frozen_q, _ = self.robot_A.joint_state()
                 self._mount_hold_left = int(getattr(self.cfg, "loosen_hold_steps", 0))
                 self._mount_hold_finish_term = False
@@ -2603,7 +2804,8 @@ class TyroEnv(gym.Env):
         palm_up_corrected = False
         if self._mount_hold_left <= 0:
             palm_up_corrected = self._enforce_robot_a_palm_up()
-        if self._grasp_kinematic and self._use_kinematic_tire_sync():
+        if (self._grasp_kinematic and self._use_kinematic_tire_sync()
+                and not self._mount_seat_active):
             self._sync_grasped_tire_upright()
         # The palm-up re-lock / kinematic tire sync above move bodies via
         # resetJointState / resetBasePositionAndOrientation WITHOUT a physics
@@ -2733,11 +2935,22 @@ class TyroEnv(gym.Env):
         if not bool(getattr(self.cfg, "planner_lock_palm_up", True)):
             return False
         st = int(self.task_stage if stage is None else stage)
-        allowed = tuple(
-            int(x) for x in getattr(
-                self.cfg, "planner_lock_palm_up_stages", (0,),
+        # 6-stage remount cycle uses its own stage set: S2 (empty retract to
+        # HOME) is excluded so baking targets the true home orientation
+        # (palm-up would land IK in a branch that stalls ~0.24 m short).
+        if bool(getattr(self.cfg, "remount_cycle_enable", False)):
+            allowed = tuple(
+                int(x) for x in getattr(
+                    self.cfg, "remount_planner_lock_palm_up_stages",
+                    (0, 1, 3, 4, 5),
+                )
             )
-        )
+        else:
+            allowed = tuple(
+                int(x) for x in getattr(
+                    self.cfg, "planner_lock_palm_up_stages", (0,),
+                )
+            )
         return st in allowed
 
     def _tilt_lock_palm_up_quat(
@@ -3450,12 +3663,30 @@ class TyroEnv(gym.Env):
         # (positive when Δd_hub > 0). Stage 3's PB return continues to
         # live in ``b.pb_shape`` (handled in the Stage 3 branch via
         # ``pb_step``), so we don't double-count here.
-        stage_dense_A = {
-            0: float(b.approach_A),
-            1: float(b.guide_A) + float(b.pb_carry),
-            2: float(b.demount) + float(b.pb_carry),
-            3: float(b.return_A) + float(b.landing),
-        }[int(self.task_stage)]
+        # **2026-06-06 (remount-cycle dense dispatch)** — the legacy dict
+        # only keyed 0..3, so the 6-stage cycle (a) mis-read S2/S3 (they
+        # compute ``return_A``/``approach_A`` above, but the legacy dict
+        # pulled ``demount``/``return_A`` for keys 2/3) and (b) raised
+        # ``KeyError`` the instant the FSM reached S4/S5. Map each remount
+        # stage to the term its upstream branch actually populated:
+        #   S0 approach_A · S1 guide+pb_carry · S2 return_A (retract→HOME)
+        #   S3 approach_A (regrip) · S4 demount+pb_carry · S5 return+landing
+        if remount:
+            stage_dense_A = {
+                0: float(b.approach_A),
+                1: float(b.guide_A) + float(b.pb_carry),
+                2: float(b.return_A),
+                3: float(b.approach_A),
+                4: float(b.demount) + float(b.pb_carry),
+                5: float(b.return_A) + float(b.landing),
+            }[ts]
+        else:
+            stage_dense_A = {
+                0: float(b.approach_A),
+                1: float(b.guide_A) + float(b.pb_carry),
+                2: float(b.demount) + float(b.pb_carry),
+                3: float(b.return_A) + float(b.landing),
+            }[int(self.task_stage)]
         common = ("coop", "sync_joint_A", "collision", "workspace",
                   "action", "jerk", "vertical_pen")
         b.dense_total_pre_mix = float(
@@ -3614,7 +3845,20 @@ class TyroEnv(gym.Env):
             # is active, ignore *all* contacts involving the tire body.
             # Robot-vs-plane / robot-vs-vehicle / robot-vs-robot contacts
             # are still counted, so genuine arm crashes still terminate.
-            if self._is_tire_grasped():
+            #
+            # **2026-06-06 (remount-cycle)** — also mask while the tire is
+            # bonded to the hub (``_hub_mount_constraint``). On mount the
+            # grasp is released but the tire is seated + JOINT_FIXED-bonded
+            # to the wheel-station flange; the rigid bond (erp=1, maxForce=
+            # 1e6) reports a spurious ~98 kN tire↔wheel_station penetration
+            # reaction every step — a seating artifact, not policy damage.
+            # Without this mask the 50 kN gate killed *every* Phase B episode
+            # one step after mount (stage 1→2), so the policy never collected
+            # any tighten-hold / retract / regrip / demount / return data.
+            tire_held = self._is_tire_grasped() or (
+                self._hub_mount_constraint is not None
+            )
+            if tire_held:
                 tire_uid = self.handles.tire
                 if bodyA == tire_uid or bodyB == tire_uid:
                     continue

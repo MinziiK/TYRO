@@ -589,7 +589,7 @@ class EnvConfig:
     #: uses a ``JOINT_FIXED`` EE bond instead so the tire is not
     #: teleported every physics sub-step (which amplified EE/IK jitter
     #: into visible "수직 유지" shaking during carry/mount).
-    kinematic_tire_lock_stages: Tuple[int, ...] = (0, 1, 2, 3)
+    kinematic_tire_lock_stages: Tuple[int, ...] = (0, 1, 2, 3, 4, 5)
     #: EMA blend for kinematic tire sync (1.0 = snap, 0.35 = smooth).
     #: Low values cut the "수직 유지" teleport jitter while keeping reach.
     kinematic_tire_sync_alpha: float = 0.65
@@ -905,6 +905,33 @@ class EnvConfig:
     #: but the gate stays closed — preventing "drive the tire away
     #: instantly" exploits that bypass the safety hold.
     demount_stall_steps: int = 20
+    #: **2026-06-06 (mount-seat glide)** — number of env steps over which the
+    #: tire is smoothly interpolated from its grasped pose at the mount-gate
+    #: fire to the exact seated hub pose, *before* the JOINT_FIXED bond /
+    #: pin is applied and the ``mounted`` event is emitted. The arm reaches
+    #: the stage-1 end pose ~10 cm short of the hub (kinematic reach limit
+    #: carrying the tire under the hub), so an instant ``resetBasePosition``
+    #: snap produced a visible ~12-14 cm tire teleport at the mount instant.
+    #: Gliding the seat over ``mount_seat_glide_steps`` (0.5 s at 20 Hz)
+    #: turns that snap into a smooth slide-onto-the-hub. Set to 0 for the
+    #: legacy instant snap. The ``mounted`` event (and any mount-terminate)
+    #: is deferred until the glide completes so termination still coincides
+    #: with the tire actually being seated.
+    mount_seat_glide_steps: int = 10
+    #: **2026-06-06 (mount bounce fix)** — disable tire↔hub collision for the
+    #: whole episode. The wheel disk's inner radius (``wheel_disk_radial_inner``
+    #: = 0.10) is smaller than the hub flange radius (``hub_radius`` = 0.21)
+    #: because the lug circle (``bolt_circle_radius`` = 0.1675) sits inside the
+    #: flange footprint, so a perfectly-aligned seated tire's disk *overlaps*
+    #: the hub cylinder by design. During the kinematic carry/seat this overlap
+    #: drove a ~700 kN tire↔hub contact impulse each step that the engine kept
+    #: trying to resolve while the sync yanked the tire back — the visible
+    #: "tire bouncing off the hub" jitter. The final seated state is defined by
+    #: the rigid ``_attach_tire_to_hub`` bond (and the gross approach is still
+    #: constrained by the vehicle wheel-well cutout + cargo back wall), so the
+    #: hub's own collision against the tire serves no training purpose and is
+    #: filtered out. Covers all hub/truck links (flange + bolt children).
+    disable_tire_hub_collision: bool = True
     #: Stage 3 cradle return — Euclidean radius (m) the tire centre must
     #: land within of the cradle pickup pose for the Stage 3 → done
     #: gate to consider it a successful landing.
@@ -912,7 +939,23 @@ class EnvConfig:
     #: Stage 1 → 2 trigger: ‖tire − hub‖ < ``mount_radius_tol`` AND tire axis
     #: aligned with hub axis (≤ ``RewardConfig.delta_A`` rad).
     #: **Final hard gate** that the v6 mount curriculum asymptotes to.
-    mount_radius_tol: float = 0.04
+    #: **2026-06-06 (gate realism fix)** — raised 0.04 → 0.12 m. The
+    #: carry-mount policy (planner + residual on a 100 kg kinematic carry)
+    #: asymptotes to ~9.3 cm tire↔hub at best approach and then oscillates
+    #: 0.10–0.16 m around the hub; a 0.04 m gate NEVER fired, so the mount
+    #: event never triggered: the episode ran to ``max_steps`` (never
+    #: terminated) AND the policy kept jittering the tire in/out of the hub
+    #: (the visible "teleport away & back"). Because the mount event snaps +
+    #: JOINT_FIXED-bonds the tire to ``tire_mount_pos`` exactly
+    #: (``_attach_tire_to_hub``), the gate is only a "close enough to seat"
+    #: trigger — the final seated pose is exact regardless of gate width.
+    #: 0.12 m clears the 9.3 cm best approach with margin so the event fires
+    #: reliably; the angle gate (``reward.delta_A`` 5°) is unchanged (the
+    #: planner yaw-aligns the bore to ~0°). The old 0.04 m "100 % mount"
+    #: number was a measurement artifact: ``eval_ckpt_mount.py`` forced
+    #: ``set_mount_tol(0.55, 45°)`` so the event fired early and the snap
+    #: then placed the tire at d=0 before the radius was measured.
+    mount_radius_tol: float = 0.12
     #: v6 mount-gate curriculum — **start radius** (m) used before the
     #: smoothstep ramp begins. 0.30 m gives the policy a generous
     #: "anywhere near the hub" entry signal so R_mount fires reliably
@@ -1330,6 +1373,20 @@ class EnvConfig:
     #: lock to pickup-only (Option C, faster IK convergence but the
     #: tire flops over during carry).
     planner_lock_palm_up_stages: Tuple[int, ...] = (0, 1, 2, 3)
+    #: **2026-06-06 (remount cycle)** — palm-up tilt-lock stages for the
+    #: 6-stage remount cycle. Differs from the 4-stage default: S2 is the
+    #: *empty-handed* retract to HOME, where baking the home EE pose to a
+    #: palm-up quat (instead of the true captured home orientation) put IK
+    #: in a branch that stalled ~0.24 m short of HOME, so S2→S3 never fired.
+    #: S2 is EXCLUDED for that reason, and S5 (return-to-rack) is excluded for
+    #: the SAME reason — baking the rack grasp pose to a palm-up quat stalled
+    #: the IK ~0.6 m short of the rack so the landing never fired. Both the
+    #: demount (S4) and return (S5) carry the tire KINEMATICALLY (the per-step
+    #: ``_sync_grasped_tire_upright`` sets the tire orientation directly), so
+    #: the planner no longer needs the palm-up lock to keep the tire upright
+    #: on those legs. Kept for S0 pickup, S1 mount-carry, S3 regrip-approach,
+    #: S4 demount pull-off (short near-hub move that tracks fine palm-up).
+    remount_planner_lock_palm_up_stages: Tuple[int, ...] = (0, 1, 3, 4)
     #: Stage 1 carry arch height (m). 0.5 m clears the UR10 base column
     #: on a straight-line carry from cradle to hub; lower values risk
     #: clipping the base / cargo bottom.
@@ -1913,7 +1970,16 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: mount target (end err 51 cm → 0.1 cm) and the gripper stays palm-up
     #: (worst tilt 15.6° → 5.6°, → 3.4° with the post-step re-lock below).
     #: ``kinematic_tire_sync_alpha`` (0.65) smooths the per-step teleport.
-    cfg.kinematic_tire_lock_stages = (0, 1, 2, 3)
+    #: **2026-06-06 (remount S4/S5)** — extended to include the 6-stage
+    #: cycle's demount (S4) and return (S5) carry legs. Previously the
+    #: regrip created a JOINT_FIXED bond and S4/S5 were absent here, so the
+    #: arm had to *dynamically drag* the 100 kg tire off the hub against the
+    #: mount-seating penetration contact (~98 kN) — the position PD saturated
+    #: and the arm was pinned, so the demount never fired. Kinematic carry
+    #: (teleport the tire to EE+offset each step, as S1–S3 already do) avoids
+    #: both the dynamic-drag torque limit and the penetration jam. The
+    #: 4-stage FSM never reaches stage 4/5 so the extra entries are inert.
+    cfg.kinematic_tire_lock_stages = (0, 1, 2, 3, 4, 5)
 
     #: **2026-06-05 (mount gate matched to carry tracking reach)** — with
     #: the 100 kg tire the zero-residual baked carry tracks to ~0.74 m of
@@ -1928,10 +1994,25 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     cfg.mount_radius_tol_soft = 0.55
     cfg.mount_angle_tol_soft_rad = np.deg2rad(45.0)
     cfg.mount_tol_ramp_steps = 1_500_000
-    #: Double the per-step residual authority (0.10→0.20 m) so the policy
-    #: can actively drive the heavy tire the last ~0.4 m into the gate that
-    #: the baked nominal alone cannot pull the lagging arm through.
-    cfg.planner_pos_offset_scale = 0.20
+    #: Per-step residual authority. **2026-06-06: 0.20 → 0.12.** The zero-
+    #: residual baked nominal already mounts at d=0 / theta=0 (attached hot-
+    #: start probe), so a wide ±0.20 m residual under std≈0.78 injected ~0.16 m
+    #: of exploration noise on top of an already-correct path — overshooting
+    #: the 0.04 m mount gate and crushing the *rollout* success_rate (eval
+    #: stayed healthy). 0.12 m keeps enough authority for fine correction /
+    #: hard-pickup recovery while halving the noise the tight gate sees.
+    #: Paired with ``--log-std-init -0.5`` in run_phase1_pipeline.sh.
+    #: **2026-06-07: 0.12 → 0.03.** Diagnostics showed the trained policy was
+    #: using near-saturated residuals (~5 cm lateral X offset at scale 0.05)
+    #: that pulled the tire off-centre during the carry/insertion — the
+    #: "tire X ≠ hub-centre X during mount" the operator observed — while the
+    #: baked nominal alone seats the tire to 0.4 cm. With orientation fully
+    #: planner-locked and the end pose now derived from the real grasp
+    #: transform (tire centre lands exactly on ``tire_mount_pos``), a large
+    #: residual only adds off-axis noise. 0.03 m keeps a small fine-correction
+    #: budget while letting the smooth nominal dominate the insertion so the
+    #: tire tracks the hub centre coaxially the whole way in.
+    cfg.planner_pos_offset_scale = 0.03
     cfg.obs.workspace_radius = 3.0
     cfg.grasp_com_offset_world = (0.0, 0.0, 1.0)
 

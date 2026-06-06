@@ -30,6 +30,28 @@ from src.config import make_env_config
 from src.env import TyroEnv
 
 
+def _poll_triggered_keys(client: int) -> set[str]:
+    """Return the set of keys newly pressed this frame (lowercased chars).
+
+    Wraps ``p.getKeyboardEvents`` and keeps only ``KEY_WAS_TRIGGERED`` events
+    so a held key fires once per press. Non-printable codes are ignored.
+    """
+    try:
+        events = p.getKeyboardEvents(physicsClientId=client)
+    except p.error:
+        return set()
+    out: set[str] = set()
+    for code, state in events.items():
+        if not (state & p.KEY_WAS_TRIGGERED):
+            continue
+        if 0 <= code <= 0x10FFFF:
+            try:
+                out.add(chr(code).lower())
+            except ValueError:
+                pass
+    return out
+
+
 def _layout_overrides_for_checkpoint(model: PPO) -> dict:
     """Match env action/obs layout to the checkpoint's training era."""
     obs_d = int(model.observation_space.shape[0])
@@ -73,6 +95,14 @@ def main() -> int:
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--stochastic", action="store_true",
                     help="Sample actions instead of using deterministic mean.")
+    ap.add_argument(
+        "--loop",
+        action="store_true",
+        help=(
+            "Start in loop mode: after the last episode, wrap back to the "
+            "first and keep replaying (toggle live with the L key in the GUI)."
+        ),
+    )
     ap.add_argument("--no-hold", action="store_true",
                     help="Don't hold the GUI window after the last episode.")
     ap.add_argument(
@@ -106,6 +136,27 @@ def main() -> int:
         help="FSM early-success gate (default: EnvConfig.terminate_on, usually 'never').",
     )
     ap.add_argument(
+        "--residual-scale",
+        type=float,
+        default=None,
+        help=(
+            "Override planner_pos_offset_scale (m). The trained policy adds a "
+            "per-step EE residual of this magnitude on top of the clean baked "
+            "nominal; lowering it (e.g. 0.05) makes the arm hug the smooth "
+            "nominal path for a cleaner demo (default: EnvConfig 0.15)."
+        ),
+    )
+    ap.add_argument(
+        "--mount-radius-tol",
+        type=float,
+        default=None,
+        help=(
+            "Override mount-gate radius tolerance (m). Default 0.12; pair a "
+            "smaller residual-scale with a tighter gate so the seat fires "
+            "right as the tire arrives."
+        ),
+    )
+    ap.add_argument(
         "--scene-layout",
         type=str,
         default="fanuc_spacious",
@@ -132,6 +183,10 @@ def main() -> int:
         overrides["max_steps"] = int(args.max_steps)
     if args.mix_easy_prob is not None:
         overrides["start_pos_easy_prob"] = float(args.mix_easy_prob)
+    if args.residual_scale is not None:
+        overrides["planner_pos_offset_scale"] = float(args.residual_scale)
+    if args.mount_radius_tol is not None:
+        overrides["mount_radius_tol"] = float(args.mount_radius_tol)
 
     model_path = _resolve_model_path(args.model)
     print(f"[eval] loading {model_path}")
@@ -169,13 +224,63 @@ def main() -> int:
     term_counts: dict[str, int] = {}
     step_period = 1.0 / cfg.control_freq_hz
 
-    for ep in range(args.episodes):
-        obs, info = env.reset(seed=args.seed + ep)
+    # Mutable GUI control state shared with the key handler.
+    ctrl = {"loop": bool(args.loop), "paused": False}
+
+    if args.render:
+        print(
+            "[eval] GUI keys:  R = replay current episode   "
+            "N = next/skip   L = toggle loop   Space = pause/resume"
+        )
+        if ctrl["loop"]:
+            print("[eval] loop mode ON (wraps to ep 0 after the last episode)")
+
+    def handle_keys() -> str:
+        """Poll GUI keys. Returns '', 'replay', or 'next' as an action signal."""
+        if not args.render:
+            return ""
+        keys = _poll_triggered_keys(env.client)
+        if "l" in keys:
+            ctrl["loop"] = not ctrl["loop"]
+            print(f"[eval] loop mode {'ON' if ctrl['loop'] else 'OFF'}")
+        if " " in keys:
+            ctrl["paused"] = not ctrl["paused"]
+            print(f"[eval] {'paused' if ctrl['paused'] else 'resumed'}")
+        # While paused, block here but keep polling so Space resumes and
+        # R / N / L still register and the GUI stays responsive.
+        while ctrl["paused"] and p.isConnected(env.client):
+            time.sleep(0.03)
+            pk = _poll_triggered_keys(env.client)
+            if " " in pk:
+                ctrl["paused"] = False
+                print("[eval] resumed")
+            if "l" in pk:
+                ctrl["loop"] = not ctrl["loop"]
+                print(f"[eval] loop mode {'ON' if ctrl['loop'] else 'OFF'}")
+            if "r" in pk:
+                return "replay"
+            if "n" in pk:
+                return "next"
+        if "r" in keys:
+            return "replay"
+        if "n" in keys:
+            return "next"
+        return ""
+
+    def run_episode(ep_index: int) -> str:
+        """Play one episode. Returns 'done', 'replay', 'next', or 'closed'."""
+        obs, info = env.reset(seed=args.seed + ep_index)
         total_r = 0.0
         steps = 0
         terminated = truncated = False
+        signal = ""
         while not (terminated or truncated):
             t_start = time.time()
+            if args.render and not p.isConnected(env.client):
+                return "closed"
+            signal = handle_keys()
+            if signal in ("replay", "next"):
+                return signal
             action, _ = model.predict(obs, deterministic=not args.stochastic)
             obs, r, terminated, truncated, info = env.step(action)
             total_r += float(r)
@@ -184,31 +289,54 @@ def main() -> int:
                 dt = time.time() - t_start
                 if dt < step_period:
                     time.sleep(step_period - dt)
+        if args.render and not p.isConnected(env.client):
+            return "closed"
         is_success = bool(info.get("is_success", False))
         term = info.get("termination", "unknown")
         term_counts[term] = term_counts.get(term, 0) + 1
         successes.append(is_success)
         rewards.append(total_r)
         lengths.append(steps)
-        print(f"  ep {ep:3d}  r={total_r:+8.2f}  len={steps:4d}  "
+        print(f"  ep {ep_index:3d}  r={total_r:+8.2f}  len={steps:4d}  "
               f"success={is_success}  termination={term}")
+        return "done"
+
+    ep = 0
+    while ep < args.episodes:
+        result = run_episode(ep)
+        if result == "closed":
+            print("[eval] GUI closed — stopping.")
+            break
+        if result == "replay":
+            print(f"  ep {ep:3d}  [replay — restarting same episode]")
+            continue  # same ep, no stats recorded
+        if result == "next":
+            print(f"  ep {ep:3d}  [skipped]")
+        ep += 1
+        if ctrl["loop"] and ep >= args.episodes:
+            ep = 0  # wrap and keep replaying
 
     n = len(successes)
-    sr = sum(successes) / n * 100
-    print("\n=== Eval summary ===")
-    print(f"  episodes:     {n}")
-    print(f"  success rate: {sr:.1f}%  ({sum(successes)}/{n})")
-    print(f"  reward:       mean={statistics.mean(rewards):+.2f}  "
-          f"std={statistics.pstdev(rewards):.2f}  "
-          f"min={min(rewards):+.2f}  max={max(rewards):+.2f}")
-    print(f"  length:       mean={statistics.mean(lengths):.1f}  "
-          f"min={min(lengths)}  max={max(lengths)}")
-    print(f"  terminations: {term_counts}")
+    if n > 0:
+        sr = sum(successes) / n * 100
+        print("\n=== Eval summary ===")
+        print(f"  episodes:     {n}")
+        print(f"  success rate: {sr:.1f}%  ({sum(successes)}/{n})")
+        print(f"  reward:       mean={statistics.mean(rewards):+.2f}  "
+              f"std={statistics.pstdev(rewards):.2f}  "
+              f"min={min(rewards):+.2f}  max={max(rewards):+.2f}")
+        print(f"  length:       mean={statistics.mean(lengths):.1f}  "
+              f"min={min(lengths)}  max={max(lengths)}")
+        print(f"  terminations: {term_counts}")
 
-    if args.render and not args.no_hold:
-        print("[eval] GUI held open. Close window or Ctrl-C to exit.")
+    if args.render and not args.no_hold and p.isConnected(env.client):
+        print("[eval] GUI held open. R = replay episode 0, Close window / Ctrl-C to exit.")
         try:
             while p.isConnected(env.client):
+                if "r" in _poll_triggered_keys(env.client):
+                    print("[eval] [replay from hold — episode 0]")
+                    run_episode(0)
+                    print("[eval] GUI held open. R = replay episode 0, Close / Ctrl-C to exit.")
                 time.sleep(0.05)
         except KeyboardInterrupt:
             pass

@@ -59,6 +59,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--render", action="store_true")
     ap.add_argument("--max-steps", type=int, default=1400)
+    ap.add_argument("--no-palm-up", action="store_true",
+                    help="disable fanuc_enforce_palm_up_post_step (S2 retract test)")
+    ap.add_argument("--no-s2-planner-lock", action="store_true",
+                    help="drop stage 2 from planner_lock_palm_up_stages (S2 retract test)")
+    ap.add_argument("--palm-up-stages", type=str, default=None,
+                    help="comma list overriding remount_planner_lock_palm_up_stages, e.g. 0,1,3,4")
     args = ap.parse_args()
 
     cfg = make_env_config(
@@ -83,6 +89,18 @@ def main() -> int:
         rack_return_radius_tol=0.12,
         max_steps=int(args.max_steps),
     )
+    if args.no_palm_up:
+        cfg.fanuc_enforce_palm_up_post_step = False
+    if getattr(args, "no_s2_planner_lock", False):
+        cfg.planner_lock_palm_up_stages = tuple(
+            s for s in cfg.planner_lock_palm_up_stages if s != 2
+        )
+        pr(f"  [test] planner_lock_palm_up_stages -> {cfg.planner_lock_palm_up_stages}")
+    if getattr(args, "palm_up_stages", None) is not None:
+        cfg.remount_planner_lock_palm_up_stages = tuple(
+            int(x) for x in args.palm_up_stages.split(",") if x.strip() != ""
+        )
+        pr(f"  [test] remount_planner_lock_palm_up_stages -> {cfg.remount_planner_lock_palm_up_stages}")
     pr("=" * 72)
     pr("6-STAGE REMOUNT CYCLE — end-to-end baked-planner audit")
     pr(f"  tighten_hold(W1)={cfg.tighten_hold_steps}  loosen_hold(W2)={cfg.loosen_hold_steps}")
@@ -136,9 +154,10 @@ def main() -> int:
             d_hub = float(np.linalg.norm(tp - hp))
             d_home = (float(np.linalg.norm(ee - np.asarray(env._home_ee_pos, float)))
                       if getattr(env, "_home_ee_pos", None) is not None else -1.0)
+            d_rack = float(np.linalg.norm(tp - np.asarray(env._pickup_pos_world, float)))
             pr(f"            ...[{i+1:4d}] {STAGE_NAMES[cur_stage]:16s} "
-               f"d(tire,hub)={d_hub:.3f}  d(ee,home)={d_home:.3f}  "
-               f"hold_left={env._mount_hold_left}")
+               f"d(tire,hub)={d_hub:.3f}  d(tire,rack)={d_rack:.3f}  "
+               f"d(ee,home)={d_home:.3f}  hold_left={env._mount_hold_left}")
 
         if info.get("is_success"):
             success = True
