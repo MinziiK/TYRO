@@ -104,6 +104,13 @@ class Robot:
         # compares this to the post-step achieved EE pose to log IK tracking
         # residual — useful for catching reach-saturation in DR rollouts.
         self.last_target_pos: Optional[np.ndarray] = None
+        # IK warm-start branch policy for ``apply_delta_ee``. Legacy default
+        # warm-starts from ``arm.rest`` (HOME), which biases the solver toward
+        # the HOME branch — fine when the arm stays near HOME, but for tasks
+        # that roam far (nut fastening sweeps the whole lug ring) it makes the
+        # solver fight the policy / snap branches on the far arc. When True the
+        # warm-start uses the *current* joint state for branch continuity.
+        self._ik_warmstart_current: bool = False
         self._disable_non_arm_motors()
         self.reset_to_home()
 
@@ -245,13 +252,20 @@ class Robot:
         target_orn = quat_multiply(d_quat, cur_orn)
         self.last_target_pos = target_pos
 
+        if self._ik_warmstart_current:
+            # Branch-continuity warm-start: seed from the live joints so the
+            # solver tracks the arm's current configuration instead of
+            # snapping toward the HOME branch (needed for far-arc reach).
+            rest = self.joint_state()[0].tolist()
+        else:
+            rest = self.arm.rest.tolist()
         ik = p.calculateInverseKinematics(
             self.uid, self.EE_LINK_INDEX,
             list(target_pos), list(target_orn),
             lowerLimits=self.arm.lower.tolist(),
             upperLimits=self.arm.upper.tolist(),
             jointRanges=self.arm.range.tolist(),
-            restPoses=self.arm.rest.tolist(),
+            restPoses=rest,
             maxNumIterations=50,
             residualThreshold=1e-3,
             physicsClientId=self.client,
@@ -347,9 +361,19 @@ class UR10Robot(Robot):
     TOOL_UP_QUATERNION = FINAL_LOCK_QUATERNION
 
     def _arm_motor_forces(self) -> List[float]:
+        # Per-joint torque caps (N·m). Overridable via ``_motor_forces_override``
+        # for regimes that need more holding torque than the tire-carrying
+        # default — notably the nut task, where the arm extends nearly fully
+        # across the wheel and the default 300 N·m elbow cap is below the
+        # static gravity moment at that reach (arm sags ~36 cm and cannot hold
+        # the staging pose).
+        ov = getattr(self, "_motor_forces_override", None)
+        if ov is not None:
+            return list(ov)
         return [400.0, 400.0, 300.0, 60.0, 60.0, 60.0]
 
     def __init__(self, client: int, cfg: EnvConfig):
+        self._motor_forces_override: Optional[List[float]] = None
         self._lock_tool_up = bool(getattr(cfg, "ur10_lock_tool_up", True))
         # 2026-06-03 — commanded-joint-target motion smoothing (see
         # ``EnvConfig.ur10_joint_target_smooth_alpha`` / ``..._max_step_rad``).
@@ -461,13 +485,23 @@ class UR10Robot(Robot):
             d_quat = axisangle3_to_quat(delta_axisangle)
             target_orn = list(quat_multiply(d_quat, cur_orn))
 
+        if self._ik_warmstart_current:
+            # Branch-continuity warm-start: seed from the live joints so the
+            # solver tracks the arm's current configuration instead of
+            # snapping toward the HOME branch. Needed when the socket sweeps
+            # the whole lug ring (nut task) — HOME-biased IK returns a
+            # different/unconverged branch on the far arc (bolts 4–6),
+            # swinging the EE tens of cm off the requested target.
+            rest = self.joint_state()[0].tolist()
+        else:
+            rest = self.arm.rest.tolist()
         ik = p.calculateInverseKinematics(
             self.uid, self.EE_LINK_INDEX,
             list(target_pos), target_orn,
             lowerLimits=self.arm.lower.tolist(),
             upperLimits=self.arm.upper.tolist(),
             jointRanges=self.arm.range.tolist(),
-            restPoses=self.arm.rest.tolist(),
+            restPoses=rest,
             maxNumIterations=200,
             residualThreshold=1e-4,
             physicsClientId=self.client,

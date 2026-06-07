@@ -238,6 +238,13 @@ class TyroEnv(gym.Env):
         self._prev_action: np.ndarray = np.zeros(self.cfg.action.dim, dtype=np.float32)
         self._prev_d_A: Optional[float] = None
         self._prev_d_B: Optional[float] = None
+        # Nut-task two-stage APPROACH shaping book-keeping: separate
+        # potentials for "get onto the bolt axis" (lateral) and "slide to
+        # the staging point along the axis" (axial). Reset on every target
+        # switch / macro hand-off so the first post-transition sample does
+        # not pay a spurious potential jump.
+        self._prev_lateral_B: Optional[float] = None
+        self._prev_axial_err_B: Optional[float] = None
         # FSM potential-based shaping book-keeping. Per-stage distances
         # that drive ``w_pb_*`` shaping bonuses; reset to ``None`` at
         # every stage transition so the first sample after transition
@@ -535,6 +542,8 @@ class TyroEnv(gym.Env):
         self._prev_d_A = None
         self._prev_d_B = None
         self._prev_axial_B = None
+        self._prev_lateral_B = None
+        self._prev_axial_err_B = None
         self._prev_d_approach = None
         self._prev_d_return = None
         self._prev_d_hub: Optional[float] = None
@@ -740,6 +749,22 @@ class TyroEnv(gym.Env):
         * Initialises the sequential bolt target to index 0 and recolours
           the bolts (target = yellow, the rest = pending grey).
         """
+        # Branch-continuity IK for B: the socket sweeps the whole lug ring, so
+        # the HOME-biased IK warm-start fights the policy / snaps branches on
+        # the far arc (bolts 4–6). Use current-joint warm-start instead.
+        self.robot_B._ik_warmstart_current = True
+        # Raise B's motor torque caps for the nut task. The far-arc bolts
+        # (4–6) need a near-full-extension reach where the default 300 N·m
+        # elbow cap is below the static gravity moment — the arm sags ~36 cm
+        # and physically cannot hold the staging pose, so the policy can never
+        # dwell to trigger the macro (root cause of the mid-ring stall). B
+        # carries no payload here (geometric fastening), so higher caps are
+        # safe and realistic. Confirmed: sag 36.8→4.2 cm at bolt 4.
+        self.robot_B._motor_forces_override = list(
+            getattr(self.cfg, "nut_b_motor_forces",
+                    (6000.0, 6000.0, 4000.0, 1000.0, 1000.0, 1000.0))
+        )
+
         R = float(self.cfg.tire_outer_radius)
         # 1. Seat + bond the tire on the hub (sets _mount_seated_pos/orn).
         self._attach_tire_to_hub()
@@ -803,8 +828,28 @@ class TyroEnv(gym.Env):
         self._nut_frozen_qA = np.asarray(arm_q, dtype=np.float64).copy()
 
         # 4. Sequential bolt bookkeeping.
-        self._nut_target_idx = 0
-        self._nut_fastened = []
+        #
+        # Per-bolt random start (curriculum coverage fix): always starting the
+        # chain at bolt 0 means later bolt-to-bolt transitions (4→5, 5→6, …)
+        # are only ever sampled in episodes that already cleared every earlier
+        # bolt — exponentially rare early in training. The learned competence
+        # then stalls at an advancing frontier (observed: v2/v3 stuck at bolt
+        # 3, v4 at bolt 4), with the socket parked ~10 cm off the next bolt's
+        # axis (alignment fine, lateral-closing untrained). Seeding the start
+        # bolt uniformly over the ring gives every transition equal training
+        # mass, so the frontier disappears. Earlier bolts are marked already
+        # fastened; the hot-start teleports B to the chosen bolt's approach.
+        n_bolts = len(self.handles.bolts)
+        start_bolt = 0
+        if (
+            bool(getattr(self.cfg, "nut_b_hotstart_random_bolt", False))
+            and bool(getattr(self.cfg, "nut_b_hotstart_enable", False))
+            and float(getattr(self.cfg, "nut_b_hotstart_alpha", 0.0)) > 1e-3
+            and n_bolts > 0
+        ):
+            start_bolt = int(self._np_random.integers(0, n_bolts))
+        self._nut_target_idx = start_bolt
+        self._nut_fastened = list(range(start_bolt))
         self._nut_hold_count = 0
         self._nut_subphase = 0
         self._nut_macro_stage = 0
@@ -820,10 +865,14 @@ class TyroEnv(gym.Env):
 
         n = len(self.handles.bolts)
         for i in range(n):
-            self._set_bolt_color(i, self._NUT_COLOR_PENDING)
+            self._set_bolt_color(
+                i,
+                self._NUT_COLOR_FASTENED if i in self._nut_fastened
+                else self._NUT_COLOR_PENDING,
+            )
         if n > 0:
-            self._set_bolt_color(0, self._NUT_COLOR_TARGET)
-            self.handles.target_bolt_idx = 0
+            self._set_bolt_color(self._nut_target_idx, self._NUT_COLOR_TARGET)
+            self.handles.target_bolt_idx = self._nut_target_idx
 
         # 4a. Filter Robot-B socket ↔ hub/tire collision. The fastening is
         #     geometric (no nut bodies / torque), so the forced insert must be
@@ -919,7 +968,16 @@ class TyroEnv(gym.Env):
             # first zero-Δ step holds the hot-start pose instead of yanking
             # back toward the stale HOME target.
             rb.last_target_pos = rb.ee_pose()[0].copy()
-            rb._cmd_q = None
+            # Pin the motor targets to the teleported config and seed the
+            # smoothing filter with it. Without this the joints are only
+            # *reset* (kinematically) while the PD targets still point at the
+            # stale HOME branch; the first step's IK then re-solves from the
+            # HOME warm-start and can land a *different* arm branch for bolts
+            # on the far arc (4–6), swinging the socket ~30 cm off-axis before
+            # the policy ever acts (observed: zero-action failed to hold the
+            # staging pose for bolts 4/5/6 while 0/1/2/8 held).
+            rb._cmd_q = arm_q.copy()
+            rb.drive_arm_targets(arm_q)
 
     def _nut_gate_metrics(self, idx: int) -> Tuple[float, float]:
         """(d_B, theta_B) for the nut-runner tool_tip vs bolt ``idx``.
@@ -1182,6 +1240,40 @@ class TyroEnv(gym.Env):
                 except p.error:
                     pass
 
+        # Spurious self-collision: the ``nut_runner`` tool is bolted onto the
+        # wrist, so it geometrically overlaps the wrist cluster — but that pair
+        # is NOT auto-filtered (only the kinematically-adjacent joint pair is).
+        # On the far arc (bolts 4–6) the wrist roll needed to stay coaxial
+        # deepens the tool↔wrist_3 overlap, and PyBullet answers with a huge
+        # penalty contact (≈16 kN vs ≈4 kN baseline) that shoves the arm ~36 cm
+        # off the commanded pose — so it can never dwell at staging to trigger
+        # the macro. Disable collision between the tool and the wrist links it
+        # is mounted on (a standard adjacent-link filter).
+        name_by_link = {}
+        for li in range(n_b):
+            try:
+                info = p.getJointInfo(b_uid, li, physicsClientId=self.client)
+                name_by_link[info[12].decode()] = li
+            except p.error:
+                pass
+        tool_links = [
+            name_by_link[n] for n in ("nut_runner", "tool_tip", "tool0")
+            if n in name_by_link
+        ]
+        wrist_links = [
+            name_by_link[n] for n in (
+                "wrist_1_link", "wrist_2_link", "wrist_3_link", "ee_link",
+            ) if n in name_by_link
+        ]
+        for tl in tool_links:
+            for wl in wrist_links:
+                try:
+                    p.setCollisionFilterPair(
+                        b_uid, b_uid, tl, wl, 0, physicsClientId=self.client,
+                    )
+                except p.error:
+                    pass
+
     def _precompute_nut_macro_solutions(self, n: int) -> None:
         """Solve + cache the INSERT (base) and RETRACT joint vectors per bolt.
 
@@ -1409,6 +1501,8 @@ class TyroEnv(gym.Env):
                     # inject a spurious large Δ on the next step.
                     self._prev_d_B = None
                     self._prev_axial_B = None
+                    self._prev_lateral_B = None
+                    self._prev_axial_err_B = None
         return events
 
     # ------------------------------------------------------------------
@@ -4235,8 +4329,13 @@ class TyroEnv(gym.Env):
         _, theta_B = self._nut_gate_metrics(idx)
         axial, lateral, theta = self._nut_axial_lateral(idx)
         staging_axial = self._nut_staging_axial()
-        # Distance from the socket tip to the on-axis staging point.
-        d_stage = float(math.hypot(axial - staging_axial, lateral))
+        # Distance from the socket tip to the on-axis staging point, with the
+        # lateral (off-axis) component weighted up by ``nut_reach_lateral_w``
+        # so the reach gradient prioritises getting *onto the bolt axis* over
+        # closing the axial gap — this is what breaks the lateral-stall local
+        # equilibrium seen mid-loop (parked ~12 cm beside the next bolt axis).
+        lat_w = float(getattr(rcfg, "nut_reach_lateral_w", 1.0))
+        d_stage = float(math.hypot(axial - staging_axial, lat_w * lateral))
         b.d_B = float(d_stage)
         b.theta_B = float(theta_B)
         b.nut_target_idx = idx
@@ -4254,24 +4353,54 @@ class TyroEnv(gym.Env):
         macro = int(self._nut_subphase) == 1
 
         if not macro:
-            # APPROACH — shape the socket onto the staging point coaxially.
+            # APPROACH — two-stage shaping so the socket first climbs ONTO the
+            # bolt axis, then slides along it to the staging point. The old
+            # single ``reach = exp(-d_stage/decay)`` term mixed both goals and
+            # let the policy cut a chord across the axis: it parked ~15 cm
+            # off-axis (lateral) while oscillating in d_stage and never entered
+            # the capture sphere (observed: 519 steps stuck at bolt 3, theta
+            # already 10°, lateral pinned at 0.15). Splitting the objective and
+            # gating the axial pull by a coaxial factor removes that chord
+            # local-optimum.
+            coax_gate = max(
+                float(getattr(rcfg, "nut_coax_gate", 0.05)), 1e-3,
+            )
+            # 1 when perfectly coaxial, → 0 as the socket drifts off the axis.
+            coax = float(np.exp(-lateral / coax_gate))
+            axial_err = abs(axial - staging_axial)
+
             b.nut_align = (
                 float(rcfg.w_nut_align) * float(np.exp(-theta / align_decay))
             )
+            # Always-on axis attraction (get coaxial); the dominant driver when
+            # off-axis.
             b.nut_lateral_term = (
                 float(rcfg.w_nut_lateral) * float(np.exp(-lateral / lat_decay))
             )
+            # Axial approach matters only once roughly coaxial → gate by coax so
+            # the policy cannot trade lateral error for axial progress.
             b.nut_reach = (
-                float(rcfg.w_nut_reach) * float(np.exp(-d_stage / reach_decay))
+                float(rcfg.w_nut_reach)
+                * float(np.exp(-axial_err / reach_decay)) * coax
             )
-            axial_err = abs(axial - staging_axial)
             b.nut_axial_term = (
-                float(rcfg.w_nut_axial) * float(np.exp(-axial_err / axial_decay))
+                float(rcfg.w_nut_axial)
+                * float(np.exp(-axial_err / axial_decay)) * coax
             )
+            # Potential-based shaping split into a lateral leg (always paid) and
+            # an axial leg (gated by coax), each on its own monotone potential.
             pb_nut = 0.0
-            if self._prev_d_B is not None and float(rcfg.w_pb_nut) > 0.0:
-                pb_nut = float(rcfg.w_pb_nut) * float(self._prev_d_B - d_stage)
+            wpb = float(rcfg.w_pb_nut)
+            if wpb > 0.0:
+                if self._prev_lateral_B is not None:
+                    pb_nut += wpb * float(self._prev_lateral_B - lateral)
+                if self._prev_axial_err_B is not None:
+                    pb_nut += wpb * coax * float(
+                        self._prev_axial_err_B - axial_err
+                    )
             b.pb_nut = float(pb_nut)
+            self._prev_lateral_B = float(lateral)
+            self._prev_axial_err_B = float(axial_err)
         else:
             # MACRO — env-driven; no policy-shaping dense terms.
             b.nut_align = 0.0
@@ -4279,6 +4408,10 @@ class TyroEnv(gym.Env):
             b.nut_reach = 0.0
             b.nut_axial_term = 0.0
             b.pb_nut = 0.0
+            # Drop APPROACH potentials so the next APPROACH (next bolt) starts
+            # fresh and does not pay a spurious jump across the macro window.
+            self._prev_lateral_B = None
+            self._prev_axial_err_B = None
 
         # Sparse FSM bonuses.
         if fsm_events.get("arrived"):

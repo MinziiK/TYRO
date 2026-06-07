@@ -189,6 +189,19 @@ class RewardConfig:
     #: ``w_nut_reach * exp(-d_B / nut_reach_decay)`` where d_B is the
     #: tool_tip→bolt distance. Bounded in [0, w_nut_reach].
     w_nut_reach: float = 3.0
+    #: Lateral (off-axis) weight inside the APPROACH reach distance
+    #: ``d_stage = hypot(axial_err, w * lateral)``. Retained for the d_B gate
+    #: metric/logging; the APPROACH reward now uses an explicit two-stage
+    #: split (see ``nut_coax_gate``) instead of this combined distance.
+    nut_reach_lateral_w: float = 2.5
+    #: 2026-06-07 — two-stage APPROACH coaxial gate length (m). The axial
+    #: approach terms (``nut_reach``/``nut_axial_term`` and the axial PB leg)
+    #: are multiplied by ``exp(-lateral / nut_coax_gate)`` so they only switch
+    #: on once the socket is roughly on the bolt axis. This stops the policy
+    #: from cutting a chord across the axis to shrink the staging distance
+    #: (the 15 cm off-axis stall at bolt 3). ~5 cm ⇒ axial pull is ~0 at the
+    #: 10 cm bolt pitch and ~0.6 once within ~2.5 cm of the axis.
+    nut_coax_gate: float = 0.05
     #: 2026-06-07 — widened 0.15 → 0.50. At the 1.7 m HOME→bolt standoff
     #: ``exp(-1.7/0.15) ≈ 1e-5`` gave the policy zero approach gradient
     #: (the first B run never reached a bolt). 0.50 keeps a usable pull
@@ -216,8 +229,16 @@ class RewardConfig:
     #: ``lat`` is the tool_tip distance off the bolt axis. Drives the
     #: "enter exactly along the bolt (Y) axis" requirement so the socket
     #: overlaps the stud instead of brushing it sideways.
-    w_nut_lateral: float = 2.0
-    nut_lateral_decay: float = 0.03
+    #: 2026-06-07 — decay widened 0.03 → 0.08 and weight raised 2.0 → 4.0.
+    #: At 0.03 the kernel was dead past ~6 cm off-axis (``exp(-0.12/0.03)≈0.02``),
+    #: so when the socket parked ~12 cm beside the next bolt's axis (the
+    #: bolt-to-bolt hand-off around the lug circle) there was no gradient
+    #: pulling it coaxial — the policy stalled laterally (observed: stuck at
+    #: bolt 4, lateral 12 cm). 0.08 keeps a usable coaxial pull out to ~15 cm
+    #: (``exp(-0.12/0.08)=0.22``) and the higher weight makes "get on the
+    #: axis" compete with the raw reach term.
+    w_nut_lateral: float = 4.0
+    nut_lateral_decay: float = 0.08
     #: Positive axial-progress kernel during INSERT: rewards driving the
     #: tool_tip to the bolt base (hub face) along the axis.
     w_nut_axial: float = 2.0
@@ -1152,6 +1173,22 @@ class EnvConfig:
     #: (eval, preview) measure the true full-distance task; the training
     #: callback overrides this to 1.0 at start and ramps it back to 0.
     nut_b_hotstart_alpha: float = 0.0
+    #: Per-bolt random start (curriculum coverage). When enabled (and the
+    #: hot-start is active, alpha > 0), each reset seeds the chain at a
+    #: uniformly random bolt k (bolts < k pre-marked fastened) instead of
+    #: always bolt 0. Always starting at bolt 0 means later bolt-to-bolt
+    #: transitions are sampled only after every earlier bolt is cleared —
+    #: vanishingly rare early in training — so competence stalls at an
+    #: advancing frontier (v2/v3 stuck at bolt 3, v4 at bolt 4) with the
+    #: socket parked ~10 cm off the next bolt's axis. Uniform start gives
+    #: every transition equal training mass and removes the frontier.
+    nut_b_hotstart_random_bolt: bool = True
+    #: Per-joint motor torque caps (N·m) for Robot B during the nut task,
+    #: overriding the tire-carrying default ([400,400,300,60,60,60]). The
+    #: far-arc bolts need near-full extension where the default elbow cap is
+    #: below the static gravity moment (arm sags ~36 cm, cannot hold staging).
+    #: B carries no payload here so higher caps are safe.
+    nut_b_motor_forces: tuple = (6000.0, 6000.0, 4000.0, 1000.0, 1000.0, 1000.0)
     #: Per-step EE translation scale (m) for Robot B in the nut task. The
     #: shared 0.02 m/step makes the ≥1 m HOME→bolt traverse ~90 steps even
     #: in a straight line; 0.05 keeps the traverse tractable inside the
@@ -1180,7 +1217,7 @@ class EnvConfig:
     #: (combined with the alignment gate). Generous (5 cm ≫ the old ±2 cm
     #: axial / 1.5 cm lateral box) so the policy can realistically reach it
     #: under exploration; the scripted macro supplies the final precision.
-    nut_arrive_pos_tol: float = 0.05
+    nut_arrive_pos_tol: float = 0.08
     #: Alignment gate (rad) for the trigger — tool +Z within this of the bolt
     #: axis. Live value, ramped down by ``NutArriveAngCurriculumCallback`` from
     #: ``nut_arrive_ang_start_deg`` → ``nut_arrive_ang_end_deg`` so the policy
