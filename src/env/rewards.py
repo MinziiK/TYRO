@@ -59,6 +59,18 @@ class RewardBreakdown:
     guide_A: float = 0.0      # Stage 1 EE-vector guide (w_guide * exp(-||hub-ee||/τ))
     pb_carry: float = 0.0     # Stage 1 PB shaping on Δd_A (w_pb_carry * (prev - curr))
     d_guide: float = 0.0      # ||hub - ee|| diagnostic (mirrors hub_guide_vector norm)
+    # Robot B sequential nut-fastening task diagnostics
+    nut_reach: float = 0.0    # w_nut_reach * exp(-d_B / decay)
+    nut_align: float = 0.0    # w_nut_align * exp(-theta_B / decay)
+    pb_nut: float = 0.0       # PB shaping on Δd_B toward the target bolt
+    n_fastened: int = 0       # bolts fastened so far this episode
+    nut_target_idx: int = -1  # current target bolt index
+    # insertion-retract diagnostics
+    nut_lateral_term: float = 0.0  # w_nut_lateral * exp(-lateral / decay)
+    nut_axial_term: float = 0.0    # INSERT axial-progress / RETRACT shaping
+    nut_lateral: float = 0.0       # tool_tip distance off the bolt axis (m)
+    nut_axial: float = 0.0         # signed tool_tip depth along bolt axis (m)
+    nut_subphase: int = 0          # 0 = inserting/hold, 1 = retracting
 
 
 def align_reward(tire_pos, hub_pos, tire_axis, hub_axis,

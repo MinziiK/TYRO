@@ -361,6 +361,126 @@ class StartPosEasyProbCurriculumCallback(BaseCallback):
         self.logger.record("curriculum/start_pos_easy_prob_frac", float(frac))
 
 
+class NutHotStartCurriculumCallback(BaseCallback):
+    """Reverse-curriculum for the Robot-B nut hot-start (insertion task).
+
+    Linearly ramps ``alpha`` from ``hold`` (held at the start value for
+    ``hold_steps``) down to ``end_alpha`` over ``ramp_steps`` global PPO
+    timesteps. ``alpha = 1`` starts B at bolt 0's approach point (easy,
+    rich reach gradient); ``alpha = 0`` starts B at full HOME distance.
+    Broadcast via ``env_method("set_nut_b_hotstart_alpha", a)``.
+    """
+
+    def __init__(
+        self,
+        start_alpha: float,
+        end_alpha: float,
+        hold_steps: int,
+        ramp_steps: int,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._a0 = float(start_alpha)
+        self._a1 = float(end_alpha)
+        self._hold = int(max(0, hold_steps))
+        self._ramp = int(max(1, ramp_steps))
+        self._last_pushed: Optional[float] = None
+
+    def _scheduled_alpha(self, t: int) -> float:
+        t = int(max(0, t))
+        if t <= self._hold:
+            return self._a0
+        frac = min(1.0, (t - self._hold) / float(self._ramp))
+        return self._a0 * (1.0 - frac) + self._a1 * frac
+
+    def _broadcast(self, alpha: float) -> None:
+        try:
+            self.training_env.env_method("set_nut_b_hotstart_alpha", float(alpha))
+        except AttributeError:
+            pass
+
+    def _on_training_start(self) -> None:
+        a = self._scheduled_alpha(int(self.model.num_timesteps))
+        self._last_pushed = a
+        self._broadcast(a)
+        if self.verbose:
+            print(f"[curriculum] nut_b_hotstart_alpha init = {a:.3f} "
+                  f"(t={self.model.num_timesteps})")
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        t = int(self.model.num_timesteps)
+        a = self._scheduled_alpha(t)
+        if self._last_pushed is None or abs(a - self._last_pushed) > 1e-5:
+            self._broadcast(a)
+            self._last_pushed = a
+            if self.verbose:
+                print(f"[curriculum] nut_b_hotstart_alpha = {a:.3f} (t={t})")
+        self.logger.record("curriculum/nut_b_hotstart_alpha", float(a))
+
+
+class NutArriveAngCurriculumCallback(BaseCallback):
+    """Ramp the nut arrive-alignment gate from loose → tight during training.
+
+    Holds ``start_deg`` for ``hold_steps`` (so the value function learns the
+    macro is valuable while the gate is easy to hit), then linearly ramps to
+    ``end_deg`` over ``ramp_steps``. Broadcast via
+    ``env_method("set_nut_arrive_ang_tol", rad)``.
+    """
+
+    def __init__(
+        self,
+        start_deg: float,
+        end_deg: float,
+        hold_steps: int,
+        ramp_steps: int,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._a0 = float(np.deg2rad(start_deg))
+        self._a1 = float(np.deg2rad(end_deg))
+        self._hold = int(max(0, hold_steps))
+        self._ramp = int(max(1, ramp_steps))
+        self._last_pushed: Optional[float] = None
+
+    def _scheduled(self, t: int) -> float:
+        t = int(max(0, t))
+        if t <= self._hold:
+            return self._a0
+        frac = min(1.0, (t - self._hold) / float(self._ramp))
+        return self._a0 * (1.0 - frac) + self._a1 * frac
+
+    def _broadcast(self, rad: float) -> None:
+        try:
+            self.training_env.env_method("set_nut_arrive_ang_tol", float(rad))
+        except AttributeError:
+            pass
+
+    def _on_training_start(self) -> None:
+        a = self._scheduled(int(self.model.num_timesteps))
+        self._last_pushed = a
+        self._broadcast(a)
+        if self.verbose:
+            print(f"[curriculum] nut_arrive_ang_tol init = "
+                  f"{np.degrees(a):.1f}deg (t={self.model.num_timesteps})")
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        t = int(self.model.num_timesteps)
+        a = self._scheduled(t)
+        if self._last_pushed is None or abs(a - self._last_pushed) > 1e-5:
+            self._broadcast(a)
+            self._last_pushed = a
+            if self.verbose:
+                print(f"[curriculum] nut_arrive_ang_tol = "
+                      f"{np.degrees(a):.1f}deg (t={t})")
+        self.logger.record("curriculum/nut_arrive_ang_deg", float(np.degrees(a)))
+
+
 class MountTolCurriculumCallback(BaseCallback):
     """Schedules the Stage 1 → 2 mount gate (radius, angle) over training.
 
@@ -724,6 +844,28 @@ def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
             prob_end=float(args.start_pos_easy_prob_schedule_end),
             mid_steps=int(args.start_pos_easy_prob_schedule_mid_steps),
             end_steps=int(args.start_pos_easy_prob_schedule_end_steps),
+            verbose=1,
+        ))
+    if (
+        bool(getattr(args, "nut_fastening", False))
+        and bool(getattr(args, "nut_hotstart_curriculum", True))
+    ):
+        cbs.append(NutHotStartCurriculumCallback(
+            start_alpha=float(getattr(args, "nut_hotstart_alpha_start", 1.0)),
+            end_alpha=float(getattr(args, "nut_hotstart_alpha_end", 0.0)),
+            hold_steps=int(getattr(args, "nut_hotstart_hold_steps", 300_000)),
+            ramp_steps=int(getattr(args, "nut_hotstart_ramp_steps", 1_500_000)),
+            verbose=1,
+        ))
+    if (
+        bool(getattr(args, "nut_fastening", False))
+        and bool(getattr(args, "nut_arrive_ang_curriculum", True))
+    ):
+        cbs.append(NutArriveAngCurriculumCallback(
+            start_deg=float(getattr(args, "nut_arrive_ang_start_deg", 35.0)),
+            end_deg=float(getattr(args, "nut_arrive_ang_end_deg", 12.0)),
+            hold_steps=int(getattr(args, "nut_arrive_ang_hold_steps", 300_000)),
+            ramp_steps=int(getattr(args, "nut_arrive_ang_ramp_steps", 1_500_000)),
             verbose=1,
         ))
     cbs.append(CheckpointCallback(
@@ -1160,6 +1302,68 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--nut-fastening",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "nut_fastening_task", False)),
+        help=(
+            "Robot-B sequential nut-fastening task: the tire is held mounted "
+            "on the hub (Robot A frozen) and Robot B (UR10e nut-runner) learns "
+            "to seat its tool on each hub bolt in turn (geometric reach+align, "
+            "no nut physics). Forces freeze_robot_b=False (13-d action). Use "
+            "with --terminate-on never and a larger --max-steps (~600)."
+        ),
+    )
+    ap.add_argument(
+        "--nut-hold-steps", type=int,
+        default=int(getattr(_cfg_defaults, "nut_hold_steps", 12)),
+        help="Consecutive in-gate steps before a bolt counts as fastened.",
+    )
+    ap.add_argument(
+        "--nut-hotstart-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reverse-curriculum hot-start for the nut task: B starts near "
+            "bolt 0 (alpha=1) and the start pose ramps back to full HOME "
+            "(alpha=0). Gives the policy a reach gradient the flat exp-reach "
+            "landscape lacks from the 1.7 m HOME standoff."
+        ),
+    )
+    ap.add_argument("--nut-hotstart-alpha-start", type=float, default=1.0,
+                    help="Hot-start alpha held during the warmup (1=at bolt).")
+    ap.add_argument("--nut-hotstart-alpha-end", type=float, default=0.0,
+                    help="Hot-start alpha after the ramp (0=full HOME).")
+    ap.add_argument("--nut-hotstart-hold-steps", type=int, default=300_000,
+                    help="Steps to hold alpha_start before ramping down.")
+    ap.add_argument("--nut-hotstart-ramp-steps", type=int, default=1_500_000,
+                    help="Steps to ramp alpha_start → alpha_end.")
+    ap.add_argument(
+        "--nut-arrive-ang-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "nut_arrive_ang_curriculum", True)),
+        help=(
+            "Ramp the arrive-alignment gate loose→tight during the nut task: "
+            "the macro triggers under a generous angle early (so the reward is "
+            "reachable), then the gate tightens so the policy must align well."
+        ),
+    )
+    ap.add_argument(
+        "--nut-arrive-ang-start-deg", type=float,
+        default=float(getattr(_cfg_defaults, "nut_arrive_ang_start_deg", 35.0)),
+        help="Loose start angle (deg) for the arrive-alignment gate.")
+    ap.add_argument(
+        "--nut-arrive-ang-end-deg", type=float,
+        default=float(getattr(_cfg_defaults, "nut_arrive_ang_end_deg", 12.0)),
+        help="Tight end angle (deg) for the arrive-alignment gate.")
+    ap.add_argument(
+        "--nut-arrive-ang-hold-steps", type=int,
+        default=int(getattr(_cfg_defaults, "nut_arrive_ang_hold_steps", 300_000)),
+        help="Steps to hold the loose start before ramping the angle gate.")
+    ap.add_argument(
+        "--nut-arrive-ang-ramp-steps", type=int,
+        default=int(getattr(_cfg_defaults, "nut_arrive_ang_ramp_steps", 1_500_000)),
+        help="Steps to ramp the arrive-alignment gate start → end.")
+    ap.add_argument(
         "--tighten-hold-steps", type=int,
         default=int(getattr(_cfg_defaults, "tighten_hold_steps", 40)),
         help="6-stage cycle W1 hold (steps) the arm holds after mount.",
@@ -1342,6 +1546,11 @@ def main() -> int:
         overrides["remount_cycle_enable"] = bool(args.remount_cycle)
         overrides["tighten_hold_steps"] = int(args.tighten_hold_steps)
         overrides["loosen_hold_steps"] = int(args.loosen_hold_steps)
+        if bool(getattr(args, "nut_fastening", False)):
+            overrides["nut_fastening_task"] = True
+            # Robot B must be policy-controlled (13-d action / full obs).
+            overrides["freeze_robot_b"] = False
+            overrides["nut_hold_steps"] = int(args.nut_hold_steps)
         overrides["use_planner_residual"] = bool(args.use_planner_residual)
         overrides["attached_spawn_when_easy"] = bool(args.attached_spawn_when_easy)
         overrides["max_steps"] = int(args.max_steps)

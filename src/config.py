@@ -177,6 +177,62 @@ class RewardConfig:
     #: ``terminated and not is_success``.
     R_fail: float = -50.0
 
+    # ------------------------------------------------------------------
+    # Robot B sequential nut-fastening task (``cfg.nut_fastening_task``).
+    # These weights are phase-independent (the nut reward branch does not
+    # consult ``make_reward_config``'s phase gating), so they stay active
+    # whenever the nut task is enabled. Mirrors the Stage-0 approach
+    # design: bounded positive ``exp`` kernels (so surviving a step is
+    # never punished) + potential-based shaping + a sparse per-bolt bonus.
+    # ------------------------------------------------------------------
+    #: Positive reach kernel toward the current target bolt:
+    #: ``w_nut_reach * exp(-d_B / nut_reach_decay)`` where d_B is the
+    #: tool_tip→bolt distance. Bounded in [0, w_nut_reach].
+    w_nut_reach: float = 3.0
+    #: 2026-06-07 — widened 0.15 → 0.50. At the 1.7 m HOME→bolt standoff
+    #: ``exp(-1.7/0.15) ≈ 1e-5`` gave the policy zero approach gradient
+    #: (the first B run never reached a bolt). 0.50 keeps a usable pull
+    #: from ~1 m out while still rewarding the final cm of seating.
+    nut_reach_decay: float = 0.50
+    #: Positive alignment kernel: ``w_nut_align * exp(-θ_B / decay)``
+    #: where θ_B is the tool↔bolt axis angle (folded to [0, π/2]).
+    #: 2026-06-07 — decay tightened 30° → 18° so the gradient stays firm down
+    #: to the arrive-angle curriculum's end gate (12°). At 30° the kernel was
+    #: nearly flat across 12–35° (exp(-12/30)=0.67 vs exp(-35/30)=0.31), so
+    #: tightening the trigger gate added no matching pull to align; 18° gives
+    #: a clear pull right where the gate closes (exp(-12/18)=0.51,
+    #: exp(-5/18)=0.76) while still rewarding coarse alignment far out.
+    w_nut_align: float = 1.5
+    nut_align_decay_rad: float = np.deg2rad(18.0)
+    #: Potential-based shaping on Δd_B (pays positively each step the
+    #: tool closes on the target bolt). Reset across bolt advances.
+    w_pb_nut: float = 8.0
+    #: Sparse bonus paid once per bolt successfully fastened.
+    R_fasten: float = 50.0
+    #: Terminal success bonus paid once all ``n_bolts`` are fastened.
+    R_all_fastened: float = 300.0
+    # --- insertion-retract shaping (nut_fastening_task) -------------------
+    #: Positive lateral kernel ``w_nut_lateral * exp(-lat / decay)`` where
+    #: ``lat`` is the tool_tip distance off the bolt axis. Drives the
+    #: "enter exactly along the bolt (Y) axis" requirement so the socket
+    #: overlaps the stud instead of brushing it sideways.
+    w_nut_lateral: float = 2.0
+    nut_lateral_decay: float = 0.03
+    #: Positive axial-progress kernel during INSERT: rewards driving the
+    #: tool_tip to the bolt base (hub face) along the axis.
+    w_nut_axial: float = 2.0
+    nut_axial_decay: float = 0.05
+    #: Potential-based shaping on the RETRACT leg: pays positively per step
+    #: the tool_tip backs out along +axis (−Y) toward clearing the stud.
+    w_nut_retract: float = 6.0
+    #: Sparse bonus paid when the socket arrives coaxially + aligned at a
+    #: bolt's staging point (triggers the scripted insert→hold→retract
+    #: macro). This is the main signal the APPROACH policy chases.
+    R_arrive: float = 25.0
+    #: Sparse bonus paid when a bolt's INSERT+HOLD dwell completes (socket
+    #: fully seated over the stud), before the retract leg.
+    R_insert: float = 30.0
+
     # Cooperation term: r_coop = w_c * exp(-alpha*d_A) * exp(-beta*d_B)
     w_c: float = 2.0
     alpha: float = 10.0
@@ -1011,6 +1067,158 @@ class EnvConfig:
     #: W2 — steps the arm holds the re-gripped hub tire ("Robot B loosening
     #: the nuts") before pulling it off the hub. 40 ≈ 2 s at 20 Hz.
     loosen_hold_steps: int = 40
+
+    # ------------------------------------------------------------------
+    # **2026-06-07 — Robot B sequential nut-fastening task.** OPT-IN
+    # single-arm task that trains Robot B (UR10e + nut-runner tool) to
+    # fasten the hub bolts one-by-one while the tire is held mounted on
+    # the hub (Robot A frozen at HOME, tire bonded to the hub flange).
+    # "Fastening" is modelled GEOMETRICALLY (no nut bodies / torque in
+    # sim): the nut-runner ``tool_tip`` must come within ``nut_reach_tol``
+    # of a bolt tip AND align its tool axis to the bolt axis within
+    # ``nut_align_tol_rad`` for ``nut_hold_steps`` consecutive steps —
+    # then that bolt counts as fastened and the target advances to the
+    # next bolt. The episode succeeds once all ``n_bolts`` are fastened.
+    # When False (default) this path is entirely inert.
+    # ------------------------------------------------------------------
+    #: Master switch for the Robot-B sequential nut-fastening task.
+    nut_fastening_task: bool = False
+    #: Width of the appended nut-task obs block (eeB→staging vec [3], bolt
+    #: axis unit [3], alignment θ [1]). Kept as a field so the dim math and
+    #: ``_compute_obs`` stay in sync.
+    nut_obs_extra_dim: int = 7
+    #: tool_tip → bolt-tip distance (m) admitting a bolt into the
+    #: fasten gate. 4 cm matches the mount gate; the nut-runner socket
+    #: only needs to seat over the stud, not contact it.
+    nut_reach_tol: float = 0.04
+    #: tool-axis ↔ bolt-axis angular tolerance (rad). Both ±axis count
+    #: (the env folds θ→min(θ, π−θ)) so the policy may approach the bolt
+    #: from either bore direction. 15° ≈ a forgiving coaxial seat.
+    nut_align_tol_rad: float = np.deg2rad(15.0)
+    #: Consecutive in-gate steps required before a bolt is registered as
+    #: fastened (models the run-down dwell). 12 ≈ 0.6 s at 20 Hz.
+    nut_hold_steps: int = 12
+    # --- insertion-retract gate (the tighten cycle) ----------------------
+    #: Max tool_tip distance off the bolt axis (m) admitted into the INSERT
+    #: gate. The socket must enter coaxially (exactly along the bolt's Y
+    #: axis) so it overlaps the stud; ~1.5 cm ≳ the M22 stud radius (0.011).
+    nut_lateral_tol: float = 0.015
+    #: Axial tolerance (m) for the INSERT depth target. The tool_tip must
+    #: reach the bolt *base* (hub face, axial ≈ −L/2) within this band to
+    #: count as fully seated over the stud (socket envelops the whole bolt).
+    nut_insert_depth_tol: float = 0.02
+    #: Extra axial clearance (m) past the bolt tip the tool_tip must back
+    #: out to on RETRACT so the socket fully separates from the stud (no
+    #: residual overlap ⇒ "no collision on withdrawal"). Retract distance
+    #: from the seated base is therefore ≈ bolt_length + this.
+    nut_retract_clear: float = 0.03
+    #: Standoff (m) beyond the bolt tip for the oracle/demo APPROACH pose
+    #: (pre-insert staging point on the bolt axis). Unused by the policy.
+    nut_insert_standoff: float = 0.05
+    #: When True, fasten bolts strictly in index order 0..n-1 (the env
+    #: forces ``target_bolt_idx = 0`` at reset and increments). When
+    #: False the per-episode random target is kept and a single bolt is
+    #: trained (used for early single-bolt curriculum).
+    nut_sequential: bool = True
+    #: Optional path to a ``.npz`` snapshot of Robot-A mount-completion
+    #: poses (arrays ``qA`` [N,6], ``tire_pos`` [N,3], ``tire_orn`` [N,4]),
+    #: produced by ``scripts/extract_mount_endpose.py`` from a trained mount
+    #: policy. When set and the file exists, the nut-fastening reset samples
+    #: one snapshot so Robot A is frozen at the *actual* learned mount-hold
+    #: pose (exact deployment-distribution match) instead of the analytic
+    #: 6-o'clock anchor. Empty / missing ⇒ analytic fallback.
+    nut_mount_endpose_path: str = "data/nut_mount_endpose.npz"
+    #: Per-joint uniform jitter (rad) added to Robot A's frozen mount-hold
+    #: joint vector each reset. Injects support-pose variety so the Robot-B
+    #: policy treats A as a *distribution* of obstacle poses rather than one
+    #: memorised configuration — improves robustness to the exact pose the
+    #: deployed mount policy ends at. 0 ⇒ no jitter. ~3° keeps the gripper
+    #: on the tread (the tire stays hub-bonded regardless).
+    nut_a_hold_jitter_rad: float = np.deg2rad(3.0)
+    # --- Robot-B reverse-curriculum hot-start ----------------------------
+    #: When True, Robot B starts each episode partway between its HOME pose
+    #: and the first target bolt's approach pose, controlled by
+    #: ``nut_b_hotstart_alpha`` (1 = right at the bolt approach point,
+    #: 0 = full HOME distance). The flat exp-reach landscape gives no
+    #: gradient from the 1.7 m HOME standoff, so a reverse curriculum
+    #: (start near the bolt, then back the start pose off to HOME) is what
+    #: lets the policy first discover the insert, exactly like the mount
+    #: reverse-curriculum hot-start. The training callback ramps alpha
+    #: 1 → 0 over ``nut_b_hotstart_*_steps``.
+    nut_b_hotstart_enable: bool = True
+    #: Current hot-start interpolation (set per-rollout by the curriculum
+    #: callback; the env reads it each reset). 1 = bolt approach, 0 = HOME.
+    #: Default 0 = deployment/HOME so envs *without* the curriculum callback
+    #: (eval, preview) measure the true full-distance task; the training
+    #: callback overrides this to 1.0 at start and ramps it back to 0.
+    nut_b_hotstart_alpha: float = 0.0
+    #: Per-step EE translation scale (m) for Robot B in the nut task. The
+    #: shared 0.02 m/step makes the ≥1 m HOME→bolt traverse ~90 steps even
+    #: in a straight line; 0.05 keeps the traverse tractable inside the
+    #: 600-step horizon while staying smooth enough for the 1.5 cm insert.
+    nut_pos_scale: float = 0.05
+    # --- scripted insert→hold→retract macro ------------------------------
+    #: 2026-06-07 — the policy ONLY learns to APPROACH each bolt's staging
+    #: point (just outside the stud tip, on-axis). The delicate in/out is no
+    #: longer learned: once the socket arrives coaxially + aligned at the
+    #: staging point, the environment *forces* a deterministic
+    #: insert→hold→retract macro (driven by ``apply_absolute_ee`` straight
+    #: down/up the bolt axis), so the tighten cycle is always geometrically
+    #: correct and collision-free. The per-bolt fasten still requires the
+    #: *measured* socket to seat at the base then clear the tip.
+    nut_scripted_macro: bool = True
+    #: Consecutive in-gate steps at the staging point required to trigger the
+    #: macro. 2026-06-07 — dropped 3 → 1. With exploration noise of ~3 cm/step
+    #: (log_std −0.5 × pos_scale 0.05) the policy almost never held the old
+    #: tight 3-consecutive-step gate, so it never sampled the macro reward and
+    #: never learned to seat. The macro itself drives to a *cached* base IK
+    #: regardless of the exact arrival pose, so a single in-capture step is a
+    #: safe trigger.
+    nut_arrive_steps: int = 1
+    #: Capture radius (m) for the APPROACH→macro trigger: the macro fires once
+    #: the socket tip is within this sphere of the on-axis staging point
+    #: (combined with the alignment gate). Generous (5 cm ≫ the old ±2 cm
+    #: axial / 1.5 cm lateral box) so the policy can realistically reach it
+    #: under exploration; the scripted macro supplies the final precision.
+    nut_arrive_pos_tol: float = 0.05
+    #: Alignment gate (rad) for the trigger — tool +Z within this of the bolt
+    #: axis. Live value, ramped down by ``NutArriveAngCurriculumCallback`` from
+    #: ``nut_arrive_ang_start_deg`` → ``nut_arrive_ang_end_deg`` so the policy
+    #: first samples the macro under a loose gate, then must align ever tighter
+    #: to trigger. Default = the *tight end* so envs without the callback
+    #: (eval / smoke) measure honestly at deployment difficulty, mirroring the
+    #: hot-start alpha default of 0.0 (= hardest, full HOME).
+    nut_arrive_ang_tol_rad: float = np.deg2rad(12.0)
+    # --- arrive-alignment curriculum -------------------------------------
+    #: Whether to ramp the arrive alignment gate during training.
+    nut_arrive_ang_curriculum: bool = True
+    #: Loose start (deg): generous so the macro reward is reachable early.
+    nut_arrive_ang_start_deg: float = 35.0
+    #: Tight end (deg): the alignment quality we ultimately want at trigger.
+    nut_arrive_ang_end_deg: float = 12.0
+    #: Steps to hold the loose start before ramping (lets the value function
+    #: learn the macro is valuable while the gate is easy to hit).
+    nut_arrive_ang_hold_steps: int = 300_000
+    #: Steps to linearly ramp start → end after the hold.
+    nut_arrive_ang_ramp_steps: int = 1_500_000
+    #: Watchdog: max control steps the macro may spend in any one leg
+    #: (INSERT / HOLD / RETRACT) before it force-advances, so an IK stall
+    #: can't hang the episode. Generous vs the ~6-step legs.
+    nut_macro_leg_max_steps: int = 30
+    #: Per-control-step axial travel (m) of the forced macro. The macro
+    #: IK-teleports the socket toward the leg target capped at this stride
+    #: so the in/out is *visible* (several steps per leg) yet fast enough
+    #: that all 10 bolts fit the episode horizon (PD tracking the full
+    #: plunge took ~50 steps/bolt — too slow). ~4 cm ⇒ ~5-step legs.
+    nut_macro_step_m: float = 0.04
+    #: Extra axial margin (m) for the in/out cycle. The APPROACH staging
+    #: point is pushed this much further out in −Y (away from the hub, more
+    #: clearance before the plunge), so the forced macro plunges from
+    #: further out to the hub-face base — a longer, deeper-*looking* insert
+    #: stroke (the base is the deepest reachable point; the hub blocks
+    #: anything past it). The RETRACT then backs out this much further past
+    #: the tip too. 0 ⇒ legacy park-at-tip / seat-at-base cycle.
+    nut_insert_margin: float = 0.03
     #: S2 retract gate — EE must come within this of the HOME EE pose for the
     #: empty-handed retract (S2 → S3) to fire.
     home_return_radius_tol: float = 0.12
@@ -2109,6 +2317,16 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     if phase == 1 and not freeze_b_user_set:
         cfg.freeze_robot_b = True
 
+    # Robot-B nut-fastening task: Robot B is the policy-controlled arm
+    # (13-d action / full obs) and Robot A is a static fixture. Force the
+    # un-frozen regime regardless of phase (must precede the action/obs dim
+    # computation below). The contact-force termination is disabled further
+    # down, *after* the layout preset runs (it would otherwise reset the
+    # gate to 50 kN).
+    nut_task_cfg = bool(getattr(cfg, "nut_fastening_task", False))
+    if nut_task_cfg:
+        cfg.freeze_robot_b = False
+
     # Action / observation dims follow ``freeze_robot_b`` — the Panda
     # action block is dropped from ``action_space`` when frozen so PPO
     # doesn't search a 6-d dead manifold, and the matching ``prev_action``
@@ -2132,6 +2350,13 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
             cfg.obs.dim = tail + 3
         else:
             cfg.obs.dim = tail
+    # Nut-fastening task: append a 7-d task block (eeB→staging vector [3],
+    # bolt axis unit [3], alignment θ [1]) so the policy gets the approach
+    # target + insertion direction directly instead of inferring them from
+    # the bolt-centre vector + quaternion. ``_compute_obs`` appends the same
+    # block under ``nut_fastening_task``.
+    if nut_task_cfg:
+        cfg.obs.dim += int(getattr(cfg, "nut_obs_extra_dim", 7))
     if legacy_obs_dim is not None:
         cfg.obs.dim = int(legacy_obs_dim)
     layout = str(getattr(cfg, "scene_layout", "fanuc_spacious")).lower()
@@ -2145,4 +2370,17 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
         # caller's explicit overrides so CLI flags always win over layout presets.
         for k, v in user_overrides.items():
             setattr(cfg, k, v)
+    # Nut-fastening: disable the contact-force termination after the layout
+    # preset (which sets it to 50 kN) unless the caller set it explicitly —
+    # the nut-runner tool legitimately seats against the studs / wheel face.
+    if nut_task_cfg and not cf_user_set:
+        cfg.contact_force_terminate_above = 0.0
+    # The nut task is intimate-contact work: the socket seats on the studs at
+    # the hub face while Robot A holds the tire right there. A glancing
+    # socket↔tire / socket↔A contact is expected and must NOT kill the
+    # episode (the forced insert macro deliberately drives the socket to the
+    # hub-face base). Keep the per-step collision *penalty* but disable
+    # collision *termination* so the policy can learn to work in close.
+    if nut_task_cfg and "collision_terminates" not in user_overrides:
+        cfg.collision_terminates = False
     return cfg
