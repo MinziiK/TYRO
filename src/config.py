@@ -91,6 +91,14 @@ class RewardConfig:
     #: (3·exp(-4)≈0.055/step was drowned by sync_joint / approach dense).
     w_guide: float = 8.0
     guide_decay: float = 0.5  # m (matches return_decay scale)
+    #: **v13 (reverted)** — a fine seating kernel ``seat_A = w_seat *
+    #: exp(-d_A/seat_decay)`` was tried to pull d_A below the gate, but the
+    #: 0605 run showed the d_A≈0.25 m floor is *physical* (identical across
+    #: 3 reward configs), not a missing gradient: seat_A left d_A unchanged
+    #: while doubling contact force (49→124, max 330) and enabling a
+    #: hover-and-farm exploit. Kept at 0 — see env/scene geometry instead.
+    w_seat: float = 0.0
+    seat_decay: float = 0.10  # m
     #: **v9b**: 5 → 10 — stronger Δd_A gradient toward hub when guide_A
     #: alone does not shrink d_A (v9 stuck at d_A≈2.1 m with guide≈0.12).
     w_pb_carry: float = 10.0
@@ -381,7 +389,16 @@ class EnvConfig:
     #   * Lift travel ................ ~0 cm  (pickup ↔ hub Z gap < 1 cm)
     #: World Z height of the ground plane (Robot B-centric).
     floor_z: float = -0.60
-    robot_A_base_pos: Tuple[float, float, float] = (-0.80, 0.0, -0.30)
+    #: **2026-06-01 (dual-arm relayout)** — UR10 base moved from
+    #: ``(-0.80, 0, -0.30)`` to ``(-0.60, 0.15, -0.30)`` so its workspace
+    #: actually covers the hub (0, 0.80, 0.22) / cooperative zone. At the
+    #: old pose the EE could not reach x≈0 (hub ~1.21 m away, near the
+    #: 1.3 m reach limit); +0.20 X / +0.15 Y brings the hub ~0.95 m out,
+    #: inside the dexterous workspace. Panda stays at the world origin.
+    #: NOTE: this translates every UR10 EE world pose by (+0.20, +0.15, 0)
+    #: relative to legacy runs — HOME joint config is unchanged (joint
+    #: space), but the achieved HOME EE position shifts accordingly.
+    robot_A_base_pos: Tuple[float, float, float] = (-0.60, 0.15, -0.30)
     robot_A_base_rpy: Tuple[float, float, float] = (0.0, 0.0, 0.0)
     #: Panda sits at the world origin — the entire scene is expressed
     #: in Robot B's base frame.
@@ -583,80 +600,10 @@ class EnvConfig:
     #: starts back in once mount converges.
     start_pos_easy_prob: float = 1.0
 
-    # ------------------------------------------------------------------
-    # **v11 (2026-05-31) — Reverse curriculum (backtracking) scheduler.**
-    # ------------------------------------------------------------------
-    # Independent of the legacy ``start_pos_curriculum_mode``. When
-    # ``reverse_curriculum_enable`` is True, the env reset() routes to
-    # one of three phases as a step-function of the global PPO step:
-    #   * Phase A (0 .. reverse_phase_a_steps): hub-aligned hot-start.
-    #     Tire teleported to ``tire_mount_pos`` with bore axis aligned
-    #     to hub axis, UR10 EE on the 6-o'clock grasp anchor of that
-    #     tire pose, grasp constraint attached, ``task_stage = 1``.
-    #     Policy starts within R_mount range every reset.
-    #   * Phase A→B blend (reverse_phase_a_steps .. + a_to_b_overlap):
-    #     Bernoulli mix — keeps ``reverse_phase_a_mix_prob`` of resets
-    #     in Phase A while gradually introducing Phase B. Mitigates
-    #     catastrophic forgetting of mount-endgame skill.
-    #   * Phase B (.. reverse_phase_b_steps): legacy easy-mix start.
-    #     Bernoulli(``start_pos_easy_prob``) on easy vs HOME.
-    #   * Phase C (after reverse_phase_b_steps): pure HOME starts.
-    reverse_curriculum_enable: bool = False
-    #: End of pure-A plateau (global PPO timesteps).
-    reverse_phase_a_steps: int = 250_000
-    #: End of A→B overlap window. Between ``phase_a_steps`` and this
-    #: value resets pick A with probability ``reverse_phase_a_mix_prob``,
-    #: else fall through to Phase B sampling.
-    reverse_phase_a_to_b_overlap: int = 50_000
-    #: Probability of staying in Phase A during the A→B overlap.
-    reverse_phase_a_mix_prob: float = 0.75
-    #: End of Phase B plateau (also start of pure-C HOME).
-    reverse_phase_b_steps: int = 750_000
-    #: Distance budget (m) for the tire spawn perturbation around the
-    #: mount target in Phase A. Sampled uniformly along the hub-axis
-    #: direction inward from the goal, so the policy still has
-    #: a small mount-approach to traverse on every reset.
-    #: **v11c (2026-05-31)**: 0.03 → 0.01. v11 hot-start sampled
-    #: backoff in [0.01, 0.03] m which combined with a 2° angular tilt
-    #: pushed a non-trivial fraction of resets close to the mount-tol
-    #: boundary (radius_soft = 0.30 m, angle_soft = 35°). After the
-    #: first physics decimation step, the policy's untrained Δaction
-    #: could shove the tire out of tol → mount event never fired and
-    #: ``fsm_bonus`` averaged ≈ 0.25/step instead of the expected
-    #: ≈ 1.0/step (one R_mount paid per ep). Tight jitter restores the
-    #: "guaranteed first-step mount fire" assumption.
-    reverse_phase_a_radial_jitter: float = 0.01
-    #: Max angular perturbation (rad) applied to the tire bore axis
-    #: around the hub axis during Phase A spawn.
-    #: **v11c (2026-05-31)**: 2.0° → 0.5° for the same first-step
-    #: mount-fire guarantee. 0.5° ≪ angle_soft = 35° so the tilt never
-    #: pushes the angular check past gate.
-    reverse_phase_a_angular_jitter: float = np.deg2rad(0.5)
-    #: **v11c (2026-05-31)** — Phase A R_mount paid + episode continues.
-    #: When ``True``, the env temporarily switches ``terminate_on`` to
-    #: "mount" while the ``ReverseCurriculumCallback`` reports Phase A;
-    #: Phase B/C revert to the CLI-supplied value (typically "never").
-    #:
-    #: **v11c1 (2026-05-31)** — default flipped to **False** after the
-    #: v11c_balanced_v1 smoke run showed fps = 12 (≈ 1/8 of v11). Root
-    #: cause: 1-step episodes triggered a PyBullet ``reset()`` every env
-    #: step, which dominates wall-clock. Keeping ``terminate_on="never"``
-    #: in Phase A lets the ``_phase_a_force_mount_first_step`` flag still
-    #: pay R_mount on step 1 (sparse signal preserved), then the episode
-    #: continues through Stage 2 (demount) and Stage 3 (return) up to
-    #: ``max_steps`` — which is the actual goal of reverse curriculum:
-    #: collect on-policy trajectories *after* the mount event so PPO can
-    #: also learn demount + return. Set to ``True`` only if the legacy
-    #: 1-step success pattern is desired (e.g. for a Phase A-only
-    #: mount-policy distillation run).
-    reverse_phase_a_terminate_on_mount: bool = False
-    #: **v11c (2026-05-31)** — distance gate (m) on the Stage 0 dense
-    #: ``approach_A`` term. When ``d_approach > approach_A_gate``, the
-    #: dense reward is zeroed for that step so the policy can't farm
-    #: it by sitting just outside the grasp anchor. Reflects the v4 /
-    #: v9b plateau diagnosis (policy collected ~+1.5/step from
-    #: ``approach_A`` while ``d_A`` stayed at 2.0 m). Set to a
-    #: large value (>5 m) to disable.
+    #: Distance gate (m) on the Stage 0 dense ``approach_A`` term: when
+    #: ``d_approach > approach_A_gate`` the dense reward is zeroed so the
+    #: policy can't farm it by sitting just outside the grasp anchor. Set
+    #: large (>5 m) to disable.
     approach_A_gate: float = 0.20
     #: **v11c2 (2026-05-31)** — master switch for the four "safety"
     #: termination gates (``vertical_violation``, ``collision``,
@@ -718,6 +665,15 @@ class EnvConfig:
     #: Stage 1 → 2 trigger: ‖tire − hub‖ < ``mount_radius_tol`` AND tire axis
     #: aligned with hub axis (≤ ``RewardConfig.delta_A`` rad).
     #: **Final hard gate** that the v6 mount curriculum asymptotes to.
+    #: NOTE (v13b): this 0.04 m target was *geometrically unreachable* until
+    #: the truck-station brake proxies were resized — the brake rotor (r 0.30)
+    #: exceeded the tire bore (r 0.282), flooring the tire COM at d_A≈0.13 and
+    #: causing the curriculum to stall at frac≈0.40 (tol≈0.21 m) across three
+    #: reward configs. With rotor→0.22 and the caliper pushed aft, the tire
+    #: now seats concentrically (verified: d_A=0 clears by ~0.02 m, and a
+    #: 0.04 m offset is collision-free in every direction), so this gate and
+    #: ``tire_mount_pos`` (hub centre) are valid as-is — no reward/target
+    #: workaround needed. See scripts/generate_truck_wheel_station_urdf.py.
     mount_radius_tol: float = 0.04
     #: v6 mount-gate curriculum — **start radius** (m) used before the
     #: smoothstep ramp begins. 0.30 m gives the policy a generous
@@ -737,6 +693,49 @@ class EnvConfig:
     #: ``(mount_radius_tol_soft, mount_angle_tol_soft_rad)`` down to
     #: ``(mount_radius_tol, reward.delta_A)``.
     mount_tol_ramp_steps: int = 600_000
+    #: Mount-gate curriculum mode. ``"adaptive"`` (default) advances the
+    #: soft→hard difficulty only while the recent success rate stays high
+    #: and **rolls difficulty back** when it collapses — closing the loop
+    #: that the open-loop ``"schedule"`` mode left open (a time-only ramp
+    #: tightens the gate regardless of whether the policy keeps up, so a
+    #: collapse never recovers). ``"schedule"`` keeps the legacy
+    #: ``num_timesteps`` smoothstep for reproducing old runs.
+    mount_curriculum_mode: str = "adaptive"
+    #: Adaptive mode — advance difficulty (``frac += mount_adapt_step_up``)
+    #: when the recent success rate is at or above this threshold.
+    #: v12: raised 0.80 → 0.85. The mount success curve is a *cliff*
+    #: (1.0 → 0.0 in a single tol step), so advancing off a barely-passing
+    #: window drove the oscillation seen in the 20260602 run. Require a
+    #: stronger cushion before tightening.
+    mount_adapt_advance_sr: float = 0.85
+    #: Adaptive mode — roll difficulty back (``frac -= mount_adapt_step_down``)
+    #: when the recent success rate falls to or below this threshold. The
+    #: gap to ``mount_adapt_advance_sr`` is the hysteresis band that keeps
+    #: the gate from oscillating around a single success level. v12: lowered
+    #: 0.55 → 0.50 to widen that band (0.85/0.50) and avoid retreating on a
+    #: noisy dip.
+    mount_adapt_rollback_sr: float = 0.50
+    #: Adaptive mode — difficulty increment per adjustment when advancing.
+    #: v12 first tried 0.025 but, combined with dwell=6, that quartered the
+    #: advance rate (~175k steps / 0.025 frac) so the gate never reached the
+    #: tol≈0.19 m cliff region within a 2M budget — the run stayed in the
+    #: trivial soft-tol zone. Restored to 0.05; the anti-oscillation work is
+    #: carried by dwell=6 / advance_sr=0.85 / min_episodes=60 instead.
+    mount_adapt_step_up: float = 0.05
+    #: Adaptive mode — difficulty decrement per adjustment when rolling
+    #: back. Larger than ``step_up`` so a collapse is unwound faster than
+    #: it was built up (asymmetric: retreat quickly, re-advance cautiously).
+    mount_adapt_step_down: float = 0.10
+    #: Adaptive mode — minimum completed episodes in the success window
+    #: before any advance/rollback decision is trusted (avoids reacting to
+    #: a handful of noisy early episodes). v12: 40 → 60 for a more
+    #: trustworthy estimate near the cliff.
+    mount_adapt_min_episodes: int = 60
+    #: Adaptive mode — number of rollouts to hold ``frac`` fixed after any
+    #: change, letting the policy (and the success estimate) settle before
+    #: the next decision. v12: 3 → 6 — the dominant anti-oscillation knob;
+    #: lets the policy consolidate each new tol before being pushed again.
+    mount_adapt_dwell_rollouts: int = 6
     #: Stage 2 → success: ‖tire − pickup‖ < ``return_radius_tol`` AND tire
     #: descent speed < ``landing_speed_max`` (soft landing).
     return_radius_tol: float = 0.05
@@ -773,6 +772,18 @@ class EnvConfig:
     bolt_circle_radius: float = 0.1675
     bolt_length: float = 0.10
     bolt_radius: float = 0.011
+
+    #: **2026-06-01 (UR10-feasible tire)** — when True, ``Scene._spawn_tire``
+    #: loads ``tire_urdf`` (a smaller hollow-ring tyre generated by
+    #: ``scripts/generate_tire_urdf.py``) instead of the full-size procedural
+    #: ``models.create_tire_wheel_multibody``. The procedural tyre is left
+    #: untouched and remains the default. When enabling this, also set
+    #: ``tire_outer_radius`` / ``tire_inner_radius`` / ``tire_thickness`` /
+    #: ``tire_mass`` to match the generated URDF so the env's grasp-anchor /
+    #: mount geometry stays consistent (the generator prints the exact block).
+    #: Bore axis = link local +Z, same convention as the procedural tyre.
+    use_tire_urdf: bool = False
+    tire_urdf: str = str(URDF_DIR / "tire" / "tire_ur10.urdf")
 
     # Scene source: URDF aggregates hub + bolts; primitive path matches prior behavior.
     use_truck_hub_urdf: bool = True
@@ -933,6 +944,18 @@ class EnvConfig:
     #: this length so the policy can still operate on a "fix to last
     #: pose" basis if it has not yet triggered the stage gate.
     planner_traj_steps: int = 100
+    #: **2026-06-01 (lift-first carry fix)** — vertical clearance (m) the
+    #: Stage-1 nominal trajectory lifts the EE straight up (keeping the
+    #: grasp orientation fixed) *before* translating + rotating toward the
+    #: mount pose. Without this waypoint the single straight cradle→mount
+    #: chord drags the 1.05 m tire (grasped at its 6-o'clock point) into
+    #: the outer rack rail within ~15 steps, tripping the contact-force
+    #: kill switch even for a zero-residual rollout (see
+    #: ``scripts/smoke_planner_residual.py``). The lift clears the tread
+    #: above the rail tops (rail top Z = 0.0, grasp anchor Z ≈ −0.134) so
+    #: the subsequent carry segment never sweeps the rack. Set ≤ 0 to
+    #: disable (single-segment chord, legacy behaviour).
+    planner_stage1_lift_height: float = 0.35
     #: When ``True`` AND the easy-spawn branch is rolled in ``reset``
     #: (i.e. Bernoulli(``start_pos_easy_prob``) returned True under
     #: ``start_pos_curriculum_mode == "mix"``), the env performs the
@@ -945,6 +968,62 @@ class EnvConfig:
     #: setup. Set to False to retain the legacy "EE teleported below
     #: grasp anchor but tire still pinned to cradle" easy spawn.
     attached_spawn_when_easy: bool = True
+    #: **2026-06-01 (hub-aligned carry fix)** — when the attached hot-start
+    #: fires, re-pose the tire so its bore is **already aligned with the
+    #: hub axis** (``_mount_tire_quat``) at the cradle, instead of the
+    #: ``tire_spawn_rpy`` (+X) pickup pose. Diagnosis (see
+    #: ``scripts/smoke_planner_residual.py`` history) showed the UR10, at
+    #: its far-reach cradle pose, **cannot track** the 90° bore
+    #: reorientation (tool-roll) needed to carry a +X-spawned tire onto the
+    #: −Y hub — the IK stalls and the mount gate never fires. Pre-aligning
+    #: the bore at spawn turns the reorientation into a free teleport, so
+    #: the Stage-1 carry reduces to a lift + pure translation, which the arm
+    #: tracks stably (mount reached with zero residual). Only consulted on
+    #: the mount-only attached-hot-start path; the full-cycle Stage-0 pickup
+    #: still spawns the tire at the +X ``tire_spawn_rpy`` pose. Set False to
+    #: restore the legacy +X attached spawn (and the untrackable in-flight
+    #: reorientation).
+    #:
+    #: **Default False (2026-06-01 diagnosis)**: pre-aligning the bore to
+    #: −Y at the cradle puts the tread ring in the X-Z plane, which
+    #: *obstructs the UR10's +X-side approach* to the 6-o'clock grasp
+    #: anchor (the arm jams into the ring). Kept as an opt-in for layouts
+    #: where the robot does not approach across the tread plane.
+    attached_spawn_hub_aligned: bool = False
+
+    # ------------------------------------------------------------------
+    # **2026-06-01 — Dual-arm cooperative carry (mount-only).**
+    # ------------------------------------------------------------------
+    # Single-arm carry of the truck tire was shown (GUI + headless sweeps)
+    # to be infeasible: the UR10 is always at far reach and cannot track
+    # the 90° bore reorientation. The cooperative scheme instead spawns the
+    # (UR10-feasible) tire in an **open zone both arms reach** (in front of
+    # the hub, away from the cargo), grasps it with BOTH arms (UR10 rigid +
+    # Panda point-to-point support), and carries it onto the hub with a
+    # short, collision-free, reorientation-free translation. The PPO policy
+    # still only drives the UR10 residual (action stays 6-d / obs 85-d);
+    # the Panda is planner-driven (not policy-controlled) and simply holds
+    # the far side of the tire stable. Verified collision-free with the
+    # zero-residual nominal reaching d_hub ≈ 0.19 m (inside the soft mount
+    # gate). Requires ``use_tire_urdf=True`` + the small-tire dims and the
+    # relayout UR10 base (see those fields).
+    dual_arm_coop: bool = False
+    #: Tire COM spawn pose for the cooperative hot-start (world). In the
+    #: open zone in front of the hub that BOTH arms reach with IK residual
+    #: ≈ 0 (UR10 ~0.62 m, Panda ~0.55 m to the rim grasp points).
+    coop_spawn_pos: Tuple[float, float, float] = (-0.20, 0.50, 0.20)
+    #: Unit direction (world) from the tire COM to each arm's grasp rim
+    #: point (bore along −Y ⇒ tread ring in the X-Z plane; point = COM +
+    #: R·dir). **UR10 grasps the bottom (6-o'clock, −Z) and Panda the top
+    #: (12-o'clock, +Z)** so the two arms stay vertically separated — any
+    #: same-side pairing (e.g. UR −X + Panda −Z) makes the forearms collide
+    #: within a couple of steps. This pairing carried the tire collision-
+    #: free to d_hub ≈ 0.09 m with a zero residual.
+    coop_ur_grasp_dir: Tuple[float, float, float] = (0.0, 0.0, -1.0)
+    coop_panda_grasp_dir: Tuple[float, float, float] = (0.0, 0.0, 1.0)
+    #: Peak of the vertical lift arc (m) added to both arms' nominal carry
+    #: so the tire rises clear of any low obstacle mid-transit.
+    coop_lift_arc: float = 0.12
 
     # ------------------------------------------------------------------
     # Domain randomization (Phase 1 → Sim2Real bridge)

@@ -160,6 +160,14 @@ class TyroEnv(gym.Env):
         self.robot_B: Optional[PandaRobot] = None
         # Tire ↔ UR10 EE fixed joint (Stage 1/2). Recreated on each pickup.
         self._grasp_constraint: Optional[int] = None
+        # **Dual-arm coop** — Tire ↔ Panda EE point-to-point support grip.
+        self._panda_grasp_constraint: Optional[int] = None
+        # Panda nominal carry trajectory (positions only; orientation free).
+        self._traj_pos_B: Optional[np.ndarray] = None
+        # Held UR10 grasp orientation + spawn bookkeeping for the coop carry.
+        self._coop_ur_hold_quat: Optional[np.ndarray] = None
+        self._coop_spawn_com: Optional[np.ndarray] = None
+        self._coop_panda_ee0: Optional[np.ndarray] = None
         # Tire ↔ world fixed joint (Stage 0 and after final landing). Keeps
         # the standing-on-edge tire from tipping over when not grasped.
         self._world_pin: Optional[int] = None
@@ -238,6 +246,9 @@ class TyroEnv(gym.Env):
         p.resetSimulation(physicsClientId=self.client)
         # resetSimulation() invalidates all body / constraint ids — clear cache.
         self._grasp_constraint = None
+        self._panda_grasp_constraint = None
+        self._traj_pos_B = None
+        self._coop_ur_hold_quat = None
         self._world_pin = None
         self.task_stage = 0
         self._mount_bonus_paid = False
@@ -329,31 +340,20 @@ class TyroEnv(gym.Env):
         # ``FINAL_LOCK_QUATERNION`` so the gripper stays palm-up.
         if not hasattr(self, "_start_pos_alpha"):
             self._start_pos_alpha = 1.0
-        # **v11 (2026-05-31) — Reverse curriculum** takes priority over
-        # the legacy start-pos curriculum. When enabled, the env reset
-        # routes to one of three phases driven by ``_rev_curriculum_phase``
-        # (set per-rollout by the ReverseCurriculumCallback). The phase
-        # is consulted *before* the world-pin step so Phase A can place
-        # the tire at the hub-mount pose instead of the cradle.
-        if not hasattr(self, "_rev_curriculum_phase"):
-            self._rev_curriculum_phase = "C"  # safe default (HOME)
         if not hasattr(self, "_start_pos_used_hot_start_last_reset"):
             self._start_pos_used_hot_start_last_reset = False
 
-        rev_enabled = bool(getattr(self.cfg, "reverse_curriculum_enable", False))
         hot_started = False
-        if rev_enabled and str(self._rev_curriculum_phase).upper() == "A":
-            # Phase A — hub-aligned hot-start. Tire placed at the mount
-            # target with axis aligned to hub axis (small jitter), UR10
-            # EE on the 6-o'clock grasp anchor of that tire pose, fixed
-            # grasp constraint attached, task_stage forcibly set to 1.
+        # **Dual-arm cooperative carry** takes priority over every other
+        # spawn branch: both arms grasp the tire in the open zone and the
+        # episode starts in Stage 1. Falls back to the standard reset if it
+        # raises (geometry / IK issue) so eval/debug never hard-crashes.
+        if bool(getattr(self.cfg, "dual_arm_coop", False)):
             try:
-                self._apply_reverse_phase_a_hot_start()
+                self._apply_dual_arm_hot_start()
                 hot_started = True
             except Exception as exc:  # noqa: BLE001
-                # Fall through to standard reset if hot-start fails for
-                # any reason (geometry not loaded, IK failure, etc.).
-                print(f"[reverse-curriculum] Phase A hot-start failed: {exc}")
+                print(f"[dual-arm] hot-start failed, falling back: {exc}")
                 hot_started = False
         self._start_pos_used_hot_start_last_reset = bool(hot_started)
 
@@ -362,29 +362,12 @@ class TyroEnv(gym.Env):
             # Don't re-pin the tire (would override the mount pose).
             self._start_pos_used_easy_last_reset = False
         else:
-            # Phase A→B blend may still want Phase B sampling (easy/HOME
-            # mix). Phase B and C both consult the legacy start-pos
-            # curriculum below. Phase C is implemented as easy_prob=0.
-            phase = str(self._rev_curriculum_phase).upper() if rev_enabled else None
-            if rev_enabled and phase == "B":
-                # Force mix mode with the configured easy_prob.
-                self._start_pos_alpha = float(getattr(
-                    self.cfg, "start_pos_easy_prob", 0.75,
-                ))
-                start_mode = "mix"
-                start_pos_active = True
-            elif rev_enabled and phase == "C":
-                # Pure HOME — disable the easy spawn entirely.
-                self._start_pos_alpha = 0.0
-                start_mode = "mix"
-                start_pos_active = True
-            else:
-                start_pos_active = bool(getattr(
-                    self.cfg, "start_pos_curriculum_enable", False,
-                ))
-                start_mode = str(getattr(
-                    self.cfg, "start_pos_curriculum_mode", "lerp",
-                )).lower()
+            start_pos_active = bool(getattr(
+                self.cfg, "start_pos_curriculum_enable", False,
+            ))
+            start_mode = str(getattr(
+                self.cfg, "start_pos_curriculum_mode", "lerp",
+            )).lower()
 
             # **2026-06-01** — attached-hot-start gate. When the easy
             # branch is rolled AND ``cfg.attached_spawn_when_easy`` is
@@ -399,14 +382,11 @@ class TyroEnv(gym.Env):
                 if start_mode == "mix":
                     # In mix mode, ``_start_pos_alpha`` is reinterpreted
                     # as the Bernoulli easy-spawn probability.
-                    if rev_enabled and phase in ("B", "C"):
-                        easy_prob = float(self._start_pos_alpha)
-                    else:
-                        easy_prob = float(getattr(self, "_start_pos_alpha", 1.0))
-                        if easy_prob >= 1.0:
-                            easy_prob = float(getattr(
-                                self.cfg, "start_pos_easy_prob", 0.5,
-                            ))
+                    easy_prob = float(getattr(self, "_start_pos_alpha", 1.0))
+                    if easy_prob >= 1.0:
+                        easy_prob = float(getattr(
+                            self.cfg, "start_pos_easy_prob", 0.5,
+                        ))
                     if float(self._np_random.random()) < easy_prob:
                         if bool(getattr(
                             self.cfg, "attached_spawn_when_easy", False,
@@ -679,291 +659,6 @@ class TyroEnv(gym.Env):
         ur.last_target_pos = ur.ee_pose()[0].copy()
 
     # ------------------------------------------------------------------
-    # **v11 (2026-05-31) — Reverse curriculum hot-start.**
-    # ------------------------------------------------------------------
-    def set_terminate_on(self, value: str) -> None:
-        """**v11c (2026-05-31)** — broadcast-able ``terminate_on`` toggle.
-
-        Called by the ``ReverseCurriculumCallback`` on every phase change.
-        Phase A flips the env to ``terminate_on="mount"`` so the
-        first-step mount fire collects R_mount + ``is_success`` and
-        the episode ends; Phase B/C restore the CLI-supplied default
-        (typically ``"never"`` for full 4-stage cycle).
-
-        Args
-        ----
-        value : str
-            One of ``"never" | "pickup" | "mount" | "demount"``.
-        """
-        v = str(value).strip().lower()
-        if v not in ("never", "pickup", "mount", "demount"):
-            raise ValueError(f"terminate_on must be never/pickup/mount/demount, got {value!r}")
-        self.cfg.terminate_on = v
-
-    def get_terminate_on(self) -> str:
-        return str(getattr(self.cfg, "terminate_on", "never")).lower()
-
-    def set_safety_terminations(self, enabled: bool) -> None:
-        """**v11c2 (2026-05-31)** — master switch for the four "safety"
-        episode-end gates: vertical / collision / workspace / contact_force.
-
-        See ``EnvConfig.safety_terminations_enabled`` for the rationale.
-        """
-        self.cfg.safety_terminations_enabled = bool(enabled)
-
-    def get_safety_terminations(self) -> bool:
-        return bool(getattr(self.cfg, "safety_terminations_enabled", True))
-
-    def set_contact_force_term(self, value: float) -> None:
-        """**v11c1 (2026-05-31)** — broadcast-able ``contact_force_terminate_above``.
-
-        Called by ``ReverseCurriculumCallback`` so Phase A can disable
-        the contact-force kill switch (set to ``+inf``) while the tire
-        is sitting on the hub at hot-start — the first physics step
-        produces 25k–70k N of contact force which would otherwise
-        terminate the episode in one step. Phase B/C restore the
-        config default so the safety gate is active during random-
-        spawn / HOME training.
-        """
-        self.cfg.contact_force_terminate_above = float(value)
-
-    def get_contact_force_term(self) -> float:
-        return float(getattr(self.cfg, "contact_force_terminate_above", 0.0))
-
-    def set_reverse_curriculum_phase(self, phase: str) -> None:
-        """External entry point for the ReverseCurriculumCallback.
-
-        ``phase`` ∈ {"A", "B", "C"}. The env consumes this on the next
-        ``reset()`` call. Defaults to "C" (pure HOME) when never set,
-        so eval / render paths always evaluate the production task.
-        """
-        ph = str(phase).strip().upper()
-        if ph not in ("A", "B", "C"):
-            raise ValueError(f"reverse curriculum phase must be A/B/C, got {phase!r}")
-        self._rev_curriculum_phase = ph
-
-    def get_reverse_curriculum_phase(self) -> str:
-        return str(getattr(self, "_rev_curriculum_phase", "C")).upper()
-
-    def _apply_reverse_phase_a_hot_start(self) -> None:
-        """Place the tire at the hub mount pose, attach the grasp, and
-        teleport the UR10 EE to the corresponding 6-o'clock anchor.
-
-        Sets ``self.task_stage = 1`` so the policy starts inside the
-        carry/mount window. Small radial + angular jitter is applied so
-        every reset is a slightly different "almost mounted" pose,
-        preventing memorisation of a single grasp.
-        """
-        R = float(self.cfg.tire_outer_radius)
-        mount_target = np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
-        hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
-        hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
-
-        radial_jitter = float(getattr(
-            self.cfg, "reverse_phase_a_radial_jitter", 0.03,
-        ))
-        angular_jitter = float(getattr(
-            self.cfg, "reverse_phase_a_angular_jitter", np.deg2rad(2.0),
-        ))
-
-        # Sample a backoff along the hub axis (1 .. 3 cm away from the
-        # mount target) so the tire is "just outside" the bore.
-        backoff = float(self._np_random.uniform(0.01, max(radial_jitter, 0.01)))
-        tire_pos = mount_target - backoff * hub_axis
-
-        # Tire orientation — align bore axis with hub axis + small
-        # random tilt within ``angular_jitter`` rad. Implemented as a
-        # rotation around a random axis perpendicular to hub_axis.
-        if angular_jitter > 0.0:
-            perp = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            if abs(float(np.dot(perp, hub_axis))) > 0.95:
-                perp = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-            perp = perp - float(np.dot(perp, hub_axis)) * hub_axis
-            perp = perp / max(float(np.linalg.norm(perp)), 1e-9)
-            tilt = float(self._np_random.uniform(-angular_jitter, angular_jitter))
-            # Rotate hub_axis around ``perp`` by ``tilt`` to get the
-            # perturbed tire axis.
-            cos_t, sin_t = float(np.cos(tilt)), float(np.sin(tilt))
-            tire_axis = (
-                cos_t * hub_axis
-                + sin_t * np.cross(perp, hub_axis)
-                + (1.0 - cos_t) * float(np.dot(perp, hub_axis)) * perp
-            )
-            tire_axis = tire_axis / max(float(np.linalg.norm(tire_axis)), 1e-9)
-        else:
-            tire_axis = hub_axis.copy()
-
-        # Build a quaternion whose +Z body axis matches ``tire_axis``.
-        # Tire URDF convention (see scene.py / cfg.tire_spawn_rpy) has
-        # the bore axis along the body +Z; we align that to tire_axis.
-        z_ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        v = np.cross(z_ref, tire_axis)
-        c = float(np.dot(z_ref, tire_axis))
-        s = float(np.linalg.norm(v))
-        if s < 1e-9:
-            # tire_axis is parallel (or anti-parallel) to z_ref.
-            if c > 0.0:
-                tire_orn = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
-            else:
-                tire_orn = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        else:
-            axis = v / s
-            half = 0.5 * float(np.arctan2(s, c))
-            sh = float(np.sin(half))
-            tire_orn = np.array(
-                [axis[0] * sh, axis[1] * sh, axis[2] * sh, float(np.cos(half))],
-                dtype=np.float64,
-            )
-
-        # 1. Detach any existing grasp from a prior episode.
-        if self._grasp_constraint is not None:
-            try:
-                p.removeConstraint(
-                    self._grasp_constraint, physicsClientId=self.client,
-                )
-            except p.error:
-                pass
-            self._grasp_constraint = None
-
-        # 2. Release world-pin if currently engaged (eval path may not).
-        self._release_world_pin()
-
-        # 3. Restore tire dynamic mass so the constraint behaves like a
-        #    real grasp (mass=0 is reserved for the world-pin).
-        p.changeDynamics(
-            self.handles.tire, -1,
-            mass=float(self.cfg.tire_mass),
-            physicsClientId=self.client,
-        )
-
-        # 4. Snap tire to the perturbed mount pose.
-        p.resetBasePositionAndOrientation(
-            self.handles.tire,
-            tire_pos.tolist(),
-            tire_orn.tolist(),
-            physicsClientId=self.client,
-        )
-        p.resetBaseVelocity(
-            self.handles.tire,
-            linearVelocity=[0.0, 0.0, 0.0],
-            angularVelocity=[0.0, 0.0, 0.0],
-            physicsClientId=self.client,
-        )
-
-        # 5. Compute UR10 EE target: 6-o'clock grasp anchor of the
-        #    perturbed tire pose. In the cradle pose the anchor is
-        #    ``tire_pos + (0, 0, -R)``; for arbitrary tire orientations
-        #    we rotate that local anchor by the tire's body frame so
-        #    the EE meets the tread at the right side of the wheel.
-        # The tire bore axis is body +Z (per tire URDF), so the "6
-        # o'clock" tread direction is **body −X** (any direction
-        # orthogonal to bore axis works for a circular tire). For the
-        # phase-A hot-start we pick the world −Z (gravity) projection
-        # onto the bore plane so the grasp point is as close to "below
-        # the tire" as the perturbed orientation allows.
-        tire_R_mat = np.array(
-            p.getMatrixFromQuaternion(list(tire_orn)), dtype=np.float64,
-        ).reshape(3, 3)
-        # World −Z projected onto the bore plane (orthogonal to
-        # tire_axis), normalised, then scaled by R to get the offset.
-        gravity_dir = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-        proj = gravity_dir - float(np.dot(gravity_dir, tire_axis)) * tire_axis
-        proj_norm = float(np.linalg.norm(proj))
-        if proj_norm < 1e-6:
-            # tire axis ~ world ±Z: fall back to world +X for the
-            # tread offset (arbitrary choice on a circular tire).
-            tread_dir = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-            tread_dir = tread_dir - float(np.dot(tread_dir, tire_axis)) * tire_axis
-            tread_dir = tread_dir / max(float(np.linalg.norm(tread_dir)), 1e-9)
-        else:
-            tread_dir = proj / proj_norm
-        ee_target = tire_pos + R * tread_dir
-
-        # 6. IK the UR10 to that EE target with FINAL_LOCK_QUATERNION.
-        ur = self.robot_A
-        warm_start, _ = ur.joint_state()
-        ik = p.calculateInverseKinematics(
-            ur.uid,
-            ur.EE_LINK_INDEX,
-            ee_target.tolist(),
-            list(ur.FINAL_LOCK_QUATERNION),
-            lowerLimits=ur.arm.lower.tolist(),
-            upperLimits=ur.arm.upper.tolist(),
-            jointRanges=ur.arm.range.tolist(),
-            restPoses=warm_start.tolist(),
-            maxNumIterations=300,
-            residualThreshold=1e-5,
-            physicsClientId=self.client,
-        )
-        ik = np.asarray(ik, dtype=np.float64)
-        if ur._ik_arm_slots and len(ik) > max(ur._ik_arm_slots):
-            arm_q = ik[ur._ik_arm_slots]
-        else:
-            arm_q = np.asarray(ur.HOME_POSE, dtype=np.float64)
-        arm_q = np.clip(arm_q, ur.arm.lower, ur.arm.upper)
-        for idx, q in zip(ur.arm.indices, arm_q):
-            p.resetJointState(
-                ur.uid, idx,
-                targetValue=float(q),
-                targetVelocity=0.0,
-                physicsClientId=self.client,
-            )
-        ur.last_target_pos = ur.ee_pose()[0].copy()
-
-        # 7. Attach the grasp constraint between EE and tire.
-        ee_pos, ee_orn = ur.ee_pose()
-        tire_R = np.array(
-            p.getMatrixFromQuaternion(list(tire_orn)), dtype=np.float64,
-        ).reshape(3, 3)
-        local_anchor = tire_R.T @ (-R * tread_dir)
-        child_pos = local_anchor.tolist()
-        inv_tire_pos, inv_tire_orn = p.invertTransform(
-            tire_pos.tolist(), tire_orn.tolist(),
-        )
-        _, child_orn = p.multiplyTransforms(
-            inv_tire_pos, inv_tire_orn,
-            ee_pos.tolist(), ee_orn.tolist(),
-        )
-        self._grasp_constraint = p.createConstraint(
-            parentBodyUniqueId=ur.uid,
-            parentLinkIndex=ur.EE_LINK_INDEX,
-            childBodyUniqueId=self.handles.tire,
-            childLinkIndex=-1,
-            jointType=p.JOINT_FIXED,
-            jointAxis=[0, 0, 0],
-            parentFramePosition=[0, 0, 0],
-            parentFrameOrientation=[0, 0, 0, 1],
-            childFramePosition=child_pos,
-            childFrameOrientation=list(child_orn),
-            physicsClientId=self.client,
-        )
-        p.changeConstraint(
-            self._grasp_constraint,
-            maxForce=1.0e6,
-            physicsClientId=self.client,
-        )
-
-        # 8. Force Stage-1 entry — the pickup gate already fired by
-        #    construction. The mount/demount bookkeeping still runs
-        #    via ``_try_stage_transitions`` based on env state.
-        self.task_stage = 1
-        self._pickup_bonus_paid = True
-        # Re-seed PB shaping accumulators so the first Stage-1 step
-        # doesn't see a stale ``_prev_d_A``.
-        self._prev_d_approach = None
-        self._prev_d_return = None
-        self._prev_d_A = None
-        # v11c — stash a one-shot "force the mount FSM event on the
-        # next ``step()``" flag. Without it, the first physics
-        # decimation pushes the tire out of mount_tol (the hub-aligned
-        # grasp + small policy action injects O(0.5 m) translation on
-        # step 1) and the mount event never fires for the rest of the
-        # episode. Phase A is meant to deliver a guaranteed R_mount
-        # sparse signal per reset, so we bypass the post-step
-        # geometric check exactly once.
-        self._phase_a_force_mount_first_step = True
-
-    # ------------------------------------------------------------------
     # **2026-06-01 — Min-Jerk planner + residual control helpers.**
     # ------------------------------------------------------------------
     def _apply_attached_hot_start(self) -> None:
@@ -980,8 +675,50 @@ class TyroEnv(gym.Env):
         """
         R = float(self.cfg.tire_outer_radius)
         tire_pos = np.asarray(self.cfg.tire_pickup_pos, dtype=np.float64)
-        # Exact 6-o'clock outer tread point for the spawn orientation.
+
+        # **2026-06-01 (hub-aligned carry fix)** — pre-rotate the tire so
+        # its bore already points along the hub axis at the cradle. The
+        # mount end-pose uses the same ``_mount_tire_quat`` orientation, so
+        # the Stage-1 carry becomes a lift + pure translation (no in-flight
+        # reorientation, which the far-reach UR10 cannot track). A world-Z
+        # yaw keeps the grasp material point at the world bottom, so the
+        # 6-o'clock ``grasp_anchor`` below is still correct.
+        #
+        # With the bore along the hub axis (horizontal −Y) the tread ring
+        # lies in the X-Z plane and spans ±R in X — which overlaps the
+        # cradle rails (designed for the +X bore, thin in X). Spawn the
+        # tire raised just enough that the lowest tread point clears the
+        # rail tops, so there is no rack interpenetration at spawn. The
+        # tire is held by the grasp (not the cradle) on this path, so the
+        # raised spawn is purely a collision-avoidance offset.
+        hub_aligned = bool(getattr(self.cfg, "attached_spawn_hub_aligned", False))
+        if hub_aligned:
+            rail_top = float(
+                self.cfg.tire_rack_inner_center[2]
+                + self.cfg.tire_rack_half_extents[2]
+            )
+            clearance = 0.05
+            min_com_z = rail_top + R + clearance
+            if float(tire_pos[2]) < min_com_z:
+                tire_pos = tire_pos.copy()
+                tire_pos[2] = min_com_z
+
+        # Exact 6-o'clock outer tread point. Independent of bore azimuth:
+        # for any horizontal bore the lowest tread point is COM + (0,0,−R).
         grasp_anchor = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
+
+        if hub_aligned:
+            tire_orn = self._mount_tire_quat()
+            p.resetBasePositionAndOrientation(
+                self.handles.tire, tire_pos.tolist(), tire_orn.tolist(),
+                physicsClientId=self.client,
+            )
+            p.resetBaseVelocity(
+                self.handles.tire,
+                linearVelocity=[0.0, 0.0, 0.0],
+                angularVelocity=[0.0, 0.0, 0.0],
+                physicsClientId=self.client,
+            )
 
         ur = self.robot_A
         warm_start, _ = ur.joint_state()
@@ -1042,6 +779,120 @@ class TyroEnv(gym.Env):
         hold_q, _ = ur.joint_state()
         self._planner_hold_arm_targets = hold_q.copy()
 
+    def _reset_arm_to_point(self, rb, target_pos) -> None:
+        """Position-only IK + ``resetJointState`` so ``rb``'s EE sits at
+        ``target_pos`` (orientation free). Used to seat both arms on their
+        grasp points for the dual-arm hot-start."""
+        cl = self.client
+        cur, _ = rb.joint_state()
+        ik = p.calculateInverseKinematics(
+            rb.uid, rb.EE_LINK_INDEX, list(np.asarray(target_pos, float)),
+            lowerLimits=rb.arm.lower.tolist(), upperLimits=rb.arm.upper.tolist(),
+            jointRanges=rb.arm.range.tolist(), restPoses=cur.tolist(),
+            maxNumIterations=400, residualThreshold=1e-6, physicsClientId=cl)
+        ik = np.asarray(ik, dtype=np.float64)
+        arm = np.clip(ik[rb._ik_arm_slots], rb.arm.lower, rb.arm.upper)
+        for idx, q in zip(rb.arm.indices, arm):
+            p.resetJointState(rb.uid, idx, float(q), 0.0, physicsClientId=cl)
+
+    def _apply_dual_arm_hot_start(self) -> None:
+        """Spawn the tire in the open cooperative zone, grasp it with BOTH
+        arms, and enter Stage 1.
+
+        Geometry (bore along the hub axis ⇒ tread ring in the X-Z plane):
+          * UR10 grasps the ``coop_ur_grasp_dir`` rim point (default 9-o'clock,
+            −X) with a **rigid** JOINT_FIXED — this holds the tire's
+            orientation (and caches ``T_ee_tire`` for the planner).
+          * Panda grasps the ``coop_panda_grasp_dir`` rim point (default
+            6-o'clock, −Z) with a **point-to-point** constraint — positional
+            support without over-constraining orientation (two rigid grips
+            explode numerically). The Panda is planner-driven, not policy-
+            controlled, so it just stabilises the far side of the tire.
+
+        The carry to the hub is then a short, reorientation-free translation
+        both arms can track (verified collision-free, d_hub ≈ 0.19 m with a
+        zero residual — inside the soft mount gate).
+        """
+        cl = self.client
+        R = float(self.cfg.tire_outer_radius)
+        com = np.asarray(self.cfg.coop_spawn_pos, dtype=np.float64)
+        tire_q = self._mount_tire_quat()  # bore along hub axis (−Y)
+        ur_dir = np.asarray(self.cfg.coop_ur_grasp_dir, dtype=np.float64)
+        pa_dir = np.asarray(self.cfg.coop_panda_grasp_dir, dtype=np.float64)
+        ur_pt = com + R * (ur_dir / max(float(np.linalg.norm(ur_dir)), 1e-9))
+        pa_pt = com + R * (pa_dir / max(float(np.linalg.norm(pa_dir)), 1e-9))
+
+        # Clear prior grips / world-pin, restore dynamic mass, place tire.
+        self._release_grasp()
+        if self._panda_grasp_constraint is not None:
+            try:
+                p.removeConstraint(self._panda_grasp_constraint, physicsClientId=cl)
+            except p.error:
+                pass
+            self._panda_grasp_constraint = None
+        self._release_world_pin()
+        p.changeDynamics(self.handles.tire, -1, mass=float(self.cfg.tire_mass),
+                         physicsClientId=cl)
+        p.resetBasePositionAndOrientation(self.handles.tire, com.tolist(),
+                                          tire_q.tolist(), physicsClientId=cl)
+        p.resetBaseVelocity(self.handles.tire, [0, 0, 0], [0, 0, 0],
+                            physicsClientId=cl)
+
+        # Seat both arms on their grasp points (position-only IK) and latch
+        # position-control targets so they hold against gravity.
+        self._reset_arm_to_point(self.robot_A, ur_pt)
+        self._reset_arm_to_point(self.robot_B, pa_pt)
+        for rb, f in ((self.robot_A, [400., 400., 300., 60., 60., 60.]),
+                      (self.robot_B, [87., 87., 87., 87., 12., 12., 12.])):
+            qhold, _ = rb.joint_state()
+            p.setJointMotorControlArray(
+                rb.uid, rb.arm.indices, controlMode=p.POSITION_CONTROL,
+                targetPositions=qhold.tolist(), forces=f,
+                positionGains=[1.0] * rb.arm.n, velocityGains=[1.0] * rb.arm.n,
+                physicsClientId=cl)
+        self.robot_A.last_target_pos = self.robot_A.ee_pose()[0].copy()
+        self.robot_B.last_target_pos = self.robot_B.ee_pose()[0].copy()
+
+        # Create BOTH grips NOW — *before* any settle — while the tire is
+        # exactly on the spawn pose. (If we settled first the ungrasped tire
+        # would fall under gravity and drift off the spawn pose.)
+        # UR10 rigid grasp (also caches T_ee_tire for the planner).
+        self._create_grasp_constraint_in_place()
+        # Panda point-to-point support grip at the live EE point.
+        eeB_pos, _ = self.robot_B.ee_pose()
+        tp, to = self.scene.tire_pose()
+        inv_p, inv_o = p.invertTransform(np.asarray(tp, float).tolist(),
+                                         np.asarray(to, float).tolist())
+        child_anchor, _ = p.multiplyTransforms(inv_p, inv_o,
+                                               np.asarray(eeB_pos, float).tolist(),
+                                               [0, 0, 0, 1])
+        self._panda_grasp_constraint = p.createConstraint(
+            self.robot_B.uid, self.robot_B.EE_LINK_INDEX, self.handles.tire, -1,
+            p.JOINT_POINT2POINT, [0, 0, 0], [0, 0, 0], list(child_anchor),
+            physicsClientId=cl)
+        p.changeConstraint(self._panda_grasp_constraint, maxForce=1.0e5,
+                           physicsClientId=cl)
+
+        # Now settle — both grips are live, so the tire stays put.
+        for _ in range(5):
+            p.stepSimulation(physicsClientId=cl)
+        self.robot_A.last_target_pos = self.robot_A.ee_pose()[0].copy()
+        self.robot_B.last_target_pos = self.robot_B.ee_pose()[0].copy()
+        # Hold this (post-settle) UR10 grasp orientation through the whole
+        # carry so the rigidly-attached tire never reorients.
+        self._coop_ur_hold_quat = np.asarray(self.robot_A.ee_pose()[1], float)
+        self._coop_spawn_com = np.asarray(self.scene.tire_pose()[0], float).copy()
+        self._coop_panda_ee0 = np.asarray(
+            self.robot_B.ee_pose()[0], dtype=np.float64).copy()
+
+        # Enter Stage 1 exactly as the FSM would after a pickup.
+        self.task_stage = 1
+        self._pickup_bonus_paid = True
+        self._prev_d_approach = None
+        self._prev_d_return = None
+        self._prev_d_A = None
+        self._start_pos_used_easy_last_reset = True
+
     def _cache_grasp_relative_transform(self) -> None:
         """Record T_ee_tire = inv(T_world_ee) ∘ T_world_tire at this moment.
 
@@ -1088,6 +939,43 @@ class TyroEnv(gym.Env):
             np.asarray(ee_orn, dtype=np.float64),
         )
 
+    def _mount_tire_quat(self) -> np.ndarray:
+        """Tire orientation at the mount pose: the cradle spawn orientation
+        rotated by the minimal **world-Z yaw** that aligns the spawn bore
+        axis with the hub axis.
+
+        Why not ``_quat_align_z_to(hub_axis)``? That helper picks an
+        arbitrary roll about the alignment axis. For the +X→−Y bore swing
+        it lands on a 90°-about-+X rotation, which carries the cradle
+        grasp point (the tire's 6-o'clock, world −Z) onto the tire's
+        world **+X** side. The cached rigid EE↔tire transform then places
+        the mount EE at ``hub + R·(+X) ≈ (0.55, 0.80, 0.22)`` — 1.65 m
+        from the UR10 base, **beyond its ~1.3 m reach**, so IK saturates,
+        the arm fully extends, and the forearm clips the cargo box.
+
+        A pure world-Z yaw keeps the grasp material point at the bottom
+        (world −Z is invariant under a Z rotation), so the mount EE lands
+        at ``hub + (0, 0, −R) ≈ (0, 0.80, −0.305)`` — 1.13 m from base,
+        comfortably reachable and clear of the cargo (which sits at
+        Z ≥ 0.28). The bore-axis alignment (the only thing the mount gate
+        checks) is identical to ``_quat_align_z_to``.
+        """
+        spawn_quat = np.asarray(
+            p.getQuaternionFromEuler(list(self.cfg.tire_spawn_rpy)),
+            dtype=np.float64,
+        )
+        spawn_axis = np.asarray(self.cfg.tire_spawn_axis_world, dtype=np.float64)
+        spawn_axis = spawn_axis / max(float(np.linalg.norm(spawn_axis)), 1e-9)
+        hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
+        hub_axis = hub_axis / max(float(np.linalg.norm(hub_axis)), 1e-9)
+        # Signed yaw about world +Z from the spawn bore (XY proj) to the
+        # hub axis (XY proj). Both Phase-1 axes lie in the XY plane.
+        ax, ay = float(spawn_axis[0]), float(spawn_axis[1])
+        bx, by = float(hub_axis[0]), float(hub_axis[1])
+        yaw = float(np.arctan2(ax * by - ay * bx, ax * bx + ay * by))
+        qz = axisangle3_to_quat(np.array([0.0, 0.0, yaw], dtype=np.float64))
+        return quat_multiply(qz, spawn_quat)
+
     def _compute_stage_end_ee_pose(self, stage: int
                                    ) -> Tuple[np.ndarray, np.ndarray]:
         """End-point ``(EE_pos, EE_quat)`` for the given stage's nominal traj.
@@ -1126,8 +1014,7 @@ class TyroEnv(gym.Env):
 
         if stage == 1:
             tire_end_pos = np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
-            hub_axis = np.asarray(self.cfg.hub_axis_world, dtype=np.float64)
-            tire_end_quat = _quat_align_z_to(hub_axis)
+            tire_end_quat = self._mount_tire_quat()
             if have_grasp:
                 return self._ee_pose_for_tire_pose(tire_end_pos, tire_end_quat)
             return tire_end_pos.copy(), palm_up
@@ -1139,7 +1026,7 @@ class TyroEnv(gym.Env):
                 np.asarray(self.cfg.tire_mount_pos, dtype=np.float64)
                 - hub_axis * float(self.cfg.demount_axial_distance) * 1.2
             )
-            tire_end_quat = _quat_align_z_to(hub_axis)
+            tire_end_quat = self._mount_tire_quat()
             if have_grasp:
                 return self._ee_pose_for_tire_pose(
                     tire_demount_pos, tire_end_quat,
@@ -1157,24 +1044,111 @@ class TyroEnv(gym.Env):
         end_pos = tire_end_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
         return end_pos, palm_up
 
-    def _generate_nominal_trajectory(self, start_pose, end_pose,
-                                     total_steps: int = 100
-                                     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Build a ``(N, 3) / (N, 4)`` nominal EE trajectory.
+    def _generate_multiseg_trajectory(self, poses, total_steps: int = 100
+                                      ) -> Tuple[np.ndarray, np.ndarray]:
+        """Piecewise Min-Jerk (pos) + SLERP (orn) through ``poses``.
 
-        ``start_pose`` and ``end_pose`` are each ``(pos, quat)`` tuples
-        with ``pos`` shape (3,) and ``quat`` shape (4,) in PyBullet
-        xyzw. Position is interpolated with a 5th-order min-jerk
-        polynomial; orientation is interpolated with SLERP. The two
-        components are decoupled, which matches the planner-residual
-        contract: the policy adds a Cartesian XYZ offset and (optionally)
-        an axis-angle rotation offset *on top of* the per-step nominal.
+        ``poses`` is a list of ``(pos, quat)`` waypoints **including the
+        start as ``poses[0]``**. Steps are allocated to each segment in
+        proportion to its Cartesian length (≥ 2 per segment) so the EE
+        speed profile stays smooth across the whole path. Orientation is
+        SLERPed between consecutive waypoint quaternions — so a segment
+        whose two endpoints share an orientation (e.g. the lift waypoint)
+        keeps the grasp pose fixed while only the next segment rotates.
+
+        Falls back to the single-segment generator when fewer than two
+        waypoints are supplied.
         """
-        start_pos, start_quat = start_pose
-        end_pos, end_quat = end_pose
-        traj_pos = _min_jerk_positions(start_pos, end_pos, int(total_steps))
-        traj_quat = _slerp_quats(start_quat, end_quat, int(total_steps))
+        poses = [
+            (np.asarray(pp, dtype=np.float64).reshape(3),
+             np.asarray(qq, dtype=np.float64).reshape(4))
+            for pp, qq in poses
+        ]
+        n_total = max(int(total_steps), 1)
+        if len(poses) < 2:
+            single = poses[-1] if poses else (
+                np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
+            return (np.repeat(single[0][None, :], n_total, axis=0),
+                    np.repeat(single[1][None, :], n_total, axis=0))
+
+        # Segment "cost" = Cartesian length + a rotation-equivalent length
+        # so a pure in-place reorientation (zero translation) still gets a
+        # fair share of steps instead of collapsing to the 2-step floor.
+        rot_k = 0.30  # metres per radian of EE reorientation
+        seg_cost = []
+        for i in range(len(poses) - 1):
+            d = float(np.linalg.norm(poses[i + 1][0] - poses[i][0]))
+            qa = poses[i][1]
+            qb = poses[i + 1][1]
+            dot = float(np.clip(abs(np.dot(qa, qb)), -1.0, 1.0))
+            ang = 2.0 * float(np.arccos(dot))  # geodesic angle between quats
+            seg_cost.append(d + rot_k * ang)
+        total_len = float(sum(seg_cost))
+        n_seg = len(seg_cost)
+        # Allocate steps proportional to cost, min 2 each.
+        if total_len < 1e-9:
+            alloc = [max(2, n_total // n_seg)] * n_seg
+        else:
+            alloc = [max(2, int(round(n_total * c / total_len))) for c in seg_cost]
+        # Trim / pad the last segment so the concatenated length is exact.
+        # (boundary samples are de-duplicated below, so build with overlap.)
+        pos_chunks: list = []
+        quat_chunks: list = []
+        for i in range(n_seg):
+            seg_pos = _min_jerk_positions(poses[i][0], poses[i + 1][0], alloc[i])
+            seg_quat = _slerp_quats(poses[i][1], poses[i + 1][1], alloc[i])
+            if i > 0:
+                # Drop the duplicated boundary sample shared with prev segment.
+                seg_pos = seg_pos[1:]
+                seg_quat = seg_quat[1:]
+            pos_chunks.append(seg_pos)
+            quat_chunks.append(seg_quat)
+        traj_pos = np.concatenate(pos_chunks, axis=0)
+        traj_quat = np.concatenate(quat_chunks, axis=0)
         return traj_pos, traj_quat
+
+    def _compute_stage_waypoints(self, stage: int):
+        """Waypoint list ``[(pos, quat), ...]`` (excluding the start) for a
+        stage's nominal trajectory.
+
+        Most stages are a single straight chord to the stage end-pose. The
+        Stage-1 carry inserts an intermediate **lift** waypoint: from the
+        current EE pose, rise straight up by
+        ``cfg.planner_stage1_lift_height`` keeping the grasp orientation,
+        then proceed to the mount end-pose. This clears the tire tread
+        above the rack rails before the carry segment rotates / translates
+        it — eliminating the cradle→mount chord that otherwise scrapes the
+        outer rail (see ``planner_stage1_lift_height`` rationale in config).
+        """
+        end_pos, end_quat = self._compute_stage_end_ee_pose(int(stage))
+        lift_h = float(getattr(self.cfg, "planner_stage1_lift_height", 0.0))
+        if int(stage) == 1 and lift_h > 0.0:
+            start_pos, start_quat = self.robot_A.ee_pose()
+            start_pos = np.asarray(start_pos, dtype=np.float64)
+            start_quat = np.asarray(start_quat, dtype=np.float64)
+            lift_pos = start_pos + np.array([0.0, 0.0, lift_h], dtype=np.float64)
+            # How much reorientation does the carry require? (≈0 on the
+            # hub-aligned attached-hot-start path, where the bore is already
+            # along the hub axis — see ``attached_spawn_hub_aligned``.)
+            dot = float(np.clip(abs(np.dot(start_quat, end_quat)), -1.0, 1.0))
+            reorient_rad = 2.0 * float(np.arccos(dot))
+            if reorient_rad < np.deg2rad(5.0):
+                # No meaningful reorientation: lift, then pure translation.
+                # This is the stable, trackable carry the arm can follow.
+                return [(lift_pos, start_quat), (end_pos, end_quat)]
+            # Otherwise (e.g. a +X-spawned tire), keep the 1.05 m tire stable
+            # and clear of the rack / cargo with a three-phase carry:
+            #   1. lift straight up, grasp orientation fixed;
+            #   2. reorient to the mount pose **in place** up high, clear of
+            #      obstacles — doing the bore rotation during translation
+            #      whips the tire into the rack;
+            #   3. translate to the mount EE pose at the mount orientation.
+            return [
+                (lift_pos, start_quat),
+                (lift_pos, end_quat),
+                (end_pos, end_quat),
+            ]
+        return [(end_pos, end_quat)]
 
     def _replan_for_current_stage(self) -> None:
         """Rebuild the planner trajectory from the current EE pose.
@@ -1193,14 +1167,45 @@ class TyroEnv(gym.Env):
             self.current_traj_step = 0
             return
         start_pos, start_quat = self.robot_A.ee_pose()
-        end_pos, end_quat = self._compute_stage_end_ee_pose(int(self.task_stage))
         n = int(getattr(self.cfg, "planner_traj_steps", 100))
-        traj_pos, traj_quat = self._generate_nominal_trajectory(
-            (np.asarray(start_pos, dtype=np.float64),
-             np.asarray(start_quat, dtype=np.float64)),
-            (np.asarray(end_pos, dtype=np.float64),
-             np.asarray(end_quat, dtype=np.float64)),
-            total_steps=n,
+
+        # **Dual-arm cooperative carry** — both arms translate the rigidly
+        # held tire from the cooperative spawn zone to the hub with a short
+        # lift arc and NO reorientation (UR10 holds its grasp orientation,
+        # Panda is position-only). Build both EE trajectories here.
+        if bool(getattr(self.cfg, "dual_arm_coop", False)):
+            start_pos = np.asarray(start_pos, dtype=np.float64)
+            ur_end, _ = self._compute_stage_end_ee_pose(int(self.task_stage))
+            ur_end = np.asarray(ur_end, dtype=np.float64)
+            hold_q = self._coop_ur_hold_quat
+            if hold_q is None:
+                hold_q = np.asarray(start_quat, dtype=np.float64)
+            lift = float(getattr(self.cfg, "coop_lift_arc", 0.12))
+
+            def _arc(p0, p1):
+                base = _min_jerk_positions(p0, p1, n)
+                s = np.linspace(0.0, 1.0, n)
+                base[:, 2] = base[:, 2] + np.sin(np.pi * s) * lift
+                return base
+
+            self._traj_pos = _arc(start_pos, ur_end)
+            self._traj_quat = np.repeat(
+                np.asarray(hold_q, dtype=np.float64).reshape(1, 4), n, axis=0)
+            # Panda follows the same translation delta from its current EE.
+            paB0 = np.asarray(self.robot_B.ee_pose()[0], dtype=np.float64)
+            delta = ur_end - start_pos
+            self._traj_pos_B = _arc(paB0, paB0 + delta)
+            self.current_traj_step = 0
+            return
+
+        # Build the per-stage waypoint list (Stage 1 inserts a lift
+        # waypoint to clear the rack before carrying — see
+        # ``_compute_stage_waypoints``) and interpolate piecewise.
+        waypoints = self._compute_stage_waypoints(int(self.task_stage))
+        poses = [(np.asarray(start_pos, dtype=np.float64),
+                  np.asarray(start_quat, dtype=np.float64))] + waypoints
+        traj_pos, traj_quat = self._generate_multiseg_trajectory(
+            poses, total_steps=n,
         )
         self._traj_pos = traj_pos
         self._traj_quat = traj_quat
@@ -1509,15 +1514,6 @@ class TyroEnv(gym.Env):
             mount_ang_tol = float(getattr(self, "_mount_angle_tol",
                                            self.cfg.reward.delta_A))
             mounted = (d_mount < mount_tol) and (theta < mount_ang_tol)
-            # v11c — one-shot Phase A force-mount override. Set by
-            # ``_apply_reverse_phase_a_hot_start`` so the first
-            # ``step()`` after a hot-start always fires the mount
-            # event, regardless of how far the first physics
-            # decimation translated the tire. This guarantees the
-            # R_mount sparse signal per Phase A reset.
-            if getattr(self, "_phase_a_force_mount_first_step", False):
-                self._phase_a_force_mount_first_step = False
-                mounted = True
             if mounted and not self._mount_bonus_paid:
                 self._mount_bonus_paid = True
                 self.task_stage = 2
@@ -1790,11 +1786,22 @@ class TyroEnv(gym.Env):
                 d_rot_A = action[3:6] * rs
             self.robot_A.apply_delta_ee(d_pos_A, d_rot_A)
 
+        # **Dual-arm cooperative carry** — Panda is planner-driven (not
+        # policy-controlled): it follows ``_traj_pos_B`` (position-only IK,
+        # point-to-point grip) to support the far side of the tire. Uses the
+        # same trajectory index the UR10 block just consumed.
+        if (bool(getattr(self.cfg, "dual_arm_coop", False))
+                and self._traj_pos_B is not None):
+            nB = int(self._traj_pos_B.shape[0])
+            idxB = int(max(0, min(self.current_traj_step - 1, nB - 1)))
+            self.robot_B.apply_absolute_ee(
+                self._traj_pos_B[idxB], quat=None,
+                forces=[87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0])
         # Robot B: in Phase 1 (``freeze_robot_b=True``) Panda is parked at
         # HOME and ``reset_to_home`` re-seeds the motor target every step
         # so it doesn't sag under gravity. In Phase 2/3 ``action[6:12]``
         # carries Δpose_B and is forwarded to IK.
-        if self.cfg.freeze_robot_b:
+        elif self.cfg.freeze_robot_b:
             self.robot_B.reset_to_home()
         else:
             ps = self.cfg.action.pos_scale
@@ -2010,12 +2017,25 @@ class TyroEnv(gym.Env):
             #   2. pb_carry: w_pb_carry * (prev_d_A - d_A)
             #      potential-based shaping on tire-to-hub distance — pays
             #      positively for every step that closes the carry gap.
-            ee_to_hub = float(np.linalg.norm(
-                np.asarray(hub_pos, dtype=np.float64) - ee_pos
-            ))
+            # v12: guide_A now keys on the *tire→hub* distance (b.d_A) — the
+            # exact quantity the mount gate measures (d_mount, line ~1500) —
+            # instead of the EE→hub distance. The tire is fix-welded R≈0.525 m
+            # below the EE (grasp anchor at the 6 o'clock outer point, see
+            # _attach_tire_to_robot_A), so driving the EE onto the hub pushes
+            # the tire COM ~R off-target and actively fought the final seating.
+            # Unifying the shaping target with the gate removes that conflict.
             decay_g = max(float(getattr(rcfg, "guide_decay", 0.5)), 1e-3)
-            b.guide_A = float(rcfg.w_guide) * float(np.exp(-ee_to_hub / decay_g))
-            b.d_guide = ee_to_hub
+            b.guide_A = float(rcfg.w_guide) * float(np.exp(-b.d_A / decay_g))
+            b.d_guide = float(b.d_A)
+            # v13: fine seating kernel — a second, sharp exp on the same
+            # tire→hub distance. guide_A (decay 0.5 m) is near-flat below
+            # ~0.2 m, so it could not pull d_A past the gate. This term
+            # (decay ~0.10 m) is negligible far away but builds a strong
+            # standing gradient in the final approach, letting the policy
+            # follow the curriculum gate down toward the 0.04 m target.
+            decay_s = max(float(getattr(rcfg, "seat_decay", 0.10)), 1e-3)
+            b.seat_A = float(getattr(rcfg, "w_seat", 0.0)) * float(
+                np.exp(-b.d_A / decay_s))
             if self._prev_d_A is not None and float(rcfg.w_pb_carry) > 0.0:
                 pb_step = float(rcfg.w_pb_carry) * float(self._prev_d_A - b.d_A)
             self._prev_d_A = b.d_A
@@ -2166,7 +2186,7 @@ class TyroEnv(gym.Env):
         # ``pb_step``), so we don't double-count here.
         stage_dense_A = {
             0: float(b.approach_A),
-            1: float(b.guide_A) + float(b.pb_carry),
+            1: float(b.guide_A) + float(b.pb_carry) + float(b.seat_A),
             2: float(b.demount) + float(b.pb_carry),
             3: float(b.return_A) + float(b.landing),
         }[int(self.task_stage)]
@@ -2257,6 +2277,11 @@ class TyroEnv(gym.Env):
                 tire_uid = self.handles.tire
                 robot_a_uid = self.robot_A.uid
                 if {bodyA, bodyB} == {tire_uid, robot_a_uid}:
+                    continue
+            # **Dual-arm coop** — the Panda point-to-point support grip also
+            # reports intentional tire↔Panda contact forces; exclude them.
+            if self._panda_grasp_constraint is not None:
+                if {bodyA, bodyB} == {self.handles.tire, self.robot_B.uid}:
                     continue
             try:
                 mx = max(mx, abs(float(cp[9])))

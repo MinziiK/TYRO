@@ -309,14 +309,14 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <cylinder radius="0.3" length="0.022"/>
+        <cylinder radius="0.22" length="0.022"/>
       </geometry>
       <material name="rotor_gray"><color rgba="0.35 0.35 0.37 1"/></material>
     </visual>
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <cylinder radius="0.297" length="0.022"/>
+        <cylinder radius="0.2178" length="0.022"/>
       </geometry>
     </collision>
   </link>
@@ -348,7 +348,7 @@
   <joint name="brake_caliper_joint" type="fixed">
     <parent link="hub_mount"/>
     <child link="brake_caliper_proxy"/>
-    <origin xyz="0 0.27 -0.15" rpy="0 0 0"/>
+    <origin xyz="0 0.27 -0.25" rpy="0 0 0"/>
   </joint>
 
 </robot>

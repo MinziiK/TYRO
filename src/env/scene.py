@@ -694,6 +694,26 @@ class Scene:
             p.getQuaternionFromEuler(list(spawn_rpy)),
             dtype=np.float64,
         )
+        # **2026-06-01 (UR10-feasible tire)** — opt-in URDF tyre. The smaller
+        # hollow-ring URDF (``scripts/generate_tire_urdf.py``) keeps the bore
+        # axis along link local +Z, identical to the procedural tyre, so the
+        # spawn orientation and every downstream tire_pose/tire_axis query
+        # stay valid. Mass is forced to ``cfg.tire_mass`` so the URDF's own
+        # ``<mass>`` value never overrides the env's tuned payload.
+        if bool(getattr(self.cfg, "use_tire_urdf", False)):
+            uid = p.loadURDF(
+                str(self.cfg.tire_urdf),
+                basePosition=tire_pos.tolist(),
+                baseOrientation=tire_orn.tolist(),
+                useFixedBase=False,
+                physicsClientId=self.client,
+            )
+            p.changeDynamics(
+                uid, -1, mass=float(self.cfg.tire_mass),
+                physicsClientId=self.client,
+            )
+            self.has_wheel_disk = False
+            return uid
         uid, has_disk = models.create_tire_wheel_multibody(
             self.client,
             self.cfg,

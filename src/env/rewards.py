@@ -6,7 +6,7 @@ so it stays unit-tested without PyBullet. The env aggregates terms in step().
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -59,6 +59,7 @@ class RewardBreakdown:
     guide_A: float = 0.0      # Stage 1 EE-vector guide (w_guide * exp(-||hub-ee||/τ))
     pb_carry: float = 0.0     # Stage 1 PB shaping on Δd_A (w_pb_carry * (prev - curr))
     d_guide: float = 0.0      # ||hub - ee|| diagnostic (mirrors hub_guide_vector norm)
+    seat_A: float = 0.0       # v13 Stage 1 fine seating kernel (w_seat * exp(-d_A/seat_decay))
 
 
 def align_reward(tire_pos, hub_pos, tire_axis, hub_axis,
@@ -88,46 +89,6 @@ def sync_joint_a_penalty(qdot_a: np.ndarray, cfg: RewardConfig) -> float:
     """Penalty on squared joint velocity magnitude for Robot A (UR10)."""
     q = np.asarray(qdot_a, dtype=np.float64)
     return -cfg.w_sync_joint_a * float(np.dot(q, q))
-
-
-def success_bonus(
-    d_A: float,
-    theta_A: float,
-    d_B: float,
-    theta_B: float,
-    cfg: RewardConfig,
-    mount: Optional[Tuple[float, float, float]] = None,
-) -> tuple[float, bool]:
-    """Sparse success predicate.
-
-    If ``mount`` is ``(axial_dot, lateral_norm, lug_spin_err_rad)`` and
-    ``cfg.use_lug_aligned_success``, require hub-face-style proximity using those
-    terms in addition to the gripper / axis checks.
-    """
-    if cfg.R_success <= 0.0:
-        return 0.0, False
-
-    grip_ok = (
-        theta_A < cfg.delta_A
-        and d_B < cfg.eps_B
-        and theta_B < cfg.delta_B
-    )
-    if not grip_ok:
-        return 0.0, False
-
-    if cfg.use_lug_aligned_success and mount is not None:
-        axial, lat, lug = mount
-        pos_ok = d_A < cfg.eps_A_mounted
-        mating_ok = (
-            abs(axial - cfg.success_axial_dot_target) < cfg.success_axial_tolerance
-            and lat < cfg.success_lateral_tolerance
-            and lug < cfg.lug_spin_tolerance_rad
-        )
-        ok = pos_ok and mating_ok
-        return ((cfg.R_success if ok else 0.0), bool(ok))
-
-    ok = grip_ok and (d_A < cfg.eps_A)
-    return (cfg.R_success if ok else 0.0), bool(ok)
 
 
 def collision_penalty(in_collision: bool, cfg: RewardConfig) -> float:
@@ -183,34 +144,3 @@ def shaping_reward(prev_d: Optional[float], curr_d: float, weight: float) -> flo
     return weight * (prev_d - curr_d)
 
 
-def dense_core_value(parts: dict, use_shaping: bool, rcfg: RewardConfig) -> float:
-    """Geometric dense core: shaping, absolute-distance penalty, or their sum.
-
-    - ``use_shaping`` False ⇒ classic stages 1–3 behaviour
-      ``dense_core = align_A + reach_B`` (= ``- w_d * d - w_theta * theta``).
-    - ``use_shaping`` True with ``use_dense_baseline_with_shaping`` False ⇒
-      pure potential shaping ``shape_A + shape_B``.
-    - ``use_shaping`` True with ``use_dense_baseline_with_shaping`` True
-      (default, Solution A) ⇒ ``shape_* + w_dense_baseline_scale * align/reach``
-      so the absolute distance penalty acts as a baseline that keeps pulling the
-      policy toward the target even when the shaping increment is ≈ 0.
-    """
-    align = float(parts.get("align_A", 0.0) + parts.get("reach_B", 0.0))
-    shape = float(parts.get("shape_A", 0.0) + parts.get("shape_B", 0.0))
-    if not use_shaping:
-        return align
-    if rcfg.use_dense_baseline_with_shaping:
-        return shape + rcfg.w_dense_baseline_scale * align
-    return shape
-
-
-def aggregate(parts: dict, use_shaping: bool, rcfg: RewardConfig) -> float:
-    """Combine dense process reward with sparse success using configured mix."""
-    common = ("coop", "sync_joint_A", "collision", "workspace", "action", "jerk")
-    dense_core = dense_core_value(parts, use_shaping, rcfg)
-    dense = dense_core + float(sum(parts.get(k, 0.0) for k in common))
-    succ = float(parts.get("success", 0.0))
-    return (
-        rcfg.mix_dense * dense
-        + rcfg.mix_sparse_success * succ
-    )

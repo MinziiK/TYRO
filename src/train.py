@@ -280,12 +280,28 @@ class StartPosCurriculumCallback(BaseCallback):
 
 
 class MountTolCurriculumCallback(BaseCallback):
-    """Schedules the Stage 1 → 2 mount gate (radius, angle) over training.
+    """Drives the Stage 1 → 2 mount gate (radius, angle) over training.
 
-    Mirrors ``ApproachTolCurriculumCallback`` but ramps two scalars in
-    lockstep — Euclidean radius (m) and axis tolerance (rad). Both fade
-    from soft → hard via a single smoothstep so the easy/hard regime is
-    consistent across the two checks.
+    Both tolerances fade from soft → hard along a single progress scalar
+    ``frac ∈ [0, 1]`` via one smoothstep, so the easy/hard regime stays
+    consistent across the radius and axis checks. How ``frac`` moves is
+    selected by ``mode``:
+
+    ``"adaptive"`` (default) — a **success-gated, advance-and-rollback**
+        loop. After a soft-step warm-up, each rollout reads the recent
+        episode success rate from ``model.ep_info_buffer`` and:
+          - advances (``frac += step_up``)  when sr ≥ ``advance_sr``
+          - rolls back (``frac -= step_down``) when sr ≤ ``rollback_sr``
+          - holds otherwise (hysteresis band between the two thresholds).
+        A dwell period after every change lets the policy and the success
+        estimate settle before the next decision. This closes the loop the
+        legacy schedule left open: difficulty only tightens while the
+        policy can keep up, and a collapse is actively unwound instead of
+        being baked in for the rest of training.
+
+    ``"schedule"`` — the legacy open-loop ``num_timesteps`` smoothstep
+        (``soft_steps`` hold, then ``ramp_steps`` ramp). Kept for
+        reproducing pre-adaptive runs; not recommended for new training.
     """
 
     def __init__(
@@ -293,6 +309,14 @@ class MountTolCurriculumCallback(BaseCallback):
         radius_soft: float, radius_hard: float,
         angle_soft_rad: float, angle_hard_rad: float,
         soft_steps: int, ramp_steps: int, verbose: int = 0,
+        eval_env=None,
+        mode: str = "adaptive",
+        advance_sr: float = 0.80,
+        rollback_sr: float = 0.55,
+        step_up: float = 0.05,
+        step_down: float = 0.10,
+        min_episodes: int = 40,
+        dwell_rollouts: int = 3,
     ):
         super().__init__(verbose)
         self._r_soft = float(radius_soft)
@@ -302,43 +326,120 @@ class MountTolCurriculumCallback(BaseCallback):
         self._soft_steps = int(max(0, soft_steps))
         self._ramp_steps = int(max(1, ramp_steps))
         self._last_pushed: Optional[Tuple[float, float]] = None
+        # The EvalCallback's env is a *separate* vec-env not reachable via
+        # ``self.training_env``; broadcast the schedule to it too so eval
+        # measures success at the current curriculum difficulty (otherwise
+        # eval stays pinned at the hard config tol and reads 0% until the
+        # ramp finishes). ``None`` when --no-eval-callback.
+        self._eval_env = eval_env
+        # --- adaptive-mode state / knobs ---
+        self._mode = str(mode)
+        self._advance_sr = float(advance_sr)
+        self._rollback_sr = float(rollback_sr)
+        self._step_up = float(step_up)
+        self._step_down = float(step_down)
+        self._min_episodes = int(max(1, min_episodes))
+        self._dwell = int(max(0, dwell_rollouts))
+        # Adaptive progress along soft→hard, advanced/rolled-back per rollout.
+        self._frac = 0.0
+        # Rollouts remaining to hold ``frac`` fixed after a change.
+        self._dwell_left = 0
 
     @staticmethod
     def _smoothstep(x: float) -> float:
         x = float(np.clip(x, 0.0, 1.0))
         return x * x * (3.0 - 2.0 * x)
 
-    def _scheduled(self, t: int) -> Tuple[float, float, float]:
-        if t <= self._soft_steps:
-            return self._r_soft, self._a_soft, 0.0
-        frac = (t - self._soft_steps) / float(self._ramp_steps)
-        if frac >= 1.0:
-            return self._r_hard, self._a_hard, 1.0
+    def _tol_for_frac(self, frac: float) -> Tuple[float, float]:
+        """Map progress ``frac`` ∈ [0, 1] → (radius, angle) via smoothstep."""
         s = self._smoothstep(frac)
         r = self._r_soft * (1.0 - s) + self._r_hard * s
         a = self._a_soft * (1.0 - s) + self._a_hard * s
+        return r, a
+
+    def _scheduled(self, t: int) -> Tuple[float, float, float]:
+        """Legacy open-loop schedule: frac keyed on global PPO step ``t``."""
+        if t <= self._soft_steps:
+            return self._r_soft, self._a_soft, 0.0
+        frac = (t - self._soft_steps) / float(self._ramp_steps)
+        frac = float(np.clip(frac, 0.0, 1.0))
+        r, a = self._tol_for_frac(frac)
         return r, a, frac
+
+    def _recent_success_rate(self) -> Tuple[float, int]:
+        """(success_rate, n_episodes) over the model's episode-info buffer.
+
+        ``ep_info_buffer`` carries ``is_success`` because the training
+        ``VecMonitor`` is built with ``info_keywords=("is_success", ...)``.
+        Older episodes without the key count as failures (False).
+        """
+        buf = getattr(self.model, "ep_info_buffer", None)
+        if not buf:
+            return 0.0, 0
+        n = len(buf)
+        succ = sum(1 for ep in buf if ep.get("is_success", False))
+        return succ / float(n), n
 
     def _broadcast(self, r: float, a: float) -> None:
         try:
             self.training_env.env_method("set_mount_tol", r, a)
         except AttributeError:
             pass
+        if self._eval_env is not None:
+            try:
+                self._eval_env.env_method("set_mount_tol", r, a)
+            except (AttributeError, Exception):  # noqa: BLE001
+                pass
 
     def _on_training_start(self) -> None:
-        r, a, _ = self._scheduled(int(self.model.num_timesteps))
+        if self._mode == "adaptive":
+            self._frac = 0.0
+            r, a = self._tol_for_frac(self._frac)
+        else:
+            r, a, _ = self._scheduled(int(self.model.num_timesteps))
         self._last_pushed = (r, a)
         self._broadcast(r, a)
         if self.verbose:
             print(f"[curriculum] mount_tol init = ({r:.3f} m, "
-                  f"{np.degrees(a):.1f}°) (t={self.model.num_timesteps})")
+                  f"{np.degrees(a):.1f}°) mode={self._mode} "
+                  f"(t={self.model.num_timesteps})")
 
     def _on_step(self) -> bool:
         return True
 
+    def _adaptive_update(self, t: int) -> Tuple[float, float, float]:
+        """Advance / hold / roll back ``self._frac`` from recent success."""
+        sr, n = self._recent_success_rate()
+        self.logger.record("curriculum/mount_recent_success", float(sr))
+        self.logger.record("curriculum/mount_recent_episodes", int(n))
+        # Warm-up: keep the gate soft until the policy has had some steps
+        # *and* enough episodes have accrued for a trustworthy estimate.
+        warming = t < self._soft_steps or n < self._min_episodes
+        if warming or self._dwell_left > 0:
+            if self._dwell_left > 0:
+                self._dwell_left -= 1
+            r, a = self._tol_for_frac(self._frac)
+            return r, a, self._frac
+        prev = self._frac
+        if sr >= self._advance_sr and self._frac < 1.0:
+            self._frac = min(1.0, self._frac + self._step_up)
+        elif sr <= self._rollback_sr and self._frac > 0.0:
+            self._frac = max(0.0, self._frac - self._step_down)
+        if abs(self._frac - prev) > 1e-9:
+            self._dwell_left = self._dwell
+            if self.verbose:
+                direction = "advance" if self._frac > prev else "ROLLBACK"
+                print(f"[curriculum] mount {direction}: frac {prev:.2f}"
+                      f"→{self._frac:.2f} (sr={sr:.2f} over {n} eps, t={t})")
+        r, a = self._tol_for_frac(self._frac)
+        return r, a, self._frac
+
     def _on_rollout_end(self) -> None:
         t = int(self.model.num_timesteps)
-        r, a, frac = self._scheduled(t)
+        if self._mode == "adaptive":
+            r, a, frac = self._adaptive_update(t)
+        else:
+            r, a, frac = self._scheduled(t)
         changed = (
             self._last_pushed is None
             or abs(r - self._last_pushed[0]) > 1e-6
@@ -353,228 +454,6 @@ class MountTolCurriculumCallback(BaseCallback):
         self.logger.record("curriculum/mount_radius_tol", float(r))
         self.logger.record("curriculum/mount_angle_tol_deg", float(np.degrees(a)))
         self.logger.record("curriculum/mount_tol_frac", float(frac))
-
-
-class ReverseCurriculumCallback(BaseCallback):
-    """**v11 (2026-05-31)** — broadcast Phase A / B / C label to all envs.
-
-    The env reads ``self._rev_curriculum_phase`` (set via
-    ``set_reverse_curriculum_phase``) on every ``reset()`` and routes
-    the spawn accordingly. Phases:
-
-    * **A** — pure hub-aligned hot-start. ``0 .. phase_a_steps``.
-    * **A/B blend** — Bernoulli mix between A and B. ``phase_a_steps
-      .. phase_a_steps + a_to_b_overlap``. ``phase_a_mix_prob`` of
-      resets stay in A, the rest fall through to Phase B.
-    * **B** — legacy easy-mix start. ``phase_a_end .. phase_b_steps``.
-    * **C** — pure HOME. ``phase_b_steps ..``.
-    """
-
-    def __init__(
-        self,
-        phase_a_steps: int,
-        a_to_b_overlap: int,
-        phase_a_mix_prob: float,
-        phase_b_steps: int,
-        verbose: int = 0,
-        phase_a_terminate_on: str = "mount",
-        phase_bc_terminate_on: str = "never",
-        phase_a_mount_tol_lock: bool = True,
-        phase_b_mount_tol_lock: bool = True,
-        mount_tol_soft_radius: float = 0.30,
-        mount_tol_soft_angle_rad: float = float(np.deg2rad(35.0)),
-        phase_a_contact_force_term: float = 1.0e9,
-        phase_bc_contact_force_term: Optional[float] = None,
-    ) -> None:
-        super().__init__(verbose)
-        self.phase_a_steps = int(phase_a_steps)
-        self.a_to_b_overlap = int(a_to_b_overlap)
-        self.phase_a_mix_prob = float(phase_a_mix_prob)
-        self.phase_b_steps = int(phase_b_steps)
-        self._last_logged: Optional[str] = None
-        # v11c — terminate_on toggle. Phase A flips to ``"mount"`` so
-        # the first-step mount fire collects R_mount + is_success and
-        # the episode ends — gives the policy a clean sparse signal
-        # for "tire-aligned-at-hub" → success. Phase B/C restore the
-        # CLI default (typically ``"never"`` for full cycle).
-        self.phase_a_terminate_on = str(phase_a_terminate_on).lower()
-        self.phase_bc_terminate_on = str(phase_bc_terminate_on).lower()
-        # v11c — Phase A mount-tol lock. While Phase A is active we
-        # broadcast the soft tol (e.g. 0.30 m / 35°) and freeze the
-        # MountTolCurriculumCallback ramp until Phase A ends — this
-        # is what guarantees the first-step mount fire even with the
-        # small jitter set in ``reverse_phase_a_*_jitter``.
-        self.phase_a_mount_tol_lock = bool(phase_a_mount_tol_lock)
-        # v11c5 (2026-05-31) — Phase B soft mount-tol lock. v11c4 showed
-        # fsm_bonus collapse once MountTolCurriculumCallback reached hard
-        # tol (0.04 m) at ~375k global steps while d_A stayed at 2.07 m.
-        # Keep soft (0.30 m / 35°) through all of Phase B so the policy
-        # can learn carry→mount before tol tightens in Phase C.
-        self.phase_b_mount_tol_lock = bool(phase_b_mount_tol_lock)
-        self._mount_tol_soft_radius = float(mount_tol_soft_radius)
-        self._mount_tol_soft_angle_rad = float(mount_tol_soft_angle_rad)
-        # v11c1 — contact-force kill-switch toggle. During Phase A the
-        # tire is teleported into the hub which produces enormous
-        # contact-force spikes on the very first physics step; the
-        # default 2500 N gate would terminate the episode in one step
-        # before the policy can collect any post-mount data. We
-        # disable the gate (effectively ``+inf``) while Phase A is
-        # active, then restore the config default for Phase B/C.
-        self.phase_a_contact_force_term = float(phase_a_contact_force_term)
-        # ``None`` → resolved on training start by capturing the
-        # env's current contact_force_terminate_above value.
-        self._phase_bc_contact_force_term_user = phase_bc_contact_force_term
-        self.phase_bc_contact_force_term = (
-            float(phase_bc_contact_force_term) if phase_bc_contact_force_term is not None else 0.0
-        )
-        # Per-env coin (resampled each rollout boundary) so A/B blend
-        # resets are stable within a rollout.
-        self._blend_rng = np.random.default_rng(seed=12345)
-
-    def _phase_for_timestep(self, t: int) -> str:
-        a_end = self.phase_a_steps
-        ab_end = a_end + self.a_to_b_overlap
-        if t < a_end:
-            return "A"
-        if t < ab_end:
-            # Bernoulli blend handled per-env below in ``_on_rollout_start``.
-            return "AB_BLEND"
-        if t < self.phase_b_steps:
-            return "B"
-        return "C"
-
-    def _broadcast_terminate_on(self, value: str) -> None:
-        """Push ``terminate_on`` to every env (no-op if hook missing)."""
-        try:
-            self.training_env.env_method("set_terminate_on", value)
-        except (AttributeError, Exception):  # noqa: BLE001
-            pass
-
-    def _broadcast_contact_force_term(self, value: float) -> None:
-        try:
-            self.training_env.env_method("set_contact_force_term", float(value))
-        except (AttributeError, Exception):  # noqa: BLE001
-            pass
-
-    def _broadcast_safety_terminations(self, enabled: bool) -> None:
-        try:
-            self.training_env.env_method("set_safety_terminations", bool(enabled))
-        except (AttributeError, Exception):  # noqa: BLE001
-            pass
-
-    def _broadcast_mount_tol(self, r: float, a: float) -> None:
-        try:
-            self.training_env.env_method("set_mount_tol", r, a)
-        except (AttributeError, Exception):  # noqa: BLE001
-            pass
-
-    def _push_to_envs(self, phase: str) -> None:
-        if not hasattr(self.training_env, "env_method"):
-            return
-        if phase == "AB_BLEND":
-            # Resample per-env which phase to use during the overlap.
-            # Per-env terminate_on is also broadcast so the A copies see
-            # the mount-terminate gate while the B copies stay on the
-            # default cycle terminator.
-            n = int(self.training_env.num_envs)
-            for env_i in range(n):
-                use_a = bool(self._blend_rng.random() < self.phase_a_mix_prob)
-                sub_phase = "A" if use_a else "B"
-                self.training_env.env_method(
-                    "set_reverse_curriculum_phase",
-                    sub_phase,
-                    indices=[env_i],
-                )
-                t_on = (
-                    self.phase_a_terminate_on if use_a
-                    else self.phase_bc_terminate_on
-                )
-                cf_val = (
-                    self.phase_a_contact_force_term if use_a
-                    else self.phase_bc_contact_force_term
-                )
-                # v11c4 (2026-05-31) — keep vertical/collision/workspace
-                # gates ON during Phase A; only the contact_force gate is
-                # disabled. Episodes self-terminate around step 20 via
-                # vertical_violation (the post-mount tire wobble), giving
-                # ep_rew_mean ≈ +200 from R_mount instead of the
-                # −1500 dense pile-up that the full 600-step "safety off"
-                # variant accumulated.
-                safety_on = True
-                try:
-                    self.training_env.env_method(
-                        "set_terminate_on", t_on, indices=[env_i],
-                    )
-                    self.training_env.env_method(
-                        "set_contact_force_term", float(cf_val), indices=[env_i],
-                    )
-                    self.training_env.env_method(
-                        "set_safety_terminations", bool(safety_on), indices=[env_i],
-                    )
-                except (AttributeError, Exception):  # noqa: BLE001
-                    pass
-        else:
-            self.training_env.env_method(
-                "set_reverse_curriculum_phase", phase,
-            )
-            t_on = (
-                self.phase_a_terminate_on if phase == "A"
-                else self.phase_bc_terminate_on
-            )
-            self._broadcast_terminate_on(t_on)
-            cf_val = (
-                self.phase_a_contact_force_term if phase == "A"
-                else self.phase_bc_contact_force_term
-            )
-            self._broadcast_contact_force_term(cf_val)
-            # v11c4 — keep vertical/collision/workspace ON in all phases.
-            self._broadcast_safety_terminations(True)
-
-    def _on_training_start(self) -> None:
-        # v11c — initial broadcast at t=0 (before the MountTol callback's
-        # first rollout-end push so Phase A starts already locked).
-        if self.phase_a_mount_tol_lock:
-            self._broadcast_mount_tol(
-                self._mount_tol_soft_radius,
-                self._mount_tol_soft_angle_rad,
-            )
-        # v11c1 — capture the env's pre-training contact_force_terminate_above
-        # so Phase B/C can restore it instead of using a hard-coded value.
-        if self._phase_bc_contact_force_term_user is None:
-            try:
-                envs_cf = self.training_env.env_method("get_contact_force_term")
-                if envs_cf:
-                    self.phase_bc_contact_force_term = float(envs_cf[0])
-            except (AttributeError, Exception):  # noqa: BLE001
-                self.phase_bc_contact_force_term = 0.0
-
-    def _on_rollout_start(self) -> None:
-        t = int(self.model.num_timesteps)
-        phase = self._phase_for_timestep(t)
-        self._push_to_envs(phase)
-        # v11c — re-broadcast Phase A soft mount_tol every rollout
-        # so MountTolCurriculumCallback._on_rollout_end can't clobber
-        # the lock. (Callback ordering: rollout_end runs *after* the
-        # next rollout_start, so the lock here is overridden mid-
-        # rollout otherwise. We re-push on every rollout boundary.)
-        lock_a = self.phase_a_mount_tol_lock and phase in ("A", "AB_BLEND")
-        lock_b = self.phase_b_mount_tol_lock and phase in ("B", "AB_BLEND")
-        if lock_a or lock_b:
-            self._broadcast_mount_tol(
-                self._mount_tol_soft_radius,
-                self._mount_tol_soft_angle_rad,
-            )
-        if phase != self._last_logged:
-            self._last_logged = phase
-            if self.verbose:
-                print(f"[reverse-curriculum] phase = {phase} (t={t})")
-        # TB diagnostics — integer encoding for sparkline.
-        code = {"A": 0, "AB_BLEND": 1, "B": 2, "C": 3}[phase]
-        self.logger.record("curriculum/reverse_phase_code", float(code))
-
-    def _on_step(self) -> bool:
-        return True
-
 
 def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
     cbs: list[BaseCallback] = []
@@ -596,29 +475,14 @@ def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
             soft_steps=args.mount_tol_curriculum_steps,
             ramp_steps=args.mount_tol_ramp_steps,
             verbose=1,
-        ))
-    if bool(getattr(args, "reverse_curriculum", False)):
-        # v11c — Phase A terminate-on-mount + mount-tol soft lock.
-        # ``--terminate-on`` carries the Phase B/C default; Phase A
-        # always uses "mount" (unless --no-phase-a-terminate-on-mount).
-        pa_term = (
-            "mount"
-            if bool(getattr(args, "phase_a_terminate_on_mount", True))
-            else str(getattr(args, "terminate_on", "never")).lower()
-        )
-        pbc_term = str(getattr(args, "terminate_on", "never")).lower()
-        cbs.append(ReverseCurriculumCallback(
-            phase_a_steps=int(args.reverse_phase_a_steps),
-            a_to_b_overlap=int(args.reverse_phase_a_to_b_overlap),
-            phase_a_mix_prob=float(args.reverse_phase_a_mix_prob),
-            phase_b_steps=int(args.reverse_phase_b_steps),
-            verbose=1,
-            phase_a_terminate_on=pa_term,
-            phase_bc_terminate_on=pbc_term,
-            phase_a_mount_tol_lock=bool(getattr(args, "phase_a_mount_tol_lock", True)),
-            phase_b_mount_tol_lock=bool(getattr(args, "phase_b_mount_tol_lock", True)),
-            mount_tol_soft_radius=float(args.mount_radius_soft),
-            mount_tol_soft_angle_rad=float(np.deg2rad(args.mount_angle_soft_deg)),
+            eval_env=eval_env,
+            mode=args.mount_curriculum_mode,
+            advance_sr=args.mount_adapt_advance_sr,
+            rollback_sr=args.mount_adapt_rollback_sr,
+            step_up=args.mount_adapt_step_up,
+            step_down=args.mount_adapt_step_down,
+            min_episodes=args.mount_adapt_min_episodes,
+            dwell_rollouts=args.mount_adapt_dwell_rollouts,
         ))
     if args.start_pos_curriculum and str(args.start_pos_mode) == "lerp":
         # ``StartPosCurriculumCallback`` is meaningful only in lerp mode,
@@ -862,76 +726,6 @@ def main() -> int:
             "--start-pos-mode=mix. Default from EnvConfig (v9: 0.75 easy / 0.25 HOME)."
         ),
     )
-    # **v11 (2026-05-31) — Reverse curriculum.** Independent of the
-    # legacy start-pos curriculum; toggles per-env reset routing
-    # between Phase A (hub-aligned hot-start), Phase B (easy-mix), and
-    # Phase C (pure HOME) based on global PPO timestep.
-    ap.add_argument(
-        "--reverse-curriculum",
-        action=argparse.BooleanOptionalAction,
-        default=_cfg_defaults.reverse_curriculum_enable,
-        help=(
-            "Enable v11 reverse curriculum (Phase A hot-start → B easy-mix → C HOME). "
-            "Use --no-reverse-curriculum to disable."
-        ),
-    )
-    ap.add_argument(
-        "--reverse-phase-a-steps",
-        type=int,
-        default=_cfg_defaults.reverse_phase_a_steps,
-        help="End of pure-A plateau (global PPO timesteps).",
-    )
-    ap.add_argument(
-        "--reverse-phase-a-to-b-overlap",
-        type=int,
-        default=_cfg_defaults.reverse_phase_a_to_b_overlap,
-        help="A→B overlap window length (steps).",
-    )
-    ap.add_argument(
-        "--reverse-phase-a-mix-prob",
-        type=float,
-        default=_cfg_defaults.reverse_phase_a_mix_prob,
-        help="Probability of staying in Phase A during A→B overlap.",
-    )
-    ap.add_argument(
-        "--reverse-phase-b-steps",
-        type=int,
-        default=_cfg_defaults.reverse_phase_b_steps,
-        help="End of Phase B plateau (start of pure-C HOME).",
-    )
-    ap.add_argument(
-        "--phase-a-terminate-on-mount",
-        action=argparse.BooleanOptionalAction,
-        default=bool(getattr(_cfg_defaults, "reverse_phase_a_terminate_on_mount", True)),
-        help=(
-            "v11c: in Phase A, override --terminate-on to 'mount' so the "
-            "first-step mount fire collects R_mount and ends the episode "
-            "with success. Disable with --no-phase-a-terminate-on-mount."
-        ),
-    )
-    ap.add_argument(
-        "--phase-a-mount-tol-lock",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "v11c: while Phase A is active, the ReverseCurriculumCallback "
-            "re-broadcasts the soft (radius_soft / angle_soft) mount tol "
-            "every rollout, freezing the MountTolCurriculumCallback ramp. "
-            "Guarantees the first-step mount fire even under the small "
-            "Phase A jitter. Disable with --no-phase-a-mount-tol-lock."
-        ),
-    )
-    ap.add_argument(
-        "--phase-b-mount-tol-lock",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "v11c5: while Phase B / AB_BLEND is active, re-broadcast soft "
-            "mount tol every rollout so MountTolCurriculumCallback cannot "
-            "tighten to hard (0.04 m) before d_A closes. Tol ramp then "
-            "runs only in Phase C. Disable with --no-phase-b-mount-tol-lock."
-        ),
-    )
     ap.add_argument(
         "--approach-a-gate",
         type=float,
@@ -999,6 +793,54 @@ def main() -> int:
         default=_cfg_defaults.mount_tol_ramp_steps,
         help="Smoothstep ramp length (global PPO steps) from soft to hard.",
     )
+    ap.add_argument(
+        "--mount-curriculum-mode",
+        type=str,
+        default=_cfg_defaults.mount_curriculum_mode,
+        choices=("adaptive", "schedule"),
+        help=(
+            "Mount-gate driver. 'adaptive' (default) advances soft→hard "
+            "only while recent success ≥ advance-sr and rolls back when it "
+            "drops ≤ rollback-sr. 'schedule' = legacy open-loop "
+            "num_timesteps smoothstep (reproduces pre-adaptive runs)."
+        ),
+    )
+    ap.add_argument(
+        "--mount-adapt-advance-sr",
+        type=float,
+        default=_cfg_defaults.mount_adapt_advance_sr,
+        help="Adaptive mode: advance difficulty when recent success ≥ this.",
+    )
+    ap.add_argument(
+        "--mount-adapt-rollback-sr",
+        type=float,
+        default=_cfg_defaults.mount_adapt_rollback_sr,
+        help="Adaptive mode: roll difficulty back when recent success ≤ this.",
+    )
+    ap.add_argument(
+        "--mount-adapt-step-up",
+        type=float,
+        default=_cfg_defaults.mount_adapt_step_up,
+        help="Adaptive mode: difficulty (frac) increment per advance.",
+    )
+    ap.add_argument(
+        "--mount-adapt-step-down",
+        type=float,
+        default=_cfg_defaults.mount_adapt_step_down,
+        help="Adaptive mode: difficulty (frac) decrement per rollback.",
+    )
+    ap.add_argument(
+        "--mount-adapt-min-episodes",
+        type=int,
+        default=_cfg_defaults.mount_adapt_min_episodes,
+        help="Adaptive mode: min episodes in window before a decision.",
+    )
+    ap.add_argument(
+        "--mount-adapt-dwell-rollouts",
+        type=int,
+        default=_cfg_defaults.mount_adapt_dwell_rollouts,
+        help="Adaptive mode: rollouts to hold frac fixed after a change.",
+    )
 
     ap.add_argument(
         "--terminate-on",
@@ -1038,6 +880,17 @@ def main() -> int:
         help=(
             "Episode horizon in env steps (overrides EnvConfig.max_steps). "
             "Use ~200 for pickup-only runs, ~400 for full 4-stage FSM."
+        ),
+    )
+    ap.add_argument(
+        "--dual-arm-coop",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "dual_arm_coop", False)),
+        help=(
+            "Enable dual-arm cooperative carry (UR10 + Panda jointly carry "
+            "the UR10-feasible URDF tire onto the hub). Bundles "
+            "use_tire_urdf + the small-tire dims + drops the cradle rack. "
+            "PPO still drives only the UR10 residual; Panda is planner-driven."
         ),
     )
 
@@ -1123,25 +976,22 @@ def main() -> int:
         overrides["start_pos_ramp_steps"] = int(args.start_pos_ramp_steps)
         overrides["start_pos_curriculum_mode"] = str(args.start_pos_mode)
         overrides["start_pos_easy_prob"] = float(args.start_pos_easy_prob)
-        overrides["reverse_curriculum_enable"] = bool(
-            getattr(args, "reverse_curriculum", False)
-        )
-        overrides["reverse_phase_a_steps"] = int(args.reverse_phase_a_steps)
-        overrides["reverse_phase_a_to_b_overlap"] = int(
-            args.reverse_phase_a_to_b_overlap
-        )
-        overrides["reverse_phase_a_mix_prob"] = float(
-            args.reverse_phase_a_mix_prob
-        )
-        overrides["reverse_phase_b_steps"] = int(args.reverse_phase_b_steps)
-        overrides["reverse_phase_a_terminate_on_mount"] = bool(
-            getattr(args, "phase_a_terminate_on_mount", True)
-        )
         overrides["terminate_on_pickup"] = bool(args.terminate_on_pickup)
         overrides["terminate_on"] = str(args.terminate_on)
         overrides["use_planner_residual"] = bool(args.use_planner_residual)
         overrides["attached_spawn_when_easy"] = bool(args.attached_spawn_when_easy)
         overrides["max_steps"] = int(args.max_steps)
+        # Dual-arm cooperative carry bundles the UR10-feasible URDF tire +
+        # its dims and drops the (single-arm) cradle rack. The UR10 base is
+        # already at the relayout pose in EnvConfig.
+        if bool(getattr(args, "dual_arm_coop", False)):
+            overrides["dual_arm_coop"] = True
+            overrides["use_tire_urdf"] = True
+            overrides["tire_outer_radius"] = 0.30
+            overrides["tire_inner_radius"] = 0.23
+            overrides["tire_thickness"] = 0.16
+            overrides["tire_mass"] = 1.5
+            overrides["spawn_tire_rack"] = False
         overrides["approach_A_gate"] = float(args.approach_a_gate)
         overrides["approach_tol_soft"] = float(args.approach_tol_soft)
         overrides["approach_radius_tol"] = float(args.approach_tol_hard)

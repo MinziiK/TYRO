@@ -85,7 +85,13 @@ def main() -> int:
         action="store_true",
         help="Skip simple brake rotor + caliper collision proxies aft of the flange (−hub Z).",
     )
-    ap.add_argument("--brake-rotor-radius", type=float, default=0.30)
+    # v13b: rotor must be *smaller* than the tire wheel bore
+    # (EnvConfig.tire_inner_radius ≈ 0.282) so the bore slides over it during
+    # mount. The old 0.30 (> bore) physically blocked the tire from seating —
+    # the COM floored at d_A≈0.13 and the policy could only "mount" by ramming
+    # through the brakes (contact force 124–330). 0.22 leaves ~0.06 m radial
+    # clearance so a 0.04 m mount tolerance is reachable in every direction.
+    ap.add_argument("--brake-rotor-radius", type=float, default=0.22)
     ap.add_argument("--brake-rotor-half-thickness", type=float, default=0.011)
     ap.add_argument(
         "--brake-caliper-y",
@@ -190,7 +196,11 @@ def main() -> int:
         except ValueError:
             raise SystemExit("--brake-caliper-size must be three comma floats") from None
         cy = args.brake_caliper_y
-        z_cal = -(ht / 2 + 0.04 + sz / 2)
+        # v13b: pushed the caliper aft (clearance 0.04 → 0.14) so its box
+        # (radial corner ≈ 0.35 m, inside the tire tread annulus) no longer
+        # intrudes into the mounting volume of a flat tire seated near the
+        # flange. It previously blocked the front approach at d_A≈0.08.
+        z_cal = -(ht / 2 + 0.14 + sz / 2)
         extra += f"""
   <!-- Aft flange: coarse rotor + sided caliper proxies (keep tire from clipping through brakes). -->
   <link name="brake_rotor_proxy">

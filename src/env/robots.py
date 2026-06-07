@@ -249,6 +249,61 @@ class Robot:
         q, _ = self.joint_state()
         return q
 
+    def apply_absolute_ee(self, pos, quat=None,
+                          forces: Optional[Sequence[float]] = None) -> None:
+        """Generic absolute (world-frame) EE-pose IK + position control.
+
+        Used by the **dual-arm cooperative carry** (2026-06-01) to drive a
+        robot's EE to a planner-supplied world pose. Warm-starts IK from the
+        current joint state (keeps the same IK branch step-to-step). When
+        ``quat`` is ``None`` the IK is position-only (orientation free) —
+        appropriate for the Panda support arm whose grip is a point
+        constraint. ``forces`` defaults to a per-joint torque cap sized to
+        the arm (override per robot). Subclasses (e.g. UR10) may override
+        with task-specific tuning.
+        """
+        target_pos = np.asarray(pos, dtype=np.float64).reshape(3)
+        self.last_target_pos = target_pos.copy()
+        cur_q, _ = self.joint_state()
+        ik_kwargs = dict(
+            lowerLimits=self.arm.lower.tolist(),
+            upperLimits=self.arm.upper.tolist(),
+            jointRanges=self.arm.range.tolist(),
+            restPoses=cur_q.tolist(),
+            maxNumIterations=200,
+            residualThreshold=1e-4,
+            physicsClientId=self.client,
+        )
+        if quat is not None:
+            q = np.asarray(quat, dtype=np.float64).reshape(4)
+            n = float(np.linalg.norm(q))
+            q = q / n if n > 1e-12 else np.array([0.0, 0.0, 0.0, 1.0])
+            ik = p.calculateInverseKinematics(
+                self.uid, self.EE_LINK_INDEX,
+                target_pos.tolist(), q.tolist(), **ik_kwargs)
+        else:
+            ik = p.calculateInverseKinematics(
+                self.uid, self.EE_LINK_INDEX,
+                target_pos.tolist(), **ik_kwargs)
+        ik = np.asarray(ik, dtype=np.float64)
+        max_slot = max(self._ik_arm_slots) if self._ik_arm_slots else -1
+        if len(ik) > max_slot:
+            arm_targets = ik[self._ik_arm_slots]
+        else:
+            arm_targets = self._fallback_targets()
+        arm_targets = np.clip(arm_targets, self.arm.lower, self.arm.upper)
+        n = self.arm.n
+        f = list(forces) if forces is not None else [120.0] * n
+        p.setJointMotorControlArray(
+            self.uid, self.arm.indices,
+            controlMode=p.POSITION_CONTROL,
+            targetPositions=arm_targets.tolist(),
+            forces=f,
+            positionGains=[1.0] * n,
+            velocityGains=[1.0] * n,
+            physicsClientId=self.client,
+        )
+
 
 class UR10Robot(Robot):
     NAME = "ur10"

@@ -1,33 +1,27 @@
-# TYRO — 듀얼암 타이어 마운팅 학습 환경
+# TYRO — 듀얼암 타이어 마운팅 (PyBullet + PPO)
 
-UR10 (Robot A) + Franka Panda (Robot B) 두 팔이 트럭 휠 허브에 타이어를 끼우는
-PyBullet 시뮬레이션 환경과 PPO 학습 파이프라인입니다. 현재 **Phase 1** —
-UR10이 타이어를 픽업해 허브에 마운트하고 다시 거치대로 복귀시키는 단일 로봇
-시퀀스를 학습합니다 (Panda는 HOME에 동결).
+UR10 (Robot A) + Franka Panda (Robot B)가 협조하여 트럭 휠 허브에 타이어를
+끼우는 PyBullet 시뮬레이션을 PPO로 학습합니다.
 
-- 시뮬레이터: PyBullet, 240 Hz physics / 20 Hz control
-- 좌표계: **Robot B (Panda) base 중심** — 모든 절대 좌표가 Panda 베이스 기준
-- 관측 / 액션 (Phase 1): **obs 85-d / action 6-d** (PPO **잔차(residual)** 6, gripper는 FSM이 자동 제어)
-  - obs 채널: 로봇 joints(qA·dqA, qB·dqB) + EE/타이어/허브/볼트 상대 pose + prev_action + mount tail 3 + hub_guide 3
-  - legacy 체크포인트 호환: `(obs 82, act 6)` v6 이전, `(obs 83, act 7)` v5 sharp 시대 — `eval.py`가 자동 감지
-- 제어 (2026-06-01 기본): **Min-Jerk 플래너 + PPO 잔차** — FSM 단계마다 명목 EE 궤적을 생성하고, 정책은 ±0.15 m 잔차만 학습 (`use_planner_residual=True`)
-- 알고리즘: PPO + MlpPolicy `[256, 256]`, vec env 12개 (SubprocVecEnv)
-- **기본 학습 목표 (2026-06-01)**: `terminate_on=mount` + attached hot-start → Stage 1(운반/마운트) 집중; 전체 4-stage는 `--terminate-on never`로 전환
+- 시뮬레이터: PyBullet, 240 Hz 물리 / 20 Hz 제어
+- 좌표계: **Panda 베이스 = 원점** (모든 절대 좌표는 Panda 기준)
+- 정책: PPO + MlpPolicy `[256, 256]`, vec env 12개 (SubprocVecEnv)
+- obs **85-d** / action **6-d** (PPO는 UR10 Cartesian 잔차만 학습)
 
-> 모든 명령은 `tyro` conda 환경 활성화 상태에서 실행한다고 가정합니다
-> (`conda activate tyro`).
+> **동작하는 구성 = 듀얼암 협조 운반** (`--dual-arm-coop`). 단일 UR10으로는
+> 트럭 타이어를 다룰 수 없어서(도달거리 + 90° 재배향 한계), UR10이 다룰 수
+> 있는 작은 타이어를 **양팔**이 함께 운반합니다. 레거시 단일팔 planner 경로도
+> 남아 있으나 수렴하지 않으므로 `--dual-arm-coop`를 권장합니다.
+
+모든 명령은 `tyro` conda 환경 활성화 상태를 가정합니다 (`conda activate tyro`).
 
 ---
 
 ## 설치
 
 ```bash
-git clone https://github.com/MinziiK/TYRO.git
-cd TYRO
-
 conda create -n tyro python=3.10 -y
 conda activate tyro
-
 pip install -r requirements.txt
 ```
 
@@ -35,54 +29,40 @@ pip install -r requirements.txt
 
 ## 빠른 시작
 
-### 학습
+```bash
+# 학습 (듀얼암 협조 운반, 권장)
+python -m src.train --dual-arm-coop --num-envs 12 --total-steps 2_000_000
 
-```powershell
-# PowerShell (권장)
-.\scripts\train.ps1
+# 체크포인트 평가
+python -m src.eval runs/<run>/best/best_model.zip --episodes 20
 
-# cmd.exe
-scripts\train.bat
-```
+# GUI 진단 (양팔 + 타이어를 직접 조작)
+python -m scripts.teleop_dualarm
 
-기본 설정 = `--stage 3 --phase 1 --num-envs 12 --total-steps 2_000_000`,
-run-name은 `phase1_<yyyymmdd-HHmm>` 자동 타임스탬프.
-스크립트 뒤에 붙이는 모든 인자는 `python -m src.train`에 그대로 전달됩니다:
-
-```powershell
-.\scripts\train.ps1 --total-steps 500000           # 짧게 시험
-.\scripts\train.ps1 --num-envs 8 --run-name test   # envs / 이름 override
-.\scripts\train.ps1 --resume runs\phase1_xxx\final.zip  # 이어 학습
-```
-
-### 시각 검증
-
-```powershell
-# 정적 씬 GUI 확인
-python -m src.test --render --action-scale 0
-
-# FSM 5-step + random 5-ep 자동 스모크
-python scripts\smoke_fsm.py
-
-# Min-Jerk 플래너 + attached hot-start + mount 종료 검증 (권장)
-python scripts\smoke_planner_residual.py
-
-# 픽업 / 리프트 / 마운트 3단계 정답지 이미지 생성
-python scripts\render_phase1_goal.py --out runs\phase1_goal.png
-```
-
-### 평가 (체크포인트 로드)
-
-```powershell
-python -m src.eval runs\phase1_xxx\final.zip --render --episodes 5
-python -m src.eval runs\phase1_xxx\best\best_model.zip --episodes 20  # 헤드리스
-```
-
-### TensorBoard
-
-```powershell
+# TensorBoard
 tensorboard --logdir runs/
 ```
+
+`train.py`는 추가 인자를 PPO/env에 그대로 전달합니다. `--run-name` 생략 시
+자동 타임스탬프, 산출물은 `runs/<run>/`에 저장됩니다 (git 미추적).
+
+---
+
+## 동작 원리
+
+**듀얼암 협조 운반** (mount-only):
+1. 작은 URDF 타이어(외경 0.30 m, 보어 0.23 m)가 허브 앞 **양팔이 닿는 개방
+   영역**(`coop_spawn_pos`)에 보어를 허브축에 맞춘 채 스폰됩니다.
+2. 양팔이 파지: **UR10는 아래(6시)를 강체 파지**, **Panda는 위(12시)를 점
+   파지** — 상하로 분리해 팔끼리 충돌을 방지합니다.
+3. Min-Jerk 플래너가 짧은 lift + 평행이동(운반 중 재배향 없음)으로 타이어를
+   허브에 올립니다. PPO는 UR10의 매 스텝 Cartesian **잔차**만 출력하고
+   (`planner_pos_offset_scale`), Panda는 정책이 아니라 플래너가 지지합니다.
+4. 타이어 COM이 허브에서 `mount_radius_tol` 이내이고 보어축이 정렬되면 마운트
+   성공. 커리큘럼이 게이트를 **soft → hard**(0.30 m / 35° → 0.04 m / 5°)로
+   조이며, `terminate_on=mount`로 마운트 시 에피소드를 종료합니다.
+
+모든 치수·보상 가중치·임계값의 단일 진실 원천은 `src/config.py`입니다.
 
 ---
 
@@ -91,369 +71,62 @@ tensorboard --logdir runs/
 ```
 TYRO/
 ├── src/
-│   ├── config.py           # 모든 환경 / 보상 / 액션 / 커리큘럼 파라미터 (단일 진실 원천)
-│   ├── train.py            # PPO 학습 진입점 (커리큘럼 콜백 포함)
-│   ├── eval.py             # 체크포인트 로드 + N 에피소드 평가
-│   ├── sweep.py            # Optuna 하이퍼파라미터 sweep
-│   ├── test.py             # GUI / 정적 스모크
+│   ├── config.py        # env / 보상 / 액션 / 커리큘럼 파라미터 전부
+│   ├── train.py         # PPO 학습 진입점 (+ 커리큘럼 콜백)
+│   ├── eval.py          # 체크포인트 로드 + N 에피소드 평가
+│   ├── sweep.py         # Optuna 하이퍼파라미터 sweep
 │   └── env/
-│       ├── tyro_env.py     # Gymnasium env (reset / step / reward / FSM)
-│       ├── scene.py        # 트럭 휠 스테이션 + 타이어 거치대
-│       ├── models.py       # 메시 없는 타이어 + 휠 디스크 빌더
-│       ├── robots.py       # UR10 / Panda 래퍼 (IK, EE pose, joint state)
-│       ├── rewards.py      # 보상 항 + aggregate
-│       └── utils.py        # 쿼터니언 / 축 헬퍼
+│       ├── tyro_env.py  # Gymnasium env (reset / step / 보상 / FSM / 플래너)
+│       ├── scene.py     # 트럭 허브 + 카고 + 타이어 스폰
+│       ├── models.py    # 메시 없는 절차적 타이어 + 휠 디스크
+│       ├── robots.py    # UR10 / Panda 래퍼 (IK, EE pose)
+│       ├── rewards.py   # 보상 항
+│       └── utils.py     # 쿼터니언 / 축 헬퍼
 ├── scripts/
-│   ├── train.ps1 / train.bat              # 학습 런처
-│   ├── smoke_fsm.py                       # FSM 스모크
-│   ├── smoke_planner_residual.py          # 플래너+잔차+attached hot-start 스모크
-│   ├── render_phase1_goal.py              # 3단계 정답지 렌더
-│   ├── verify_home.py                     # UR10 HOME / AABB / grasp 거리 검증
-│   ├── summarize_log.py                   # 학습 로그 요약 테이블
+│   ├── generate_tire_urdf.py   # UR10용 타이어 URDF 생성기
+│   ├── teleop_dualarm.py       # GUI 텔레옵 / 도달성 진단
+│   ├── smoke_planner_residual.py
 │   └── generate_truck_wheel_station_urdf.py
-├── data/urdf/
-│   ├── truck_assembly/truck_wheel_station.urdf   # 허브 + 10 볼트 + 브레이크
-│   └── ur10_robot/...                            # UR10 + Robotiq 그리퍼
-└── runs/                                  # 학습 산출물 (체크포인트 / tb / monitor)
+└── data/urdf/
+    ├── tire/tire_ur10.urdf          # 생성된 작은 타이어
+    ├── truck_assembly/...           # 허브 + 10 볼트
+    └── ur10_robot/...               # UR10 + Robotiq 그리퍼
 ```
 
 ---
 
-## Phase 1 — FSM 4단계 (v6+)
-
-`task_stage` 0 → 1 → 2 → 3 → done 순으로 진행. 각 전이 시 `info`에
-`picked_up` / `mounted` / `demounted` / `landed` 이벤트가 떨어지고, 해당 단계
-일회성 sparse 보너스가 더해집니다 (`src/env/tyro_env.py:_try_stage_transitions`).
-
-| Stage | 이름 | 핵심 dense 보상 | 전이 게이트 | Sparse 보너스 |
-|---|---|---|---|---|
-| **0** | 접근 / 픽업 | `3.0·exp(-d/0.15)` + `2.0·exp(-d/0.2)` + PB `5·Δd` | `‖EE − grasp_target‖ < approach_radius_tol` (기본 0.08 m) | **R_pickup = +300** |
-| **1** | 운반 / 마운트 | `guide_A = 8·exp(-d_A/0.5)` + PB carry `10·Δd_A` − `sync_joint_A` 0.02 | `‖tire − hub‖ < mount_radius_tol` (기본 0.04 m) AND `θ_tire↔hub < δ_A` | **R_mount = +300** |
-| **2** | 디마운트 (백트래킹) | PB demount `20·Δd_hub` + `3·(1 − exp(-d_hub/0.20))` (반전 kernel) | `d_hub > demount_axial_distance` (기본 0.30 m), `demount_stall_steps ≥ 20` 이후 | **R_demount = +150** |
-| **3** | 거치대 복귀 / 안착 | `3.0·exp(-d_rack/0.5)` + PB return `30·Δd_return` − `landing_speed · 0.5·|v_z|` | `‖tire − pickup‖ < 0.05 m` AND `|v_z| < 0.10 m/s` | **R_return = +300** (성공) |
-
-- 항상 작동 패널티: 충돌 / 작업공간 이탈 / action L2 / jerk / contact-force
-- Stage 1에서는 vertical-pose 패널티 면제 (보어 정합을 위한 자유 회전 허용)
-- Stage 2 디마운트는 마운트 후 `demount_stall_steps` 스톨 동안 `d_hub` 게이트가
-  비활성화 — 가상 fastener-release 인터벌
-- 실패 종료 (충돌·workspace·contact-force) 시 `R_fail = −50` 일회성
-
-### terminate_on — 조기 종료 게이트
-
-전체 사이클 학습 외에 단계별 종료를 지원합니다 (`cfg.terminate_on`,
-`eval.py --terminate-on`).
-
-| 값 | 종료 시점 | 용도 |
-|---|---|---|
-| `never` | Stage 3 landed 또는 `max_steps` | 전체 4-stage 사이클 학습 |
-| `pickup` | Stage 0 → 1 전이 (R_pickup 지급 후) | Stage 0 단독 학습 / 디버깅 |
-| `mount` (**2026-06-01 기본**) | Stage 1 → 2 전이 | Mount-only / 플래너+잔차 초기 학습 |
-| `demount` | Stage 2 → 3 전이 | 디마운트 분리 학습 |
-
-### 픽업 게이트 타임스텝 커리큘럼 (opt-in)
-
-`approach_radius_tol`을 학습 진행에 따라 점진적으로 조여 R_pickup 신호를
-초반부터 받을 수 있게 합니다 (`src/train.py:ApproachTolCurriculumCallback`).
-
-**기본 OFF** — mount-only + attached hot-start에서는 Stage 0을 건너뛰므로
-불필요합니다. full cycle 또는 pickup 단독 학습 시 `--approach-curriculum`으로
-활성화:
-
-- **t ≤ 100k**: `approach_tol_soft = 0.10 m` (soft 홀드)
-- **100k < t ≤ 400k**: smoothstep 감쇠 (`0.10 → 0.08`, 램프 폭 300k)
-- **t > 400k**: `approach_radius_tol = 0.08 m` (hard cap)
-
-매 rollout 종료 시 `env_method("set_approach_tol", v)`로 모든 sub-env에
-전파. TensorBoard에 `curriculum/approach_tol`, `curriculum/approach_tol_frac` 기록.
-
-### 마운트 게이트 커리큘럼 (`MountTolCurriculumCallback`)
-
-`mount_radius_tol`(반경)과 `mount_angle_tol`(각도)을 단계적으로 조여
-Stage 1 → 2 전이를 학습 초반에는 느슨하게, 후반에는 정밀하게:
-
-- soft: `(0.30 m, mount_angle_tol_soft_rad)` → hard: `(0.04 m, reward.delta_A)`
-- 램프 폭은 `mount_tol_ramp_steps`로 제어
-
-### 시작 자세 커리큘럼 (`start_pos`)
-
-매 reset마다 UR10 EE를 HOME ↔ grasp_anchor 사이에서 보간 (mix 모드는
-Bernoulli `start_pos_easy_prob = 1.0` — attached hot-start와 함께 항상 easy).
-lerp 모드일 때만 `StartPosCurriculumCallback`이 등록됩니다 (100k 홀드 → 300k 램프).
-
----
-
-## 보상 stage 토글 (× DR phase)
-
-위의 4-stage FSM (task_stage 0~3)과 별개로, `make_reward_config(stage)`는
-**보상 항 자체의 활성화 여부**를 단계적으로 제어합니다 (`src/config.py`):
-
-| Stage | 활성화되는 보상 항 |
-|---|---|
-| 1 | `align_A`, `reach_B` (per-robot task 만) |
-| 2 | + `coop`, `sync_joint_A` (협력 항 추가) |
-| 3 | + `success` + 충돌 / workspace / action / jerk 패널티 (전체 dense — **현재 학습 기본**) |
-| 4 | potential shaping + 약한 거리 baseline (mix 20/80) |
-
-| Phase | 도메인 랜덤화 |
-|---|---|
-| 1 | 정적 — 고정 좌표 (Panda 동결, 현재 학습 기본) |
-| 2 | ±2 cm 허브 XY 노이즈 |
-| 3 | ±5 cm |
-
-추가로 **정적 스폰 DR** 플래그 (`USE_DOMAIN_RANDOMIZATION`)가 별도로 있어
-`reset()`에서 hub / cargo XY에 균등 노이즈 (`RANDOM_POSITION_RANGE`, 기본 2 cm)를
-주입할 수 있습니다. **기본값 False** — Phase 1 안정화 후 True로 전환 권장.
-
-Phase 1에서는 `freeze_robot_b=True`로 인해 자동으로:
-- action dim 13 → 6 (UR10 Δpose 6, Panda 채널 제거), obs dim 92 → 85
-- `_compute_obs`에서 Panda 관련 obs 채널 (qB, eeB, bolt, ΔeeB-bolt) 0-마스킹
-- `action_penalty` / `jerk_penalty`에서 Panda 채널 마스킹
-
----
-
-## 씬 자산 (참고)
-
-- **UR10**: `data/urdf/ur10_robot/ur10_robot.urdf` (검색 경로 = URDF 디렉터리)
-- **트럭 휠 스테이션** (허브 ø420 mm, ISO 335 mm PCD, 10볼트):
-
-  ```bash
-  python scripts/generate_truck_wheel_station_urdf.py \
-      --bolt-collision-radius-factor 0.95 \
-      --bolt-pattern-phase-deg 0 \
-      --output data/urdf/truck_assembly/truck_wheel_station.urdf
-  ```
-
-- **타이어 + 휠 디스크**: 메시 없이 primitives만 사용
-  (`src/env/models.py:create_tire_wheel_multibody`). 트레드는 박스 토러스,
-  휠 디스크는 PCD/위상이 URDF 생성기와 정합되도록 구성.
-- **카고 (휠 웰)**: AABB 셀 분할 + 허브 동축 원통 cutout으로 타이어 진입 통로
-  확보 (`cargo_use_wheel_well_cutout`, `cargo_wheel_well_radius_yz`).
-
----
-
-## 좌표 요약 (Robot B-centric)
+## 주요 좌표 (Panda 기준)
 
 | 객체 | 위치 |
 |---|---|
-| Robot B (Panda) base | `(0, 0, 0)` ← 원점 |
-| Robot A (UR10) base | `(−0.80, 0, −0.30)` — 30 cm 플린스 |
-| 허브 중심 | `(0, +0.80, +0.22)` |
-| 타이어 픽업 COM | `(−1.90, 0, +0.225)` |
-| 타이어 거치대 (Y-split) | rail top Z = `−0.30` (UR10 base 평면과 동일) |
-| 카고 박스 중심 | `(0, +1.05, +0.78)` |
-| 바닥 평면 Z | `−0.60` |
+| Panda (Robot B) 베이스 | `(0, 0, 0)` — 원점 |
+| UR10 (Robot A) 베이스 | `(-0.60, 0.15, -0.30)` |
+| 허브 중심 | `(0, 0.80, 0.22)`, 축 = world −Y |
+| 협조 타이어 스폰 COM | `(-0.20, 0.50, 0.20)` |
+| 바닥 평면 Z | `-0.60` |
 
----
-
-## Min-Jerk 플래너 + PPO 잔차 제어 (2026-06-01)
-
-이전(v11c)에는 PPO가 **원시 Δ-EE-pose 6-d**로 전체 궤적을 직접 합성했습니다. 마운트 구간(≈1.9 m 이동 + 90° 타이어 회전)에서 탐색 공간이 너무 커서 `d_A≈2 m` 정체·hover-lockin·collision-suicide가 반복되었습니다.
-
-**변경 내용** (`src/env/tyro_env.py`, `src/config.py`, `src/env/robots.py`):
-
-| 구성요소 | 동작 |
-|---|---|
-| `_generate_nominal_trajectory` | FSM reset/전이마다 시작 EE → 단계 종료 pose로 **5차 Min-Jerk** (위치) + **SLERP** (자세), 기본 100 step |
-| `_apply_action` | `final_pos = nominal[idx] + action[0:3] × planner_pos_offset_scale` (기본 0.15 m); 회전 잔차는 기본 **비활성** (`planner_enable_rot_offset=False`) |
-| `UR10Robot.apply_absolute_ee` | 플래너 모드 전용 6-DOF IK; `ur10_lock_tool_up` 우회 (플래너가 자세 담당) |
-| `use_planner_residual=False` | v11c 이전 체크포인트·레거시 eval용 **raw Δ-EE** 경로 유지 |
-
-**왜 잔차만 학습하는가**: 명목 궤적이 Phase 1 고정 씬에서 충돌 없는 coarse 경로를 제공하므로, 정책은 랙/카고 회피·정밀 정합만 보정하면 됩니다. PPO가 “어디로 갈지”가 아니라 “명목에서 얼마나 벗어날지”를 학습합니다.
-
----
-
-## Attached hot-start (Mount-only 빠른 루프)
-
-| 플래그 | 기본 (2026-06-01) | 효과 |
-|---|---|---|
-| `start_pos_easy_prob` | `1.0` | 매 reset이 easy 분기 |
-| `attached_spawn_when_easy` | `True` | 타이어 cradle 고정 + grasp 연결 + `task_stage=1`, Stage 0 스킵 |
-| `terminate_on` | `mount` | Stage 1→2 시 `R_mount` + `is_success=True`로 조기 종료 |
-
-Stage 2(디마운트)·Stage 3(복귀) 코드는 env에 그대로 있으나, 위 기본값에서는 **학습 루프에서 호출되지 않음**. 마운트 수렴 후 `--terminate-on never`로 전체 사이클을 켭니다.
-
-```powershell
-# 권장: 플래너+잔차 Mount-only (EnvConfig 기본과 동일)
-.\scripts\train.ps1 --run-name phase1_planner_mount_v1
-
-# 전체 4-stage 사이클 (pickup부터)
-.\scripts\train.ps1 --terminate-on never --start-pos-easy-prob 0.75 `
-    --no-attached-spawn-when-easy
-
-# v11c 역커리큘럼 (허브 hot-start → easy mix → HOME)
-.\scripts\train.ps1 --reverse-curriculum --terminate-on never --run-name phase1_rev_v1
-```
-
-> attached hot-start 끄기: `--no-attached-spawn-when-easy`  
-> 레거시 raw Δ-EE: `--no-use-planner-residual`
-
----
-
-## v11 역커리큘럼 (Backtracking) — 선택 기능
-
-`--reverse-curriculum` 시 `ReverseCurriculumCallback`이 global step에 따라 reset 경로를 바꿉니다 (`reverse_curriculum_enable=False`가 기본).
-
-| Phase | step 구간 (기본) | reset 동작 |
-|---|---|---|
-| **A** | 0 ~ 250k | 허브 정렬 hot-start, `task_stage=1`, 소 jitter (0.01 m / 0.5°) |
-| **A↔B** | 250k ~ 300k | Bernoulli 75% A / 25% B |
-| **B** | 300k ~ 750k | legacy easy/HOME mix (`start_pos_easy_prob`) |
-| **C** | 750k+ | pure HOME |
-
-**v11c 패치가 필요했던 이유** (실험 로그 기반):
-
-- **v11c1**: Phase A에서 `terminate_on=mount` + 1-step ep → PyBullet `reset()` 폭주, fps ≈ 12 → `reverse_phase_a_terminate_on_mount=False` (R_mount는 step 1에 지급, ep는 계속)
-- **v11c2**: Phase A 첫 step 물리 폭주로 safety 종료 → `safety_terminations_enabled` 토글
-- **v11c4/v11c5**: Mount tol이 hard(0.04 m)로 조여지면 `fsm_bonus` 붕괴 → Phase A/B에서 soft tol(0.30 m) **lock**
-
----
-
-## UR10 / 씬 튜닝 요약 (최근)
-
-| 항목 | 변경 | 이유 |
-|---|---|---|
-| V-cradle rack | Y-gap 70 cm, rail 높이 60 cm, COM Z ≈ 0.391 | 6시 grasp anchor가 HOME EE Z와 ≈3 mm — pickup을 거의 평면 도달로 |
-| `tire_spawn_rpy` | bore axis → world **+X** (Robot A 방향) | bore가 로봇을 향해 보이도록; Stage 1에서 hub(−Y) 정렬 시 90° 회전 허용 |
-| `HOME_POSE` | palm-up cradle | 이전 HOME이 타이어 bore 내부(접촉력 즉시 종료) |
-| `apply_delta_ee` | `last_target_pos` 누적 (측정 EE 비누적) | 중력 sag가 IK 목표를 매 step 끌어내려 drift |
-| joint `forces` | 400/400/300/60/60/60 N·m | uniform 150 N·m → shoulder sag |
-| `collision_terminates` | True (플래너 모드) | 명목 궤적이 충돌-free이면 접촉 = 정책 오류 |
-| grasp 중 contact-force | tire↔UR10 제외 | JOINT_FIXED 의도 접촉이 step-1 kill 방지 |
-
----
-
-## 추가 학습 옵션
-
-```powershell
-# W&B 로깅
-.\scripts\train.ps1 --wandb tyro --tags v1
-
-# 솔버 / 물리 미세조정
-.\scripts\train.ps1 --physics-num-sub-steps 6 --contact-force-done 2500
-
-# Stage / Phase 변경
-.\scripts\train.ps1 --stage 4 --phase 2
-
-# Mount-only → full cycle 전환 (체크포인트 이어하기)
-.\scripts\train.ps1 --resume runs\phase1_xxx\final.zip --terminate-on never `
-    --reset-timesteps --run-name phase1_full_cycle_v1
-
-# 커리큘럼 노브 (override)
-.\scripts\train.ps1 `
-    --approach-tol-soft 0.60 `
-    --approach-tol-hard 0.45 `
-    --approach-tol-curriculum-steps 150000 `
-    --approach-tol-ramp-steps 250000
-
-# eval: 플래너 기본 env + easy spawn 강제
-python -m src.eval runs\phase1_xxx\best\best_model.zip --render --easy-start --terminate-on mount
-```
-
----
-
-## 하이퍼파라미터 sweep
-
-Optuna 기반 PPO + 협력 보상 가중치 sweep (TPE + median pruning, SQLite 저장).
+타이어(UR10용): 외경 0.30 m, 보어 0.23 m, 폭 0.16 m, 1.5 kg.
+재생성 / 크기 변경:
 
 ```bash
-python -m src.sweep --study smoke --smoke-test         # 1 trial × 5k step 스모크
-python -m src.sweep --study tyro1 --n-trials 30 --steps-per-trial 200000
-python -m src.sweep --study tyro1 --n-trials 20         # 이어서 진행
+python -m scripts.generate_tire_urdf --outer 0.30 --inner 0.23 --width 0.16
 ```
 
-탐색 공간은 `src/sweep.py:suggest_hparams`에서 직접 편집 가능.
-
 ---
 
-## 학습 파이프라인 (mount-only 기본)
+## 플래그
 
-### 기본 활성 콜백
+```bash
+--dual-arm-coop            # 협조 운반 (작은 URDF 타이어 자동 포함)
+--num-envs / --total-steps # 병렬 수 / 학습 길이
+--mount-curriculum         # soft→hard 마운트 게이트 (기본 ON)
+--resume <ckpt.zip>        # 체크포인트 이어 학습
+--wandb <project>          # W&B 로깅
+```
 
-| 항목 | 이유 |
-|---|---|
-| `MountTolCurriculumCallback` (기본 ON) | mount tol soft→hard; 역커리큘럼 Phase A/B lock과 공존 |
-| `RewardBreakdownCallback` | TensorBoard `reward/*`, `fsm_bonus` 디버깅 |
-| `mix_dense=0.3` / `mix_sparse=0.7` | sparse FSM 보너스가 value를 주도 (hover 방지와 병행) |
-| `w_step_alive=0.15` | mix를 우회하는 per-step 생존 비용 — 장기 hover 억제 |
-| Stage 2/3 env 코드 (`terminate_on=mount` 시 미실행) | full cycle 전환 시 `--terminate-on never`만 변경 |
+하이퍼파라미터 sweep (Optuna, SQLite 저장):
 
-### opt-in / legacy (mount-only에서 비활성)
-
-| 항목 | 활성화 방법 |
-|---|---|
-| `ApproachTolCurriculumCallback` | `--approach-curriculum` (pickup / full cycle 재학습 시) |
-| `StartPosCurriculumCallback` | `--start-pos-curriculum --start-pos-mode lerp` |
-| `ReverseCurriculumCallback` | `--reverse-curriculum` |
-| `terminate_on_pickup` (legacy) | `terminate_on`이 우선 — `--terminate-on`만 사용 권장 |
-
-### TensorBoard / monitor에서 볼 지표
-
-- `rollout/success_rate` — mount-only면 초반 급상승 목표
-- `reward/fsm_bonus` — sparse mount/pickup 신호 (≈0이면 tol/gate 문제)
-- `reward/guide_A`, `reward/pb_carry` — Stage 1 dense
-- `curriculum/mount_radius_tol` — tol ramp 진행
-- `env/ik_residual_A_mean` — 장기 >0.02 m이면 reach/DR 점검
-
-### 정리 완료 (2026-06-01)
-
-- **`runs/`** — legacy 실험 run·로그·체크포인트 전부 삭제 (`.gitignore` 유지, git 미추적)
-- **`scripts/`** — 유지: `train.ps1/bat`, `smoke_fsm.py`, `smoke_planner_residual.py`,
-  `render_phase1_goal.py`, `verify_home.py`, `summarize_log.py`,
-  `generate_truck_wheel_station_urdf.py`
-- 제거됨: `check_*`, `dump_scene.py`, `calibrate_home_pose.py`, 버전별 `smoke_v5_*`~`smoke_v11_*`,
-  v11c supervisor `.ps1` (일회성 디버그)
-
----
-
-## 변경 이력 (CHANGELOG) — 왜 바꿨는지
-
-기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
-
-### 2026-06-01 — Min-Jerk 플래너 + PPO 잔차 + Mount-only 기본
-
-- **문제**: raw Δ-EE만으로는 carry/mount 탐색이 수렴하지 않음; v11c5까지도 `d_A` 장거리 정체.
-- **조치**: 명목 궤적 + 0.15 m 잔차; `attached_spawn_when_easy`로 Stage 1부터 시작; `terminate_on=mount`.
-- **부수**: `apply_absolute_ee`, grasp 중 contact-force 필터, `collision_terminates=True` 복원.
-
-### 2026-05-31 — v11 역커리큘럼 + 4-stage FSM 완성
-
-- **문제**: pickup→mount→demount→return 전체를 한 번에 학습하면 credit assignment 붕괴.
-- **조치**: Phase A 허브 hot-start로 mount endgame 먼저 맛보기 → B easy mix → C HOME.
-- **v11c1~c5**: 1-step ep fps 붕괴, safety kill, mount tol hard lock 등을 패치 (README §v11 역커리큘럼).
-
-### 2026-05-30 — v6/v7 4-stage + vector-guided carry
-
-- Stage 2 demount, Stage 3 return 추가; Stage 1 dense를 `guide_A` + `pb_carry` 양의 커널로 교체 (음의 `align_A`만으로 collision-suicide 유발하던 문제).
-- `hub_guide_vector` obs 3-d 추가 (v7).
-- `terminate_on` enum으로 단계별 조기 성공.
-
-### 2026-05-29 — hover-lockin / 1-step pickup 버그
-
-- **hover**: `approach_decay` 0.15 m, `R_pickup` 300, `w_step_alive` 도입 — dense만 먹고 pickup 안 하는 Nash 균형 제거.
-- **1-step pickup**: `approach_tol_soft` 0.35→0.10 m — easy spawn에서 gate가 너무 넓어 step 1 종료·PPO gradient 소실.
-
-### 2026-05-28 — Robot B-centric + V-cradle + 6-d action
-
-- Panda base를 world origin에 두어 obs/좌표 단순화.
-- gripper_A action 제거 (FSM auto-grasp); Phase 1 action 7→6.
-- UR10 HOME palm-up, tire bore +X spawn.
-
-### 그 이전
-
-- Phase 1 single-arm (`freeze_robot_b`), hub URDF, curriculum stage 1→3 — `git log` 및 초기 README 설치 섹션 참고.
-
----
-
-## 실험 run 네이밍
-
-신규 학습 권장 이름: `phase1_planner_mount_v1` (또는 `train.ps1` 기본 타임스탬프).
-
-산출물은 `runs/<run-name>/` (`final.zip`, `best/`, `ckpts/`, `monitor.csv`, `tb/`).
-`.gitignore`에 포함되어 git에는 올리지 않습니다.
-
-| 접두 (legacy 참고) | 의미 |
-|---|---|
-| `phase1_fsm_v4/v5` | 3-stage → 4-stage FSM 전환 |
-| `phase1_fsm_v6_*` | mount curriculum / vector-guided |
-| `phase1_fsm_v11*` | reverse curriculum 실험 |
-| `phase1_planner_mount_*` | Min-Jerk 플래너 + 잔차 (2026-06-01~) |
+```bash
+python -m src.sweep --study smoke --smoke-test
+python -m src.sweep --study tyro1 --n-trials 30 --steps-per-trial 200000
+```

@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 runs/
 *.zip
+
+# local training logs
+train_*.log

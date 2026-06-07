@@ -1,0 +1,326 @@
+<?xml version="1.0"?>
+<!-- UR10-feasible tire: outer=0.3 inner=0.23 width=0.16 mass=1.5 segments=24. Bore axis = link local +Z. -->
+<robot name="tire_ur10">
+  <material name="tire_rubber">
+    <color rgba="0.12 0.12 0.14 1.0"/>
+  </material>
+  <link name="tire">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="1.5"/>
+      <inertia ixx="0.056787" ixy="0" ixz="0" iyy="0.056787" iyz="0" izz="0.107175"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.262733 0.034589 0.000000" rpy="0 0 0.130900"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.262733 0.034589 0.000000" rpy="0 0 0.130900"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.244828 0.101411 0.000000" rpy="0 0 0.392699"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.244828 0.101411 0.000000" rpy="0 0 0.392699"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.210239 0.161322 0.000000" rpy="0 0 0.654498"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.210239 0.161322 0.000000" rpy="0 0 0.654498"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.161322 0.210239 0.000000" rpy="0 0 0.916298"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.161322 0.210239 0.000000" rpy="0 0 0.916298"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.101411 0.244828 0.000000" rpy="0 0 1.178097"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.101411 0.244828 0.000000" rpy="0 0 1.178097"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.034589 0.262733 0.000000" rpy="0 0 1.439897"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.034589 0.262733 0.000000" rpy="0 0 1.439897"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.034589 0.262733 0.000000" rpy="0 0 1.701696"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.034589 0.262733 0.000000" rpy="0 0 1.701696"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.101411 0.244828 0.000000" rpy="0 0 1.963495"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.101411 0.244828 0.000000" rpy="0 0 1.963495"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.161322 0.210239 0.000000" rpy="0 0 2.225295"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.161322 0.210239 0.000000" rpy="0 0 2.225295"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.210239 0.161322 0.000000" rpy="0 0 2.487094"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.210239 0.161322 0.000000" rpy="0 0 2.487094"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.244828 0.101411 0.000000" rpy="0 0 2.748894"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.244828 0.101411 0.000000" rpy="0 0 2.748894"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.262733 0.034589 0.000000" rpy="0 0 3.010693"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.262733 0.034589 0.000000" rpy="0 0 3.010693"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.262733 -0.034589 0.000000" rpy="0 0 3.272492"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.262733 -0.034589 0.000000" rpy="0 0 3.272492"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.244828 -0.101411 0.000000" rpy="0 0 3.534292"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.244828 -0.101411 0.000000" rpy="0 0 3.534292"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.210239 -0.161322 0.000000" rpy="0 0 3.796091"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.210239 -0.161322 0.000000" rpy="0 0 3.796091"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.161322 -0.210239 0.000000" rpy="0 0 4.057891"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.161322 -0.210239 0.000000" rpy="0 0 4.057891"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.101411 -0.244828 0.000000" rpy="0 0 4.319690"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.101411 -0.244828 0.000000" rpy="0 0 4.319690"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="-0.034589 -0.262733 0.000000" rpy="0 0 4.581489"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="-0.034589 -0.262733 0.000000" rpy="0 0 4.581489"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.034589 -0.262733 0.000000" rpy="0 0 4.843289"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.034589 -0.262733 0.000000" rpy="0 0 4.843289"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.101411 -0.244828 0.000000" rpy="0 0 5.105088"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.101411 -0.244828 0.000000" rpy="0 0 5.105088"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.161322 -0.210239 0.000000" rpy="0 0 5.366887"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.161322 -0.210239 0.000000" rpy="0 0 5.366887"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.210239 -0.161322 0.000000" rpy="0 0 5.628687"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.210239 -0.161322 0.000000" rpy="0 0 5.628687"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.244828 -0.101411 0.000000" rpy="0 0 5.890486"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.244828 -0.101411 0.000000" rpy="0 0 5.890486"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+    <visual>
+      <origin xyz="0.262733 -0.034589 0.000000" rpy="0 0 6.152286"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+      <material name="tire_rubber"/>
+    </visual>
+    <collision>
+      <origin xyz="0.262733 -0.034589 0.000000" rpy="0 0 6.152286"/>
+      <geometry>
+        <box size="0.070000 0.073330 0.160000"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>
