@@ -197,7 +197,7 @@ class RewardConfig:
     #: shrink the farmable standing kernels and lean on the (farm-proof)
     #: potential-based ``pb_nut`` term for the approach gradient, while boosting
     #: the sparse fasten bonuses so task completion dominates.
-    w_nut_reach: float = 0.5
+    w_nut_reach: float = 0.0  # 2026-06-08 (v13) ZEROED: farm-proof PB only.
     #: Lateral (off-axis) weight inside the APPROACH reach distance
     #: ``d_stage = hypot(axial_err, w * lateral)``. Retained for the d_B gate
     #: metric/logging; the APPROACH reward now uses an explicit two-stage
@@ -210,7 +210,15 @@ class RewardConfig:
     #: from cutting a chord across the axis to shrink the staging distance
     #: (the 15 cm off-axis stall at bolt 3). ~5 cm ⇒ axial pull is ~0 at the
     #: 10 cm bolt pitch and ~0.6 once within ~2.5 cm of the axis.
-    nut_coax_gate: float = 0.05
+    #: 2026-06-08 (v11) WIDENED 0.05 → 0.16 (anti-dead-zone). With the v10
+    #: hub-CENTER hot-start the socket starts ~0.21 m off every bolt's axis
+    #: (lateral ≈ 0.21), so ``exp(-0.21/0.05) ≈ 0.015`` killed the axial reach
+    #: AND the (farm-proof) axial PB leg across the entire start→bolt gap — the
+    #: policy saw a flat valley and random-walked away (observed v10 ~0.93 M:
+    #: d_B drifted to 1.53 m, path_dev 1.5 m, n_fastened_policy 0). 0.16 keeps
+    #: the axial/PB pull alive from the hub-center start (exp(-0.21/0.16)=0.31)
+    #: while still gating out the gross off-axis chord (exp(-0.4/0.16)=0.08).
+    nut_coax_gate: float = 0.16
     #: 2026-06-07 — widened 0.15 → 0.50. At the 1.7 m HOME→bolt standoff
     #: ``exp(-1.7/0.15) ≈ 1e-5`` gave the policy zero approach gradient
     #: (the first B run never reached a bolt). 0.50 keeps a usable pull
@@ -224,7 +232,14 @@ class RewardConfig:
     #: tightening the trigger gate added no matching pull to align; 18° gives
     #: a clear pull right where the gate closes (exp(-12/18)=0.51,
     #: exp(-5/18)=0.76) while still rewarding coarse alignment far out.
-    w_nut_align: float = 0.4  # 2026-06-08 REBALANCE (1.5 → 0.4): anti-farm.
+    w_nut_align: float = 0.0  # 2026-06-08 (v12) ZEROED (0.4 → 0.0): anti-farm.
+    #: With ``nut_b_lock_coaxial`` the tool orientation is hard-locked to the
+    #: bolt axis, so θ_B ≈ 0 EVERY step by construction → this kernel paid a
+    #: constant ~0.4/step income with ZERO useful gradient (the alignment it
+    #: rewards is already guaranteed). Over a 600-step episode that was ~240 of
+    #: free, position-independent reward — a primary driver of the v11 farm
+    #: collapse (ep_rew climbed to +200 while n_fastened_policy fell to 0 as
+    #: alpha decayed). The lock makes alignment shaping redundant; remove it.
     nut_align_decay_rad: float = np.deg2rad(18.0)
     #: Potential-based shaping on Δd_B (pays positively each step the
     #: tool closes on the target bolt). Reset across bolt advances.
@@ -234,7 +249,7 @@ class RewardConfig:
     #: when retreating. Promoted to the primary approach driver now that the
     #: standing exp kernels are shrunk, so the policy still gets a strong, dense
     #: "get closer" gradient without a parkable plateau.
-    w_pb_nut: float = 14.0
+    w_pb_nut: float = 25.0  # 2026-06-08 (v13) 14→25: sole positive dense driver.
     #: Sparse bonus paid once per bolt successfully fastened.
     #: 2026-06-08 REBALANCE (50 → 120): fastening must dominate dense farming.
     R_fasten: float = 120.0
@@ -254,10 +269,31 @@ class RewardConfig:
     #: bolt 4, lateral 12 cm). 0.08 keeps a usable coaxial pull out to ~15 cm
     #: (``exp(-0.12/0.08)=0.22``) and the higher weight makes "get on the
     #: axis" compete with the raw reach term.
-    w_nut_lateral: float = 1.5  # 2026-06-08 REBALANCE (4.0 → 1.5): anti-farm,
+    w_nut_lateral: float = 0.0  # 2026-06-08 (v13) ZEROED: PB covers coaxial pull.
     #: but kept the largest of the standing kernels because getting ONTO the
     #: bolt axis (small lateral) is the precision bottleneck for the arrive gate.
-    nut_lateral_decay: float = 0.08
+    #: 2026-06-08 (v11) decay WIDENED 0.08 → 0.16 (anti-dead-zone). The v10
+    #: hub-center start sits ~0.21 m off-axis where ``1.5·exp(-0.21/0.08)=0.11``
+    #: gave almost no per-step pull onto the axis, leaving the lateral PB leg
+    #: as the only directional signal — too weak to beat the exploration noise
+    #: + step_alive drift. 0.16 lifts the start-distance pull to ~0.40/step
+    #: (1.5·exp(-0.21/0.16)) so the static term reinforces the PB direction.
+    nut_lateral_decay: float = 0.16
+    #: 2026-06-08 (v13) — AXIAL-DEPTH engagement gate on the lateral kernel.
+    #: ``nut_lateral_term`` rewards being coaxial (small lateral) with NO depth
+    #: dependence, so the policy farmed it by retreating ~1 m straight back along
+    #: the bolt axis while staying on the axis line — earning ~1.24/step from the
+    #: lateral kernel while ``nut_target_idx`` never left bolt 0 (observed v12 @
+    #: 1.23 M: lateral 0.035, axial 1.15, n_fastened_policy 0, ep_rew 143). This
+    #: was the THIRD farm whacked (align → path → lateral). Root property: every
+    #: standing positive kernel with no proximity gate is farmable. Fix: gate the
+    #: lateral term by AXIAL proximity to the staging depth — legitimate approach
+    #: and the bolt-to-bolt ring transit all happen at ~constant axial depth
+    #: (axial_err ≈ 0 → gate ≈ 1, unaffected), but the retreat farm has large
+    #: axial_err (→ gate ≈ 0, income killed). ``nut_lateral_term *=
+    #: exp(-axial_err / nut_lateral_engage_decay)``. 0.20 m: gate 1.0 at depth,
+    #: 0.78 at 5 cm off-depth (legit cold start), 0.007 at 1 m (the farm).
+    nut_lateral_engage_decay: float = 0.20
     # --- Robot-B ↔ Robot-A clearance shaping (avoid A while fastening) -----
     #: Instead of forcing an "arm-up" IK branch, teach the policy to keep
     #: Robot B's arm clear of Robot A on its own: a positive, *saturating*
@@ -308,7 +344,13 @@ class RewardConfig:
     #: joint angles freely while staying near the collision-free corridor.
     #: Only applied in APPROACH (the macro intentionally moves along ±Y to
     #: insert/retract, so an in-plane bonus there would fight the tighten).
-    w_nut_path: float = 0.6
+    w_nut_path: float = 0.0  # 2026-06-08 (v13) ZEROED: replaced by corridor PENALTY.
+    #: in-plane (constant-Y) bonus pays up to w/step whenever B's tool Y is near
+    #: the staging plane REGARDLESS of its XZ position, so at 0.6 it was a large
+    #: parkable plateau the policy could farm by hovering in-plane far from any
+    #: bolt. Kept small (0.2) so it still gently biases toward the collision-free
+    #: in-plane corridor without out-earning actual fastening progress (pb_nut +
+    #: the sparse R_fasten/R_arrive must dominate).
     nut_path_decay: float = 0.10  # m; full at plane, ~0.37 at 10 cm off-plane.
     #: 2026-06-08 (v10) — minimal-joint-change penalty: ``-w_nut_joint_vel *
     #: ||dq_B||`` over the arm joints during APPROACH. The user wants the path
@@ -316,10 +358,22 @@ class RewardConfig:
     #: act in EE-delta space, this adds a direct joint-space cost. Small so it
     #: shapes smoothness without smothering the approach drive.
     w_nut_joint_vel: float = 0.02
+    #: 2026-06-08 (v13) — one-sided staging-plane corridor PENALTY (replaces the
+    #: farmable ``w_nut_path`` bonus). During APPROACH only, penalise tool Y
+    #: excursions PAST the staging plane toward the hub (+Y): ``-w *
+    #: max(0, ee_y − (plane_y + margin))``. HOME→bolt entry (ee_y < plane_y) is
+    #: unaffected; macro insert/retract (±Y) runs with shaping off. Linear so it
+    #: cannot be farmed by standing still.
+    w_nut_corridor: float = 8.0
+    nut_corridor_margin: float = 0.02  # m past plane_y before penalty kicks in
     #: Positive axial-progress kernel during INSERT: rewards driving the
     #: tool_tip to the bolt base (hub face) along the axis.
-    w_nut_axial: float = 0.5  # 2026-06-08 REBALANCE (2.0 → 0.5): anti-farm.
-    nut_axial_decay: float = 0.05
+    w_nut_axial: float = 0.0  # 2026-06-08 (v13) ZEROED: redundant with PB reach.
+    #: 2026-06-08 (v11) decay WIDENED 0.05 → 0.12 (anti-dead-zone). Paired with
+    #: the wider coax_gate so the axial seating gradient extends across the
+    #: ~0.21 m hub-center→bolt gap once the socket is roughly coaxial, instead
+    #: of only switching on within the last ~2 cm.
+    nut_axial_decay: float = 0.12
     #: Potential-based shaping on the RETRACT leg: pays positively per step
     #: the tool_tip backs out along +axis (−Y) toward clearing the stud.
     w_nut_retract: float = 6.0
@@ -1311,6 +1365,30 @@ class EnvConfig:
     #: in a straight line; 0.05 keeps the traverse tractable inside the
     #: 600-step horizon while staying smooth enough for the 1.5 cm insert.
     nut_pos_scale: float = 0.05
+    #: 2026-06-08 (v11) — hard-lock Robot B's tool orientation coaxial to the
+    #: target bolt axis during APPROACH (policy controls XYZ position only).
+    #: ROOT-CAUSE FIX: in the delta path B's orientation accumulated the
+    #: policy's rotation residuals with no nominal anchor, so it drifted off-axis
+    #: (observed v10: theta_B → 0.8 rad / 46°, far above the 12–35° arrive gate),
+    #: meaning the macro could never trigger no matter how close the position got
+    #: (n_fastened_policy = 0 the entire run). All 10 bolts share the SAME axis
+    #: (world −Y), so a single coaxial orientation is correct for every bolt:
+    #: locking it guarantees theta ≈ 0 every step, collapses the approach to a
+    #: pure 3-DOF position reach, and frees the policy from a useless, drift-prone
+    #: 3-DOF rotation search. The locked quat is captured from the (reachable)
+    #: hot-start pose so IK stays in-branch; the rotation action channels become
+    #: dead and are masked out of the action/jerk L2 penalty.
+    nut_b_lock_coaxial: bool = True
+    #: 2026-06-08 (v14) — Min-Jerk nominal APPROACH trajectory + PPO XYZ
+    #: residual (oracle answer path). When True the env generates a
+    #: collision-free nominal EE path (HOME→hub center→staging, or XZ hop
+    #: bolt→bolt) and the policy outputs only a small offset on top; hot-start
+    #: is disabled automatically. Insert/retract remains the scripted macro.
+    nut_b_planner_residual: bool = False
+    #: Per-step EE residual scale (m) on the nominal nut trajectory.
+    nut_planner_pos_residual_scale: float = 0.05
+    #: Samples along each APPROACH nominal leg (min-jerk through waypoints).
+    nut_planner_traj_steps: int = 120
     # --- scripted insert→hold→retract macro ------------------------------
     #: 2026-06-07 — the policy ONLY learns to APPROACH each bolt's staging
     #: point (just outside the stud tip, on-axis). The delicate in/out is no
@@ -2530,4 +2608,11 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     # collision *termination* so the policy can learn to work in close.
     if nut_task_cfg and "collision_terminates" not in user_overrides:
         cfg.collision_terminates = False
+    # v13 farm-proof reward: PB is the sole positive dense driver — raise its
+    # mix weight so progress dominates step_alive without re-introducing standing
+    # exp kernels.
+    if nut_task_cfg:
+        cfg.reward.mix_dense = 0.5
+    if nut_task_cfg and bool(getattr(cfg, "nut_b_planner_residual", False)):
+        cfg.nut_b_hotstart_enable = False
     return cfg

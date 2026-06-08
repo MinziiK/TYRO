@@ -406,6 +406,14 @@ class TyroEnv(gym.Env):
         self._nut_hold_count = 0
         self._nut_done = False
         self._nut_frozen_qA = None
+        # Coaxial tool orientation B holds during APPROACH (captured from the
+        # reachable hot-start pose) when ``nut_b_lock_coaxial`` is set. None
+        # ⇒ fall back to the analytic minimal-rotation coaxial quat.
+        self._nut_lock_quat = None
+        # v14 — nominal APPROACH trajectory (joint-space lerp; coaxial quat locked).
+        self._nut_traj_pos: Optional[np.ndarray] = None
+        self._nut_traj_q: Optional[np.ndarray] = None
+        self._nut_traj_step = 0
         # Per-bolt sub-FSM: 0 = APPROACH (policy drives B toward the bolt's
         # staging point just outside the stud tip), 1 = MACRO (the env
         # scripts a deterministic insert→hold→retract straight down/up the
@@ -875,6 +883,10 @@ class TyroEnv(gym.Env):
         self._nut_macro_leg_len = 1
         self._prev_axial_B = None
         self._nut_done = False
+        self._nut_lock_quat = None
+        self._nut_traj_pos = None
+        self._nut_traj_q = None
+        self._nut_traj_step = 0
         self.task_stage = 0
 
         n = len(self.handles.bolts)
@@ -903,10 +915,12 @@ class TyroEnv(gym.Env):
         if bool(getattr(self.cfg, "nut_scripted_macro", True)):
             self._precompute_nut_macro_solutions(n)
 
-        # 5. Robot-B reverse-curriculum hot-start: place B partway between
-        #    HOME and bolt 0's approach pose so the policy can first discover
-        #    the insert from close range, then back off to full HOME distance.
-        self._apply_nut_b_hotstart()
+        # 5. Robot-B start pose: planner nominal trajectory (v14) or
+        #    reverse-curriculum hot-start (legacy).
+        if bool(getattr(self.cfg, "nut_b_planner_residual", False)):
+            self._generate_nut_approach_traj()
+        else:
+            self._apply_nut_b_hotstart()
 
     def _quat_align_tool_z(self, want_z: np.ndarray,
                            seed_quat: Optional[np.ndarray] = None) -> np.ndarray:
@@ -1058,6 +1072,13 @@ class TyroEnv(gym.Env):
             # staging pose for bolts 4/5/6 while 0/1/2/8 held).
             rb._cmd_q = arm_q.copy()
             rb.drive_arm_targets(arm_q)
+            # Capture the achieved (reachable, coaxial) tool orientation so the
+            # APPROACH lock holds exactly this branch — the analytic minimal-
+            # rotation quat is NOT always the reachable roll (the hub-center
+            # start needs a specific roll the single-quat solve misses).
+            self._nut_lock_quat = np.asarray(
+                rb.ee_pose()[1], dtype=np.float64
+            ).copy()
 
     def _nut_gate_metrics(self, idx: int) -> Tuple[float, float]:
         """(d_B, theta_B) for the nut-runner tool_tip vs bolt ``idx``.
@@ -1145,6 +1166,111 @@ class TyroEnv(gym.Env):
         standoff = float(getattr(self.cfg, "nut_insert_standoff", 0.05))
         margin = float(getattr(self.cfg, "nut_insert_margin", 0.0))
         return 0.5 * L + standoff + margin
+
+    def _nut_ref_center(self) -> np.ndarray:
+        """Bolt-ring centroid at the staging depth (hub-and-spoke center)."""
+        n_b = len(self.handles.bolts)
+        centroid = np.mean(
+            [np.asarray(self.scene.bolt_pose(i)[0], dtype=np.float64)
+             for i in range(n_b)], axis=0,
+        )
+        return centroid + self._nut_axis_unit(0) * self._nut_staging_axial()
+
+    def _nut_retract_axial(self) -> float:
+        L = float(getattr(self.cfg, "bolt_length", 0.10))
+        retract_clear = float(getattr(self.cfg, "nut_retract_clear", 0.03))
+        margin = float(getattr(self.cfg, "nut_insert_margin", 0.0))
+        return 0.5 * L + retract_clear + 0.03 + margin
+
+    def _capture_nut_lock_quat_if_needed(self) -> None:
+        """Capture a reachable coaxial tool quat for APPROACH orientation lock."""
+        if self._nut_lock_quat is not None:
+            return
+        if not bool(getattr(self.cfg, "nut_b_lock_coaxial", True)):
+            return
+        idx = int(self._nut_target_idx)
+        pos = np.asarray(
+            self._nut_point_on_axis(idx, self._nut_staging_axial()), dtype=np.float64,
+        )
+        want_z = -self._nut_axis_unit(idx)
+        q = self._ik_b_rollfree(pos, want_z)
+        if q is not None:
+            rb = self.robot_B
+            q_save, _ = rb.joint_state()
+            for sl, qq in zip(rb.arm.indices, q):
+                p.resetJointState(
+                    rb.uid, int(sl), float(qq), targetVelocity=0.0,
+                    physicsClientId=self.client,
+                )
+            self._nut_lock_quat = np.asarray(
+                rb.ee_pose()[1], dtype=np.float64,
+            ).copy()
+            for sl, qq in zip(rb.arm.indices, q_save):
+                p.resetJointState(
+                    rb.uid, int(sl), float(qq), targetVelocity=0.0,
+                    physicsClientId=self.client,
+                )
+            rb._cmd_q = None
+        else:
+            self._nut_lock_quat = self._quat_align_tool_z(want_z)
+
+    def _generate_nut_approach_traj(self) -> None:
+        """Min-jerk nominal EE path for the current bolt's APPROACH leg."""
+        idx = int(self._nut_target_idx)
+        rb = self.robot_B
+        from_pos = np.asarray(rb.ee_pose()[0], dtype=np.float64)
+        staging = np.asarray(
+            self._nut_point_on_axis(idx, self._nut_staging_axial()), dtype=np.float64,
+        )
+        n_steps = int(getattr(self.cfg, "nut_planner_traj_steps", 120))
+        n_steps = max(n_steps, 2)
+
+        policy_fastened = len(self._nut_fastened) - int(self._nut_premark)
+        if policy_fastened <= 0:
+            center = self._nut_ref_center()
+            wps = [from_pos, center, staging]
+        else:
+            prev_idx = int(self._nut_fastened[-1])
+            retr_y = float(
+                self._nut_point_on_axis(prev_idx, self._nut_retract_axial())[1]
+            )
+            hop = np.array([staging[0], retr_y, staging[2]], dtype=np.float64)
+            wps = [from_pos, hop, staging]
+
+        self._nut_traj_pos = _multi_min_jerk_positions(wps, n_steps)
+        self._nut_traj_step = 0
+        self._capture_nut_lock_quat_if_needed()
+        self._nut_traj_q = self._nut_cart_traj_to_joint_traj(
+            self._nut_traj_pos, idx,
+        )
+
+    def _nut_cart_traj_to_joint_traj(
+        self, positions: np.ndarray, idx: int,
+    ) -> np.ndarray:
+        """IK-chain a Cartesian min-jerk path into a branch-stable joint lerp."""
+        rb = self.robot_B
+        want_z = -self._nut_axis_unit(idx)
+        q_save, _ = rb.joint_state()
+        q_cur = np.asarray(q_save, dtype=np.float64)
+        qs = []
+        for pos in np.asarray(positions, dtype=np.float64):
+            for sl, qq in zip(rb.arm.indices, q_cur):
+                p.resetJointState(
+                    rb.uid, int(sl), float(qq), targetVelocity=0.0,
+                    physicsClientId=self.client,
+                )
+            q = self._ik_b_rollfree(pos, want_z, n_roll=8, n_seed=2)
+            if q is not None:
+                q_cur = np.asarray(q, dtype=np.float64)
+            qs.append(q_cur.copy())
+        for sl, qq in zip(rb.arm.indices, q_save):
+            p.resetJointState(
+                rb.uid, int(sl), float(qq), targetVelocity=0.0,
+                physicsClientId=self.client,
+            )
+        rb._cmd_q = None
+        rb.last_target_pos = rb.ee_pose()[0].copy()
+        return np.asarray(qs, dtype=np.float64)
 
     def _nut_macro_target(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
         """(pos, quat) the scripted macro commands for the current leg.
@@ -1671,6 +1797,8 @@ class TyroEnv(gym.Env):
                     self._prev_axial_B = None
                     self._prev_lateral_B = None
                     self._prev_axial_err_B = None
+                    if bool(getattr(self.cfg, "nut_b_planner_residual", False)):
+                        self._generate_nut_approach_traj()
         return events
 
     # ------------------------------------------------------------------
@@ -1705,6 +1833,10 @@ class TyroEnv(gym.Env):
         if bool(getattr(self.cfg, "nut_fastening_task", False)) and dim == 13:
             m[0:6] = 0.0
             m[12] = 0.0
+            # Coaxial-lock: B's tool orientation is env-controlled (fixed to the
+            # bolt axis), so the rotation residual channels [9:12] are dead.
+            if bool(getattr(self.cfg, "nut_b_lock_coaxial", True)):
+                m[9:12] = 0.0
         # **2026-06-01** — when the planner-residual path is active AND
         # the rotation offset channel is disabled, ``action[3:6]`` has no
         # effect on the world. Zero it in the action/jerk L2 mask so the
@@ -4163,13 +4295,62 @@ class TyroEnv(gym.Env):
             ):
                 self._drive_nut_macro()
                 return
-            # APPROACH leg (subphase 0): policy drives B via Δpose.
-            ps = float(getattr(self.cfg, "nut_pos_scale",
-                               self.cfg.action.pos_scale))
-            rs = self.cfg.action.rot_scale
-            d_pos_B = np.asarray(action[6:9], dtype=np.float64) * ps
-            d_rot_B = np.asarray(action[9:12], dtype=np.float64) * rs
-            self.robot_B.apply_delta_ee(d_pos_B, d_rot_B)
+            # APPROACH leg (subphase 0): policy drives B toward staging.
+            rb = self.robot_B
+            if bool(getattr(self.cfg, "nut_b_planner_residual", False)):
+                if self._nut_traj_q is None:
+                    self._generate_nut_approach_traj()
+                n = int(self._nut_traj_q.shape[0])
+                t = min(int(self._nut_traj_step), n - 1)
+                q_nom = np.asarray(self._nut_traj_q[t], dtype=np.float64)
+                scale = float(getattr(
+                    self.cfg, "nut_planner_pos_residual_scale", 0.05,
+                ))
+                residual = np.asarray(action[6:9], dtype=np.float64) * scale
+                lock_quat = self._nut_lock_quat
+                if lock_quat is None:
+                    lock_quat = self._quat_align_tool_z(
+                        -self._nut_axis_unit(int(self._nut_target_idx))
+                    )
+                if float(np.linalg.norm(residual)) > 1e-9:
+                    for slot, q in zip(rb.arm.indices, q_nom):
+                        p.resetJointState(
+                            rb.uid, int(slot), targetValue=float(q),
+                            targetVelocity=0.0, physicsClientId=self.client,
+                        )
+                    ee = np.asarray(rb.ee_pose()[0], dtype=np.float64)
+                    rb.apply_absolute_ee(ee + residual, lock_quat)
+                else:
+                    q_nom = np.clip(q_nom, rb.arm.lower, rb.arm.upper)
+                    for slot, q in zip(rb.arm.indices, q_nom):
+                        p.resetJointState(
+                            rb.uid, int(slot), targetValue=float(q),
+                            targetVelocity=0.0, physicsClientId=self.client,
+                        )
+                    rb._cmd_q = None
+                    rb.drive_arm_targets(q_nom)
+                    rb.last_target_pos = rb.ee_pose()[0].copy()
+                self._nut_traj_step += 1
+            elif bool(getattr(self.cfg, "nut_b_lock_coaxial", True)):
+                ps = float(getattr(self.cfg, "nut_pos_scale",
+                                   self.cfg.action.pos_scale))
+                d_pos_B = np.asarray(action[6:9], dtype=np.float64) * ps
+                if rb.last_target_pos is None:
+                    rb.last_target_pos = rb.ee_pose()[0].copy()
+                rb.last_target_pos = rb.last_target_pos + d_pos_B
+                lock_quat = self._nut_lock_quat
+                if lock_quat is None:
+                    lock_quat = self._quat_align_tool_z(
+                        -self._nut_axis_unit(int(self._nut_target_idx))
+                    )
+                rb.apply_absolute_ee(rb.last_target_pos, lock_quat)
+            else:
+                ps = float(getattr(self.cfg, "nut_pos_scale",
+                                   self.cfg.action.pos_scale))
+                rs = self.cfg.action.rot_scale
+                d_pos_B = np.asarray(action[6:9], dtype=np.float64) * ps
+                d_rot_B = np.asarray(action[9:12], dtype=np.float64) * rs
+                self.robot_B.apply_delta_ee(d_pos_B, d_rot_B)
             return
 
         use_planner = bool(getattr(self.cfg, "use_planner_residual", True))
@@ -4497,13 +4678,12 @@ class TyroEnv(gym.Env):
         _, theta_B = self._nut_gate_metrics(idx)
         axial, lateral, theta = self._nut_axial_lateral(idx)
         staging_axial = self._nut_staging_axial()
-        # Distance from the socket tip to the on-axis staging point, with the
-        # lateral (off-axis) component weighted up by ``nut_reach_lateral_w``
-        # so the reach gradient prioritises getting *onto the bolt axis* over
-        # closing the axial gap — this is what breaks the lateral-stall local
-        # equilibrium seen mid-loop (parked ~12 cm beside the next bolt axis).
-        lat_w = float(getattr(rcfg, "nut_reach_lateral_w", 1.0))
-        d_stage = float(math.hypot(axial - staging_axial, lat_w * lateral))
+        staging_pos = np.asarray(
+            self._nut_point_on_axis(idx, staging_axial), dtype=np.float64,
+        )
+        ee_pos = np.asarray(self.robot_B.ee_pose()[0], dtype=np.float64)
+        # v13 — Euclidean tool→staging distance (PB potential; no decay).
+        d_stage = float(np.linalg.norm(ee_pos - staging_pos))
         b.d_B = float(d_stage)
         b.theta_B = float(theta_B)
         b.nut_target_idx = idx
@@ -4515,83 +4695,36 @@ class TyroEnv(gym.Env):
         b.nut_axial = float(axial)
         b.nut_subphase = int(self._nut_subphase)
 
-        reach_decay = max(float(getattr(rcfg, "nut_reach_decay", 0.15)), 1e-3)
-        align_decay = max(
-            float(getattr(rcfg, "nut_align_decay_rad", np.deg2rad(30.0))), 1e-3,
-        )
-        lat_decay = max(float(getattr(rcfg, "nut_lateral_decay", 0.03)), 1e-3)
-        axial_decay = max(float(getattr(rcfg, "nut_axial_decay", 0.05)), 1e-3)
         macro = int(self._nut_subphase) == 1
 
         if not macro:
-            # APPROACH — two-stage shaping so the socket first climbs ONTO the
-            # bolt axis, then slides along it to the staging point. The old
-            # single ``reach = exp(-d_stage/decay)`` term mixed both goals and
-            # let the policy cut a chord across the axis: it parked ~15 cm
-            # off-axis (lateral) while oscillating in d_stage and never entered
-            # the capture sphere (observed: 519 steps stuck at bolt 3, theta
-            # already 10°, lateral pinned at 0.15). Splitting the objective and
-            # gating the axial pull by a coaxial factor removes that chord
-            # local-optimum.
-            coax_gate = max(
-                float(getattr(rcfg, "nut_coax_gate", 0.05)), 1e-3,
-            )
-            # 1 when perfectly coaxial, → 0 as the socket drifts off the axis.
-            coax = float(np.exp(-lateral / coax_gate))
-            axial_err = abs(axial - staging_axial)
+            # v13 APPROACH — farm-proof: PB progress only (+ penalties).
+            # Standing exp kernels (reach/lateral/axial/align/path) removed —
+            # they were farmed repeatedly (align→path→lateral whack-a-mole).
+            b.nut_align = 0.0
+            b.nut_lateral_term = 0.0
+            b.nut_reach = 0.0
+            b.nut_axial_term = 0.0
+            b.nut_path = 0.0
 
-            b.nut_align = (
-                float(rcfg.w_nut_align) * float(np.exp(-theta / align_decay))
-            )
-            # Always-on axis attraction (get coaxial); the dominant driver when
-            # off-axis.
-            b.nut_lateral_term = (
-                float(rcfg.w_nut_lateral) * float(np.exp(-lateral / lat_decay))
-            )
-            # Axial approach matters only once roughly coaxial → gate by coax so
-            # the policy cannot trade lateral error for axial progress.
-            b.nut_reach = (
-                float(rcfg.w_nut_reach)
-                * float(np.exp(-axial_err / reach_decay)) * coax
-            )
-            b.nut_axial_term = (
-                float(rcfg.w_nut_axial)
-                * float(np.exp(-axial_err / axial_decay)) * coax
-            )
-            # Potential-based shaping split into a lateral leg (always paid) and
-            # an axial leg (gated by coax), each on its own monotone potential.
-            pb_nut = 0.0
             wpb = float(rcfg.w_pb_nut)
-            if wpb > 0.0:
-                if self._prev_lateral_B is not None:
-                    pb_nut += wpb * float(self._prev_lateral_B - lateral)
-                if self._prev_axial_err_B is not None:
-                    pb_nut += wpb * coax * float(
-                        self._prev_axial_err_B - axial_err
-                    )
+            pb_nut = 0.0
+            if wpb > 0.0 and self._prev_d_B is not None:
+                pb_nut = wpb * float(self._prev_d_B - d_stage)
             b.pb_nut = float(pb_nut)
-            self._prev_lateral_B = float(lateral)
-            self._prev_axial_err_B = float(axial_err)
+            self._prev_d_B = float(d_stage)
 
-            # Soft answer-path adherence: keep the tool in the constant-Y
-            # staging plane (the in-plane hub-and-spoke route). plane_y = Y of
-            # the target bolt's on-axis staging point; all bolts share it.
-            w_path = float(getattr(rcfg, "w_nut_path", 0.0))
-            if w_path > 0.0:
-                plane_y = float(
-                    self._nut_point_on_axis(idx, staging_axial)[1]
-                )
-                ee_y = float(self.robot_B.ee_pose()[0][1])
-                y_dev = abs(ee_y - plane_y)
-                path_decay = max(
-                    float(getattr(rcfg, "nut_path_decay", 0.10)), 1e-3,
-                )
-                b.nut_path = w_path * float(np.exp(-y_dev / path_decay))
-                b.nut_path_dev = float(y_dev)
-            # Minimal-joint-change: penalise arm joint speed in joint space.
+            # One-sided corridor: penalise hub-side (+Y) excursions past staging.
+            w_corr = float(getattr(rcfg, "w_nut_corridor", 0.0))
+            plane_y = float(staging_pos[1])
+            margin = float(getattr(rcfg, "nut_corridor_margin", 0.02))
+            y_excursion = max(0.0, float(ee_pos[1]) - (plane_y + margin))
+            b.nut_path_dev = float(y_excursion)
+            b.nut_path = -w_corr * y_excursion if w_corr > 0.0 else 0.0
+
             w_jv = float(getattr(rcfg, "w_nut_joint_vel", 0.0))
             if w_jv > 0.0:
-                _, dqB = self.robot_B.joint_state()  # arm joints only
+                _, dqB = self.robot_B.joint_state()
                 b.nut_joint_vel = -w_jv * float(
                     np.linalg.norm(np.asarray(dqB, dtype=np.float64))
                 )
@@ -4605,10 +4738,7 @@ class TyroEnv(gym.Env):
             b.nut_path = 0.0
             b.nut_path_dev = 0.0
             b.nut_joint_vel = 0.0
-            # Drop APPROACH potentials so the next APPROACH (next bolt) starts
-            # fresh and does not pay a spurious jump across the macro window.
-            self._prev_lateral_B = None
-            self._prev_axial_err_B = None
+            self._prev_d_B = None
 
         # Sparse FSM bonuses.
         if fsm_events.get("arrived"):

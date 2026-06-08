@@ -849,6 +849,7 @@ def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
     if (
         bool(getattr(args, "nut_fastening", False))
         and bool(getattr(args, "nut_hotstart_curriculum", True))
+        and not bool(getattr(args, "nut_b_planner_residual", False))
     ):
         cbs.append(NutHotStartCurriculumCallback(
             start_alpha=float(getattr(args, "nut_hotstart_alpha_start", 1.0)),
@@ -1319,6 +1320,25 @@ def main() -> int:
         help="Consecutive in-gate steps before a bolt counts as fastened.",
     )
     ap.add_argument(
+        "--nut-b-planner-residual",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "nut_b_planner_residual", False)),
+        help=(
+            "Robot-B nut APPROACH: min-jerk nominal trajectory + PPO XYZ "
+            "residual (oracle path). Disables hot-start curriculum."
+        ),
+    )
+    ap.add_argument(
+        "--nut-planner-traj-steps", type=int,
+        default=int(getattr(_cfg_defaults, "nut_planner_traj_steps", 120)),
+        help="Samples along each APPROACH nominal leg.",
+    )
+    ap.add_argument(
+        "--nut-planner-pos-residual-scale", type=float,
+        default=float(getattr(_cfg_defaults, "nut_planner_pos_residual_scale", 0.05)),
+        help="Per-step EE residual scale (m) on the nominal nut trajectory.",
+    )
+    ap.add_argument(
         "--nut-hotstart-curriculum",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1551,6 +1571,15 @@ def main() -> int:
             # Robot B must be policy-controlled (13-d action / full obs).
             overrides["freeze_robot_b"] = False
             overrides["nut_hold_steps"] = int(args.nut_hold_steps)
+            overrides["nut_b_planner_residual"] = bool(
+                getattr(args, "nut_b_planner_residual", False)
+            )
+            overrides["nut_planner_traj_steps"] = int(
+                getattr(args, "nut_planner_traj_steps", 120)
+            )
+            overrides["nut_planner_pos_residual_scale"] = float(
+                getattr(args, "nut_planner_pos_residual_scale", 0.05)
+            )
         overrides["use_planner_residual"] = bool(args.use_planner_residual)
         overrides["attached_spawn_when_easy"] = bool(args.attached_spawn_when_easy)
         overrides["max_steps"] = int(args.max_steps)

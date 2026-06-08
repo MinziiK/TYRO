@@ -561,6 +561,20 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
 
+### 2026-06-08 (저녁) — Robot B 너트 체결 **v14 (Min-Jerk 플래너 + PPO 잔차)**
+
+자세한 내용은 `docs/TRAINING_REPORT.md` §10, §15. **핵심: Robot A와 동일하게 Robot B에도 명목 궤적 + 잔차 구조 적용.**
+
+- **근본 진단**: v1~v13의 반복 실패 원인은 **Robot B에 명목 경로가 없어 정책이 HOME→볼트 1.7 m를 자력 탐색**한 것. Robot A는 처음부터 플래너+잔차로 성공했는데 B만 자력 탐색 → hot-start 발판이 사라지면(`alpha→0`) `n_fastened_policy`가 0으로 붕괴.
+- **v14 구조** (`nut_b_planner_residual=True`):
+  - **명목 궤적** (`_generate_nut_approach_traj`): 첫 볼트는 `[현재 EE, 허브 링 중앙(0,−0.21,0), staging]`, 볼트 간은 `[현재 EE, XZ hop, staging]`(oracle와 동일 XZ transit) Min-Jerk → `_ik_b_rollfree`로 **관절공간 궤적 변환**(branch-stable).
+  - **정책 = 잔차만**: `action[6:9] × 0.05 m`(`nut_planner_pos_residual_scale`) XYZ 보정. 방향은 coaxial 하드 락 → 실효 자유도 3.
+  - **hot-start OFF**: 명목이 접근을 담당하므로 발판 불필요(`make_env_config`가 자동 비활성).
+- **보상**: farm-proof PB(`w_pb_nut=25`) + corridor 페널티(`w_nut_corridor=8`) + collision/joint-vel만. standing 양수 커널(align/reach/lateral/axial/path) **전부 0**.
+- **검증**: `scripts/smoke_nut_planner_v14.py` — 잔차=0(명목만)으로 **10/10 체결**(1592 step). 학습 초반부터 `n_fastened_policy`가 0보다 위에서 상승(단순 RL은 같은 구간 0 부근 정체).
+- **스크립트**: `scripts/run_b_nut_train_v14.sh`, `scripts/smoke_nut_planner_v14.py`. 신규 CLI `--nut-b-planner-residual`, `--nut-planner-traj-steps`, `--nut-planner-pos-residual-scale`.
+- **리포트/그래프**: `docs/TRAINING_REPORT.md`를 **최신 모델 기준**으로 정리(버전 이력 제거). 학습곡선 PNG 2종 추가 — `scripts/plot_phase_a_progress.py`(A 성공률 vs 게이트 조임, `docs/phase_a_progress.png`), `scripts/plot_nut_progress.py`(B 너트 체결 학습곡선, `docs/nut_fastening_progress.png`).
+
 ### 2026-06-08 — Robot B 너트 체결 v7→v10 (지표 정직화 · 충돌 · 경로추종)
 
 자세한 내용은 `docs/TRAINING_REPORT.md` §15.1b. 핵심만:
