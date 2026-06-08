@@ -400,6 +400,9 @@ class TyroEnv(gym.Env):
         # re-driven each step (the arm is a static fixture in this task).
         self._nut_target_idx = 0
         self._nut_fastened: List[int] = []
+        self._nut_premark = 0
+        # Index into ``_nut_order()`` of the current target bolt.
+        self._nut_seq_pos = 0
         self._nut_hold_count = 0
         self._nut_done = False
         self._nut_frozen_qA = None
@@ -840,16 +843,27 @@ class TyroEnv(gym.Env):
         # mass, so the frontier disappears. Earlier bolts are marked already
         # fastened; the hot-start teleports B to the chosen bolt's approach.
         n_bolts = len(self.handles.bolts)
-        start_bolt = 0
+        order = self._nut_order()
+        # Sequence position to begin the episode at. Normally 0 (start at the
+        # first bolt in the order); the reverse-curriculum random-bolt option
+        # may seed a later position so every transition gets training mass.
+        start_pos = 0
         if (
             bool(getattr(self.cfg, "nut_b_hotstart_random_bolt", False))
             and bool(getattr(self.cfg, "nut_b_hotstart_enable", False))
             and float(getattr(self.cfg, "nut_b_hotstart_alpha", 0.0)) > 1e-3
             and n_bolts > 0
         ):
-            start_bolt = int(self._np_random.integers(0, n_bolts))
-        self._nut_target_idx = start_bolt
-        self._nut_fastened = list(range(start_bolt))
+            start_pos = int(self._np_random.integers(0, len(order)))
+        self._nut_seq_pos = start_pos
+        self._nut_target_idx = order[start_pos]
+        # Bolts earlier in the order are pre-marked fastened.
+        self._nut_fastened = list(order[:start_pos])
+        # Count of bolts the episode STARTS with already fastened (random-bolt
+        # curriculum). ``n_fastened`` includes these, so subtract this to get
+        # the true policy-fastened count (the honest progress metric — the raw
+        # n_fastened was inflated by ~the mean random start position).
+        self._nut_premark = len(self._nut_fastened)
         self._nut_hold_count = 0
         self._nut_subphase = 0
         self._nut_macro_stage = 0
@@ -920,10 +934,12 @@ class TyroEnv(gym.Env):
         """Reverse-curriculum start pose for Robot B (nut task).
 
         ``alpha`` interpolates B's tool_tip start between its HOME pose
-        (``alpha = 0``) and bolt 0's approach point just outside the stud
-        tip (``alpha = 1``), with tool +Z aligned to the bolt axis so the
-        socket is oriented to insert. IK-teleports B and re-seeds its delta
-        accumulator so the first policy step continues from there.
+        (``alpha = 0``) and the **target bolt's approach point**, just outside
+        the stud tip (``alpha = 1``), with tool +Z aligned to the bolt axis so
+        the socket is oriented to insert. The target bolt at reset is the first
+        entry of ``nut_bolt_order`` (bolt 0), so the curriculum's easy start is
+        directly over bolt 0. IK-teleports B and re-seeds its delta accumulator
+        so the first policy step continues from there.
         """
         if not bool(getattr(self.cfg, "nut_b_hotstart_enable", False)):
             return
@@ -937,26 +953,90 @@ class TyroEnv(gym.Env):
         bolt_pos = np.asarray(self.scene.bolt_pose(idx)[0], dtype=np.float64)
         a = np.asarray(self.scene.bolt_axis(idx), dtype=np.float64)
         a = a / max(float(np.linalg.norm(a)), 1e-9)
-        # Approach point: on-axis at the staging depth (just outside the tip,
-        # incl. the −Y clearance margin) so the hot-start matches the gate.
-        approach = bolt_pos + a * self._nut_staging_axial()
+        if bool(getattr(self.cfg, "nut_b_hotstart_hub_center", False)):
+            # 2026-06-08 (v10) — start at the bolt-ring CENTER, backed off to
+            # the staging depth (NOT the hub face, which is unreachable with the
+            # +Y tool orientation). This point sits at a FIXED Y = staging depth
+            # and is equidistant (~0.21 m) to every bolt, so the approach to any
+            # bolt is a symmetric pure-XZ radial reach in the constant-Y plane —
+            # no bolt-0 bias, and the same skill transfers to all bolts.
+            n_b = len(self.handles.bolts)
+            ring_center = np.mean(
+                [np.asarray(self.scene.bolt_pose(i)[0], dtype=np.float64)
+                 for i in range(n_b)], axis=0,
+            )
+            approach = ring_center + a * self._nut_staging_axial()
+        else:
+            # Legacy: on-axis at the staging depth just outside the TARGET
+            # bolt's stud tip (directly over bolt 0 with the custom order).
+            approach = bolt_pos + a * self._nut_staging_axial()
         home_ee = np.asarray(rb.ee_pose()[0], dtype=np.float64)
         start_pos = (1.0 - alpha) * home_ee + alpha * approach
         want_z = -a  # tool +Z points into the bolt (insert direction)
-        target_quat = self._quat_align_tool_z(want_z)
+        base_quat = self._quat_align_tool_z(want_z)
 
+        # A single IK jump from HOME to the target frequently sticks in a folded
+        # local minimum (the target sits in the far/orientation-constrained part
+        # of the workspace), and the minimal-rotation roll is not always the
+        # reachable branch — the hub-CENTER start in particular needs a specific
+        # roll the single-quat solve misses (lands ~1 m off). So search a few
+        # rolls about ``want_z`` (a nut-runner spins freely, so roll is free),
+        # refine each iteratively from the HOME warm-start, and keep the
+        # solution with the smallest realised reach error.
         warm, _ = rb.joint_state()
-        ik = p.calculateInverseKinematics(
-            rb.uid, rb.EE_LINK_INDEX,
-            start_pos.tolist(), target_quat.tolist(),
-            lowerLimits=rb.arm.lower.tolist(),
-            upperLimits=rb.arm.upper.tolist(),
-            jointRanges=rb.arm.range.tolist(),
-            restPoses=warm.tolist(),
-            maxNumIterations=300, residualThreshold=1e-5,
-            physicsClientId=self.client,
-        )
-        ik = np.asarray(ik, dtype=np.float64)
+        warm = np.asarray(warm, dtype=np.float64)
+        n_roll = 12
+        best_ik = warm.copy()
+        best_err = 1e9
+        for ri in range(n_roll):
+            roll = 2.0 * math.pi * ri / n_roll
+            roll_q = np.asarray(
+                axisangle3_to_quat(want_z * roll), dtype=np.float64)
+            _, target_quat = p.multiplyTransforms(
+                [0.0, 0.0, 0.0], roll_q.tolist(),
+                [0.0, 0.0, 0.0], base_quat.tolist(),
+            )
+            ik = warm.copy()
+            for _ in range(12):
+                sol = p.calculateInverseKinematics(
+                    rb.uid, rb.EE_LINK_INDEX,
+                    start_pos.tolist(), list(target_quat),
+                    lowerLimits=rb.arm.lower.tolist(),
+                    upperLimits=rb.arm.upper.tolist(),
+                    jointRanges=rb.arm.range.tolist(),
+                    restPoses=np.asarray(ik, dtype=np.float64).tolist(),
+                    maxNumIterations=300, residualThreshold=1e-6,
+                    physicsClientId=self.client,
+                )
+                sol = np.asarray(sol, dtype=np.float64)
+                if not (rb._ik_arm_slots and len(sol) > max(rb._ik_arm_slots)):
+                    break
+                arm_sol = np.clip(sol[rb._ik_arm_slots], rb.arm.lower, rb.arm.upper)
+                for s, q in zip(rb.arm.indices, arm_sol):
+                    p.resetJointState(rb.uid, int(s), float(q),
+                                      targetVelocity=0.0,
+                                      physicsClientId=self.client)
+                ik = sol
+                if float(np.linalg.norm(
+                        np.asarray(rb.ee_pose()[0]) - start_pos)) < 0.01:
+                    break
+            err = float(np.linalg.norm(
+                np.asarray(rb.ee_pose()[0]) - start_pos))
+            if err < best_err:
+                best_err = err
+                best_ik = np.asarray(ik, dtype=np.float64).copy()
+            # Reset to HOME before trying the next roll so each solve starts
+            # from the same warm-start branch.
+            for s, q in zip(rb.arm.indices, warm):
+                p.resetJointState(rb.uid, int(s), float(q), targetVelocity=0.0,
+                                  physicsClientId=self.client)
+            if best_err < 0.01:
+                break
+        # Restore HOME joints; the block below re-applies the final solution.
+        for s, q in zip(rb.arm.indices, warm):
+            p.resetJointState(rb.uid, int(s), float(q), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        ik = best_ik
         if rb._ik_arm_slots and len(ik) > max(rb._ik_arm_slots):
             arm_q = np.clip(ik[rb._ik_arm_slots], rb.arm.lower, rb.arm.upper)
             for s, q in zip(rb.arm.indices, arm_q):
@@ -1203,6 +1283,89 @@ class TyroEnv(gym.Env):
                               physicsClientId=self.client)
         rb._cmd_q = None
         return best_q
+
+    def _nut_b_forearm_link(self) -> Optional[int]:
+        """Cached PyBullet link index of Robot B's ``forearm_link`` (the link
+        that collides with A's low arm). ``None`` if not found."""
+        if hasattr(self, "_b_forearm_link_cache"):
+            return self._b_forearm_link_cache
+        idx = None
+        rb = self.robot_B
+        try:
+            for li in range(p.getNumJoints(rb.uid, physicsClientId=self.client)):
+                nm = p.getJointInfo(rb.uid, li,
+                                    physicsClientId=self.client)[12].decode()
+                if nm == "forearm_link":
+                    idx = li
+                    break
+        except p.error:
+            idx = None
+        self._b_forearm_link_cache = idx
+        return idx
+
+    def _nut_order(self) -> List[int]:
+        """Resolved bolt-fastening order (a full permutation of all bolt
+        indices). Filters ``cfg.nut_bolt_order`` to valid indices, drops
+        duplicates, then appends any bolts missing from the list in ascending
+        order so the sequence always covers every bolt exactly once.
+        """
+        n = len(self.handles.bolts)
+        raw = getattr(self.cfg, "nut_bolt_order", tuple(range(n)))
+        order: List[int] = []
+        seen = set()
+        for k in raw:
+            k = int(k)
+            if 0 <= k < n and k not in seen:
+                order.append(k)
+                seen.add(k)
+        for k in range(n):
+            if k not in seen:
+                order.append(k)
+        return order
+
+    def _nut_ba_link_indices(self, uid: int) -> List[int]:
+        """Cached arm-link indices (> ``robot_ab_collision_min_link``) of a
+        robot, used for the joint-center clearance metric."""
+        cache = getattr(self, "_ba_link_idx_cache", None)
+        if cache is None:
+            cache = {}
+            self._ba_link_idx_cache = cache
+        if uid in cache:
+            return cache[uid]
+        min_link = int(getattr(self.cfg, "robot_ab_collision_min_link", 2))
+        idxs = [li for li in range(p.getNumJoints(uid, physicsClientId=self.client))
+                if li > min_link]
+        cache[uid] = idxs
+        return idxs
+
+    def _nut_ba_clearance(self) -> float:
+        """Minimum distance (m) between Robot A's and Robot B's **joint-center
+        points** (link frame origins), over the arm links past the base.
+
+        Joint-center (skeleton) separation is a smoother, mesh-independent
+        proxy for "how far B's arm is from A" than surface closest-points: link
+        origins move continuously with the joints so the reward gradient has no
+        mesh-facet discontinuities. Note the centers sit *inside* the links, so
+        even at hard contact this distance floors at roughly the sum of the
+        link radii (~0.3 m here) — the reward normalises against that floor.
+        """
+        if self.robot_A is None or self.robot_B is None:
+            return 1.0
+        a_idx = self._nut_ba_link_indices(self.robot_A.uid)
+        b_idx = self._nut_ba_link_indices(self.robot_B.uid)
+        a_pts = [np.asarray(p.getLinkState(
+            self.robot_A.uid, li, computeForwardKinematics=True,
+            physicsClientId=self.client)[4], dtype=np.float64) for li in a_idx]
+        b_pts = [np.asarray(p.getLinkState(
+            self.robot_B.uid, li, computeForwardKinematics=True,
+            physicsClientId=self.client)[4], dtype=np.float64) for li in b_idx]
+        best = 1e9
+        for pa in a_pts:
+            for pb in b_pts:
+                d = float(np.linalg.norm(pa - pb))
+                if d < best:
+                    best = d
+        return best if best < 1e8 else 1.0
 
     def _filter_nut_socket_collisions(self) -> None:
         """Disable Robot-B ↔ hub & tire collision for the geometric nut task.
@@ -1489,10 +1652,15 @@ class TyroEnv(gym.Env):
                     self._nut_done = True
                     events["all_fastened"] = True
                 else:
-                    nxt = idx + 1
-                    while nxt < n and nxt in self._nut_fastened:
-                        nxt += 1
-                    self._nut_target_idx = min(nxt, n - 1)
+                    # Advance along the explicit fastening order, skipping any
+                    # positions whose bolt is already fastened.
+                    order = self._nut_order()
+                    self._nut_seq_pos += 1
+                    while (self._nut_seq_pos < len(order)
+                           and order[self._nut_seq_pos] in self._nut_fastened):
+                        self._nut_seq_pos += 1
+                    self._nut_seq_pos = min(self._nut_seq_pos, len(order) - 1)
+                    self._nut_target_idx = order[self._nut_seq_pos]
                     self.handles.target_bolt_idx = self._nut_target_idx
                     self._set_bolt_color(
                         self._nut_target_idx, self._NUT_COLOR_TARGET
@@ -4340,6 +4508,9 @@ class TyroEnv(gym.Env):
         b.theta_B = float(theta_B)
         b.nut_target_idx = idx
         b.n_fastened = len(self._nut_fastened)
+        b.n_fastened_policy = len(self._nut_fastened) - int(
+            getattr(self, "_nut_premark", 0)
+        )
         b.nut_lateral = float(lateral)
         b.nut_axial = float(axial)
         b.nut_subphase = int(self._nut_subphase)
@@ -4401,6 +4572,29 @@ class TyroEnv(gym.Env):
             b.pb_nut = float(pb_nut)
             self._prev_lateral_B = float(lateral)
             self._prev_axial_err_B = float(axial_err)
+
+            # Soft answer-path adherence: keep the tool in the constant-Y
+            # staging plane (the in-plane hub-and-spoke route). plane_y = Y of
+            # the target bolt's on-axis staging point; all bolts share it.
+            w_path = float(getattr(rcfg, "w_nut_path", 0.0))
+            if w_path > 0.0:
+                plane_y = float(
+                    self._nut_point_on_axis(idx, staging_axial)[1]
+                )
+                ee_y = float(self.robot_B.ee_pose()[0][1])
+                y_dev = abs(ee_y - plane_y)
+                path_decay = max(
+                    float(getattr(rcfg, "nut_path_decay", 0.10)), 1e-3,
+                )
+                b.nut_path = w_path * float(np.exp(-y_dev / path_decay))
+                b.nut_path_dev = float(y_dev)
+            # Minimal-joint-change: penalise arm joint speed in joint space.
+            w_jv = float(getattr(rcfg, "w_nut_joint_vel", 0.0))
+            if w_jv > 0.0:
+                _, dqB = self.robot_B.joint_state()  # arm joints only
+                b.nut_joint_vel = -w_jv * float(
+                    np.linalg.norm(np.asarray(dqB, dtype=np.float64))
+                )
         else:
             # MACRO — env-driven; no policy-shaping dense terms.
             b.nut_align = 0.0
@@ -4408,6 +4602,9 @@ class TyroEnv(gym.Env):
             b.nut_reach = 0.0
             b.nut_axial_term = 0.0
             b.pb_nut = 0.0
+            b.nut_path = 0.0
+            b.nut_path_dev = 0.0
+            b.nut_joint_vel = 0.0
             # Drop APPROACH potentials so the next APPROACH (next bolt) starts
             # fresh and does not pay a spurious jump across the macro window.
             self._prev_lateral_B = None
@@ -4424,11 +4621,49 @@ class TyroEnv(gym.Env):
             b.fsm_bonus += float(rcfg.R_all_fastened)
             b.is_success = True
 
+        # B↔A clearance shaping (both phases): a saturating positive bonus for
+        # keeping Robot B's arm away from Robot A. Lets the policy discover a
+        # collision-free fastening configuration on its own (replaces the
+        # forced "arm-up" IK branch). Uses joint-center (skeleton) separation,
+        # normalised between a floor (≈ joint-center distance at hard contact)
+        # and a cap (well-separated): 0 at/below floor, 1 at/above cap.
+        #
+        # 2026-06-08 — ENGAGEMENT GATE. The ungated bonus was farmable: after the
+        # hot-started bolt-0 freebie, the policy discovered that fleeing the hub
+        # (B↔A dist ≈ 1.1 m, bonus saturated) paid +0.6/step forever, which beat
+        # the hard, locally-dead approach gradient toward the next bolt (at
+        # lateral ≈ 1 m both the lateral kernel and the coax-gated reach are ~0,
+        # so nothing pulled B back in). Result: bolt 0 fastened, then camp →
+        # n_fastened stuck at 1. The clearance reward is only meaningful WHILE B
+        # is actually at the bolt working, so gate it by proximity to the target
+        # staging point: ``exp(-d_engage / scale)``. Camping far away ⇒ gate ≈ 0
+        # ⇒ no farmable bonus; at/near staging ⇒ gate ≈ 1 ⇒ full "keep the arm
+        # clear of A while fastening" incentive (the user's actual intent).
+        floor = float(getattr(rcfg, "nut_ba_clear_floor", 0.30))
+        cap = float(getattr(rcfg, "nut_ba_clear_cap", 0.60))
+        span = max(cap - floor, 1e-3)
+        w_ba = float(getattr(rcfg, "w_nut_ba_clear", 0.0))
+        d_ba = self._nut_ba_clearance()
+        b.nut_ba_dist = float(d_ba)
+        engage_scale = max(
+            float(getattr(rcfg, "nut_ba_clear_engage_scale", 0.35)), 1e-3,
+        )
+        # True (unweighted) Euclidean tool→staging distance; 0 at the work point.
+        d_engage = float(math.hypot(axial - staging_axial, lateral))
+        engage = float(np.exp(-d_engage / engage_scale))
+        b.nut_ba_clear = (
+            w_ba * float(np.clip((d_ba - floor) / span, 0.0, 1.0)) * engage
+        )
+
         # Safety penalties stay on in both phases. Action/jerk L2 only makes
         # sense while the policy controls B (APPROACH); during the forced
         # macro the policy is ignored, so penalising its (dead) outputs would
         # inject spurious negative reward across the whole tighten window.
-        b.collision = rewards.collision_penalty(in_collision, rcfg)
+        # Use the stronger dedicated nut collision penalty (the shared
+        # w_collision was too weak to dominate the dense reach reward).
+        w_nut_col = float(getattr(rcfg, "w_nut_collision",
+                                  float(rcfg.w_collision)))
+        b.collision = -w_nut_col if in_collision else 0.0
         b.workspace = rewards.workspace_penalty(out_of_workspace, rcfg)
         if not macro:
             action_mask = self._build_action_mask()
@@ -4442,7 +4677,8 @@ class TyroEnv(gym.Env):
 
         dense = (
             b.nut_reach + b.nut_align + b.nut_lateral_term + b.nut_axial_term
-            + b.pb_nut + b.collision + b.workspace + b.action + b.jerk
+            + b.pb_nut + b.nut_ba_clear + b.collision + b.workspace
+            + b.action + b.jerk + b.nut_path + b.nut_joint_vel
         )
         b.dense_total_pre_mix = float(dense)
         b.step_alive = -float(getattr(rcfg, "w_step_alive", 0.0))

@@ -1591,6 +1591,30 @@ def main() -> int:
     vec = VecMonitor(vec, filename=str(out_dir / "monitor.csv"),
                      info_keywords=("is_success", "termination"))
 
+    # --- Learner thread pool (CPU utilisation fix) --------------------------
+    # SubprocVecEnv workers are spawned above with OMP_NUM_THREADS=1 (set in the
+    # launch script) so the parallel rollout doesn't oversubscribe cores. But
+    # that same env var also pins THIS (main) process — which runs the single-
+    # process PPO gradient update — to one thread. The result: during every
+    # update all rollout workers idle while one core does the matmuls, so ~half
+    # the wall-clock leaves the box >90% idle (observed: vmstat ``r`` oscillating
+    # 88↔3, ~48% user). Re-enabling multiple torch threads *only in the main
+    # process* (workers already spawned, unaffected) parallelises the update and
+    # roughly doubles throughput without oversubscribing the rollout. Tunable via
+    # TYRO_LEARNER_THREADS (default: a slice of the box left free during update).
+    if args.device == "cpu":
+        import os as _os
+        import torch as _torch
+        _lt = int(_os.environ.get("TYRO_LEARNER_THREADS", "0") or 0)
+        if _lt <= 0:
+            # During the update the rollout workers are idle, so the whole box
+            # is free — but the small MLP matmuls (batch≈1024) stop scaling past
+            # ~16 threads, so cap there to avoid thread-spawn overhead.
+            _lt = max(1, min(16, _os.cpu_count() or 1))
+        _torch.set_num_threads(_lt)
+        print(f"[train] learner torch threads = {_lt} "
+              f"(num_envs={args.num_envs}, cpus={_os.cpu_count()})")
+
     # Skip the eval env entirely when EvalCallback is disabled — PyBullet
     # connect + URDF load is non-trivial and otherwise wasted.
     if args.no_eval_callback:

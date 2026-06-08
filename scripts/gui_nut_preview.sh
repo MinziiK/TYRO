@@ -20,6 +20,15 @@ EXTRA=()
 if [[ -f data/nut_mount_endpose.npz ]]; then
   EXTRA+=(--endpose data/nut_mount_endpose.npz)
 fi
+if [[ "$MODE" == "replay" ]]; then
+  TRAJ="${2:-/tmp/nut_traj.npz}"
+  EXTRA+=(--traj "$TRAJ" --step-sleep 0.03)
+fi
+if [[ "$MODE" == "policy" ]]; then
+  MODEL="${2:-runs/nut_fastening_v5/final.zip}"
+  EXTRA+=(--model "$MODEL" --alpha 0.0 --max-steps 600 --step-sleep 0.03)
+  export OMP_NUM_THREADS=1
+fi
 
-echo "[gui] DISPLAY=$DISPLAY  mode=$MODE"
-python -u -m scripts.preview_nut_fastening --mode "$MODE" "${EXTRA[@]}"
+echo "[gui] DISPLAY=$DISPLAY  mode=$MODE  extra=${EXTRA[*]}"
+exec python -u -m scripts.preview_nut_fastening --mode "$MODE" "${EXTRA[@]}"

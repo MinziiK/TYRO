@@ -63,7 +63,8 @@ class RewardBreakdown:
     nut_reach: float = 0.0    # w_nut_reach * exp(-d_B / decay)
     nut_align: float = 0.0    # w_nut_align * exp(-theta_B / decay)
     pb_nut: float = 0.0       # PB shaping on Δd_B toward the target bolt
-    n_fastened: int = 0       # bolts fastened so far this episode
+    n_fastened: int = 0       # bolts fastened so far this episode (incl. premark)
+    n_fastened_policy: int = 0  # bolts fastened BY THE POLICY (excl. premark)
     nut_target_idx: int = -1  # current target bolt index
     # insertion-retract diagnostics
     nut_lateral_term: float = 0.0  # w_nut_lateral * exp(-lateral / decay)
@@ -71,6 +72,11 @@ class RewardBreakdown:
     nut_lateral: float = 0.0       # tool_tip distance off the bolt axis (m)
     nut_axial: float = 0.0         # signed tool_tip depth along bolt axis (m)
     nut_subphase: int = 0          # 0 = inserting/hold, 1 = retracting
+    nut_ba_clear: float = 0.0      # B↔A clearance bonus (saturating)
+    nut_ba_dist: float = 0.0       # B↔A closest-point distance diagnostic (m)
+    nut_path: float = 0.0          # soft answer-path adherence bonus (in-plane)
+    nut_path_dev: float = 0.0      # |ee_y - staging-plane Y| diagnostic (m)
+    nut_joint_vel: float = 0.0     # -w * ||dq_B|| minimal-joint-change penalty
 
 
 def align_reward(tire_pos, hub_pos, tire_axis, hub_axis,

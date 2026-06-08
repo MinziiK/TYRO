@@ -561,6 +561,18 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
 
+### 2026-06-08 — Robot B 너트 체결 v7→v10 (지표 정직화 · 충돌 · 경로추종)
+
+자세한 내용은 `docs/TRAINING_REPORT.md` §15.1b. 핵심만:
+
+- **지표 정직화**: `nut_b_hotstart_random_bolt=True`의 premark가 `n_fastened`를 ~4.5로 부풀림(실제 정책 체결 0). `n_fastened_policy`(premark 제외) 지표 추가 + **`random_bolt=False`**(항상 bolt 0 cold-start). 진짜 지표 = `n_fastened_policy` / `eval/success_rate`.
+- **Dense farming 제거 (v7→v8)**: 정책이 볼트 ~12 cm 옆에 주차해 dense reward(~1080/ep)를 farming → 체결(~945)보다 이득. dense kernel 축소 + sparse 대폭 상향(`R_arrive 40·R_insert 60·R_fasten 120·R_all 500`) + `w_pb_nut 14`.
+- **충돌 보상 재정의 (v9)**: `w_nut_ba_clear`는 **joint-center 거리**라 하드 충돌 시도 ~0.3 m 바닥 → 아래쪽 볼트(bolt 5, 실측 표면 6 cm) 좁은 통로 회피 gradient 없음. **`w_nut_ba_clear=0`(제거)**, 실제 접촉 페널티 **`w_nut_collision=40`만 유지**, **`ent_coef 0→0.008`** 탐험 강화.
+- **Oracle E2E 검증**: `scripts/e2e_nut_oracle.py` — 커스텀 순서 `(0,5,7,2,3,8,9,4,6,1)` + **XZ-only transit(Y 고정)** 경로를 teleport로 검증 → **10/10, A-B 충돌 0**. 경로·FSM·IK는 충돌-free로 실행 가능 확인.
+- **허브 중앙 hot-start (v10)**: `nut_b_hotstart_hub_center=True` — alpha=1.0 시 bolt 0 위가 아닌 **볼트 링 중앙 (0,-0.21,0)**. 모든 볼트까지 균등 0.21 m·Y 고정 → 대칭 XZ 방사 접근(bolt-0 편향 제거). hot-start IK는 roll 스윕으로 보강(중앙점 IK 0.6 cm).
+- **Soft 경로추종 + 최소 관절 (v10)**: `w_nut_path=0.6`(툴 Y를 staging 평면 −0.21에 유지, APPROACH만) + `w_nut_joint_vel=0.02`(관절속도 페널티). 체결 트리거는 기존 +Y 캡처 게이트(8 cm + 12°) 유지. hot-start `alpha_end 0.0→0.25`·`ramp 2.0M→2.5M`(v9 alpha→0 붕괴 대응).
+- **스크립트**: `scripts/run_b_nut_train_v10.sh`, `scripts/e2e_nut_oracle.py`, `scripts/record_nut_traj.py`. 정답 경로 시각화(`preview_nut_fastening.py`)는 `HOME → 허브 중앙 → 볼트들 → HOME` 허브앤스포크로 갱신.
+
 ### 2026-06-06 — 허브 원점 · UR10e 너트러너 · palm-up 캐리 · 검증 스크립트
 
 - **좌표**: 전 씬을 허브 중심 `(0,0,0)` 으로 평행이동 (`obs_reference_pos` 동일). Robot B `(0.90, −0.95, −0.30)`.

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import pybullet as p
+from stable_baselines3 import PPO  # noqa: E402  (match src.eval import order)
 
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
@@ -129,6 +130,124 @@ def _teleport_b(env: TyroEnv, q: np.ndarray) -> None:
     robot.last_target_pos = robot.ee_pose()[0].copy()
 
 
+def _compute_ref_waypoints(env: TyroEnv) -> tuple:
+    """Analytic per-bolt waypoints along each bolt axis (staging/base/retract).
+
+    All bolts on this hub share the same world Y and a common −Y axis, so
+    inter-bolt transit is purely in XZ at a fixed staging/retract altitude.
+    """
+    order = env._nut_order()
+    L = float(getattr(env.cfg, "bolt_length", 0.10))
+    retract_clear = float(getattr(env.cfg, "nut_retract_clear", 0.03))
+    margin = float(getattr(env.cfg, "nut_insert_margin", 0.0))
+    stage_ax = float(env._nut_staging_axial())
+    retr_ax = 0.5 * L + retract_clear + 0.03 + margin
+    ref_stage, ref_base, ref_retract, ref_order = [], [], [], []
+    for bi in order:
+        ref_stage.append(env._nut_point_on_axis(bi, stage_ax))
+        ref_base.append(env._nut_point_on_axis(bi, -0.5 * L))
+        ref_retract.append(env._nut_point_on_axis(bi, retr_ax))
+        ref_order.append(int(bi))
+    home_ee = np.asarray(env.robot_B.ee_pose()[0], dtype=np.float64)
+    # Hub-and-spoke center: bolt-ring centroid at the staging depth (the
+    # hot-start start pose). All bolt staging points share this Y, so every
+    # spoke (center→bolt, bolt→center) is a pure-XZ radial move at fixed Y.
+    n_b = len(env.handles.bolts)
+    centroid = np.mean(
+        [np.asarray(env.scene.bolt_pose(i)[0], dtype=np.float64)
+         for i in range(n_b)], axis=0,
+    )
+    a = np.asarray(env.scene.bolt_axis(int(order[0])), dtype=np.float64)
+    a = a / max(float(np.linalg.norm(a)), 1e-9)
+    ref_center = centroid + a * stage_ax
+    return home_ee, ref_stage, ref_base, ref_retract, ref_order, ref_center
+
+
+def _draw_ref_path(
+    cid: int,
+    home_ee: np.ndarray,
+    ref_stage: list,
+    ref_base: list,
+    ref_retract: list,
+    ref_ord: list,
+    ref_center: np.ndarray = None,
+) -> None:
+    """Draw the ideal nut-fastening route in the debug visualizer.
+
+    Route: HOME → hub CENTER (one-time) → bolt0 → bolt5 → … (the center is
+    visited only once, at the start; thereafter bolt-to-bolt is direct).
+
+    * grey-blue  HOME → hub center → first staging (one-time approach)
+    * orange     insert: staging → hub-face base (−Y along bolt axis)
+    * yellow     retract: base → past stud tip (+Y along bolt axis)
+    * cyan       inter-bolt transit: XZ only at fixed retract Y (no Y travel
+                 between bolts — all studs share the same hub Y / −Y axis)
+    """
+    if not ref_stage:
+        return
+    first_stage = np.asarray(ref_stage[0]).tolist()
+    if ref_center is not None:
+        # HOME → hub center (one-time), then center → first bolt staging.
+        c = np.asarray(ref_center, dtype=np.float64)
+        p.addUserDebugLine(
+            home_ee.tolist(), c.tolist(),
+            lineColorRGB=[0.5, 0.5, 1.0], lineWidth=1.5, physicsClientId=cid,
+        )
+        p.addUserDebugLine(
+            c.tolist(), first_stage,
+            lineColorRGB=[0.5, 0.5, 1.0], lineWidth=1.5, physicsClientId=cid,
+        )
+        p.addUserDebugText(
+            "center", c.tolist(),
+            textColorRGB=[0.6, 0.6, 1.0], textSize=1.2, physicsClientId=cid,
+        )
+    else:
+        p.addUserDebugLine(
+            home_ee.tolist(), first_stage,
+            lineColorRGB=[0.5, 0.5, 1.0], lineWidth=1.5, physicsClientId=cid,
+        )
+    for k in range(len(ref_stage)):
+        stage = np.asarray(ref_stage[k], dtype=np.float64)
+        base = np.asarray(ref_base[k], dtype=np.float64)
+        retr = np.asarray(ref_retract[k], dtype=np.float64)
+        p.addUserDebugLine(
+            stage.tolist(), base.tolist(),
+            lineColorRGB=[1.0, 0.55, 0.0], lineWidth=3.0, physicsClientId=cid,
+        )
+        p.addUserDebugLine(
+            base.tolist(), retr.tolist(),
+            lineColorRGB=[1.0, 1.0, 0.0], lineWidth=2.0, physicsClientId=cid,
+        )
+        p.addUserDebugText(
+            f"{k}:b{ref_ord[k]}", stage.tolist(),
+            textColorRGB=[1.0, 1.0, 0.2], textSize=1.2, physicsClientId=cid,
+        )
+        if k + 1 < len(ref_stage):
+            ns = np.asarray(ref_stage[k + 1], dtype=np.float64)
+            # Circumferential hop: hold Y, move only in XZ to above the next bolt.
+            hop = np.array([ns[0], retr[1], ns[2]], dtype=np.float64)
+            p.addUserDebugLine(
+                retr.tolist(), hop.tolist(),
+                lineColorRGB=[0.0, 0.9, 1.0], lineWidth=2.0, physicsClientId=cid,
+            )
+            if float(np.linalg.norm(ns - hop)) > 1e-4:
+                # Tiny coaxial slide onto the next staging point (≈1 cm ΔY here).
+                p.addUserDebugLine(
+                    hop.tolist(), ns.tolist(),
+                    lineColorRGB=[0.0, 0.9, 1.0], lineWidth=2.0,
+                    physicsClientId=cid,
+                )
+    # Closing leg: last bolt retract → HOME (return to spawn pose).
+    last_retr = np.asarray(ref_retract[-1], dtype=np.float64)
+    p.addUserDebugLine(
+        last_retr.tolist(), home_ee.tolist(),
+        lineColorRGB=[0.5, 0.5, 1.0], lineWidth=1.5, physicsClientId=cid,
+    )
+    print(f"  [ref] answer path: HOME→center→{ref_ord}→HOME  "
+          f"cyan=XZ transit (Y fixed)  orange=insert  yellow=retract  "
+          f"grey-blue=HOME/center legs")
+
+
 def _frame_camera(env: TyroEnv) -> None:
     hub, _ = env.scene.hub_pose()
     hub = np.asarray(hub, dtype=np.float64)
@@ -180,39 +299,36 @@ def _hold_at(env: TyroEnv, q: np.ndarray, n_steps: int, step_sleep: float,
 
 
 def _run_oracle(env: TyroEnv, hold_steps: int, step_sleep: float) -> None:
+    from scripts.e2e_nut_oracle import _bolt_poses, _want_z
+
     n = len(env.handles.bolts)
     hold_need = int(hold_steps)
+    order = env._nut_order()
     L = float(env.cfg.bolt_length)
-    standoff = float(getattr(env.cfg, "nut_insert_standoff", 0.05))
-    retract_clear = float(getattr(env.cfg, "nut_retract_clear", 0.03))
-    print(f"[preview] oracle insertion-retract: {n} bolts, "
+    print(f"[preview] oracle insertion-retract: {n} bolts, order={order}, "
           f"hold={hold_need} steps ({hold_need * 0.05:.1f}s), "
-          f"bolt_len={L*100:.0f}cm")
-    for i in range(n):
-        env.robot_B.reset_to_home()
-        bp = np.asarray(env.scene.bolt_pose(i)[0], dtype=np.float64)
-        a = np.asarray(env.scene.bolt_axis(i), dtype=np.float64)
-        a = a / max(float(np.linalg.norm(a)), 1e-9)
-        want_z = -a  # tool +Z points INTO the bolt (the +Y entry direction)
-
-        # Stage poses along the bolt axis:
-        approach_pos = bp + a * (0.5 * L + standoff)   # outside the tip
-        insert_pos = bp - a * (0.5 * L)                # hub-face base (seated)
-        # Aim the retract target a margin BEYOND the gate threshold
-        # (L/2 + clear) so IK jitter can't leave it just short of clearing.
-        retract_pos = bp + a * (0.5 * L + retract_clear + 0.03)
-
-        # APPROACH — stage on-axis just outside the stud tip.
-        q_app = _best_b_ik(env, approach_pos, want_z, seed_key=i)
-        _hold_at(env, q_app, 4, step_sleep)
+          f"bolt_len={L*100:.0f}cm  (XZ transit between bolts)")
+    prev_retr = None
+    seq = 0
+    while len(env._nut_fastened) < n and seq < n + 2:
+        i = int(env._nut_target_idx)
+        want_z = _want_z(env, i)
+        approach, insert, retract = _bolt_poses(env, i)
+        if prev_retr is None:
+            q_app = _best_b_ik(env, approach, want_z, seed_key=i)
+            _hold_at(env, q_app, 4, step_sleep)
+        else:
+            hop = np.array([approach[0], prev_retr[1], approach[2]], dtype=np.float64)
+            for k, pos in enumerate((hop, approach) if np.linalg.norm(hop - approach) > 1e-4 else (hop,)):
+                q = _best_b_ik(env, pos, want_z, seed_key=i * 10 + k + 1)
+                _hold_at(env, q, 3, step_sleep)
         ax, lat, th = env._nut_axial_lateral(i)
         print(f"  bolt {i:2d} APPROACH  axial={ax*100:+5.1f}cm "
               f"lat={lat*100:.1f}cm ang={np.degrees(th):.1f}deg")
 
-        # INSERT&HOLD — drive +Y down the axis to the base and dwell.
-        q_ins = _best_b_ik(env, insert_pos, want_z, seed_key=i)
-        ax, lat, th = (lambda: (_teleport_b(env, q_ins),
-                                env._nut_axial_lateral(i))[1])()
+        q_ins = _best_b_ik(env, insert, want_z, seed_key=i)
+        _teleport_b(env, q_ins)
+        ax, lat, th = env._nut_axial_lateral(i)
         print(f"  bolt {i:2d} INSERT    axial={ax*100:+5.1f}cm "
               f"lat={lat*100:.1f}cm ang={np.degrees(th):.1f}deg "
               f"(base target={-50*L:+.1f}cm)")
@@ -226,19 +342,130 @@ def _run_oracle(env: TyroEnv, hold_steps: int, step_sleep: float) -> None:
         print(f"  bolt {i:2d} {'SEATED' if seated else 'MISS-insert'} "
               f"(subphase={env._nut_subphase})")
 
-        # RETRACT — back out −Y past the tip + clearance.
-        q_ret = _best_b_ik(env, retract_pos, want_z, seed_key=i)
+        q_ret = _best_b_ik(env, retract, want_z, seed_key=i)
         done, trunc, info = _hold_at(env, q_ret, 10, step_sleep,
                                      stop_on_fasten_change=True)
         ax, lat, th = env._nut_axial_lateral(i)
         cleared = i in env._nut_fastened
         print(f"  bolt {i:2d} {'RETRACTED' if cleared else 'MISS-retract'} "
               f"axial={ax*100:+5.1f}cm  (fastened {len(env._nut_fastened)}/{n})")
+        prev_retr = retract
+        seq += 1
         if done or trunc:
             print(f"  [preview] ended at bolt {i} (retract): "
                   f"{info.get('termination', 'done')}")
             return
     print(f"[preview] complete — fastened {len(env._nut_fastened)}/{n}")
+
+
+def _run_policy(env: TyroEnv, model, obs, alpha: float,
+                max_steps: int, step_sleep: float) -> None:
+    """Roll out a trained PPO policy and watch where it stalls.
+
+    NOTE: the env must already be reset by the caller (with the desired
+    hot-start alpha set *before* that reset) and the resulting ``obs`` passed
+    in. Calling env.reset() a second time here while the GUI render thread is
+    live re-creates PyBullet bodies and segfaults llvmpipe.
+    """
+    n = len(env.handles.bolts)
+    print(f"[preview] policy rollout")
+    print(f"  hotstart_alpha={alpha:.2f}  (0=cold/real, 1=at-bolt)")
+    last_tgt = int(env._nut_target_idx)
+    last_f = len(env._nut_fastened)
+    for t in range(max_steps):
+        a, _ = model.predict(obs, deterministic=True)
+        obs, r, done, trunc, info = env.step(a)
+        if step_sleep > 0:
+            time.sleep(step_sleep)
+        idx = int(env._nut_target_idx)
+        nf = len(env._nut_fastened)
+        if nf != last_f:
+            print(f"  step {t+1:4d}: FASTENED bolt -> {nf}/{n} "
+                  f"(now targeting bolt {idx})")
+            last_f = nf
+        elif idx != last_tgt:
+            print(f"  step {t+1:4d}: target bolt {last_tgt} -> {idx}")
+        last_tgt = idx
+        if (t + 1) % 50 == 0:
+            ax, lat, th = env._nut_axial_lateral(idx)
+            print(f"  step {t+1:4d}: target=bolt{idx}  "
+                  f"axial={ax*100:+5.1f}cm lat={lat*100:.1f}cm "
+                  f"ang={np.degrees(th):.1f}deg  fastened={nf}/{n}")
+        if done or trunc:
+            print(f"  ended @ step {t+1}: {info.get('termination', 'done')}  "
+                  f"fastened={nf}/{n}")
+            break
+    print(f"[preview] policy done — fastened {len(env._nut_fastened)}/{n}, "
+          f"stalled at bolt {int(env._nut_target_idx)}")
+
+
+def _run_replay(env: TyroEnv, traj_path: str, step_sleep: float,
+                loop: bool = True) -> None:
+    """Replay a recorded policy trajectory in the LIVE interactive GUI.
+
+    The pybullet window stays fully interactive (mouse rotate/zoom) — only the
+    robot/tire poses are driven from the recording, so no torch lives in this
+    process and the GL render thread never races/segfaults. Bolt colors track
+    the recorded fastened-count.
+    """
+    d = np.load(traj_path)
+    qB, qA = d["qB"], d["qA"]
+    tpos, torn = d["tpos"], d["torn"]
+    nf, tgt = d["nf"], d["tgt"]
+    bidx = [int(x) for x in d["bidx"]]
+    aidx = [int(x) for x in d["aidx"]]
+    T = len(qB)
+    n = len(env.handles.bolts)
+    print(f"[preview] REPLAY {T} frames  (recorded final {int(nf[-1])}/{n}, "
+          f"max {int(nf.max())}/{n})  alpha={float(d['alpha']):.2f}")
+    print("  GUI is LIVE — drag mouse to rotate, scroll to zoom.")
+
+    rb, ra = env.robot_B, env.robot_A
+    cid = env.client
+
+    # Draw the analytic reference path from the live scene geometry (all bolts
+    # share hub Y / −Y axis → inter-bolt hops are XZ-only at fixed altitude).
+    (home_ee, ref_stage, ref_base, ref_retract, ref_ord,
+     ref_center) = _compute_ref_waypoints(env)
+    _draw_ref_path(cid, home_ee, ref_stage, ref_base, ref_retract, ref_ord,
+                   ref_center)
+
+    def set_frame(t: int) -> None:
+        for s, q in zip(bidx, qB[t]):
+            p.resetJointState(rb.uid, s, float(q), targetVelocity=0.0,
+                              physicsClientId=cid)
+        for s, q in zip(aidx, qA[t]):
+            p.resetJointState(ra.uid, s, float(q), targetVelocity=0.0,
+                              physicsClientId=cid)
+        p.resetBasePositionAndOrientation(
+            env.handles.tire, tpos[t].tolist(), torn[t].tolist(),
+            physicsClientId=cid)
+        k = int(nf[t])
+        cur = int(tgt[t])
+        for i in range(n):
+            if i < k:
+                env._set_bolt_color(i, env._NUT_COLOR_FASTENED)
+            elif i == cur:
+                env._set_bolt_color(i, (1.0, 1.0, 0.0, 1.0))
+            else:
+                env._set_bolt_color(i, (0.6, 0.6, 0.6, 1.0))
+
+    last_f = -1
+    while True:
+        for t in range(T):
+            set_frame(t)
+            if int(nf[t]) != last_f:
+                print(f"  frame {t:4d}: fastened {int(nf[t])}/{n}  "
+                      f"target=bolt{int(tgt[t])}")
+                last_f = int(nf[t])
+            p.stepSimulation(physicsClientId=cid)
+            if step_sleep > 0:
+                time.sleep(step_sleep)
+        if not loop:
+            break
+        print(f"  [replay] looping (recorded stalls at bolt {int(tgt[-1])}, "
+              f"{int(nf[-1])}/{n} fastened) — Ctrl-C to stop")
+        time.sleep(0.8)
 
 
 def _run_zero(env: TyroEnv, max_steps: int, step_sleep: float) -> None:
@@ -264,9 +491,17 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--mode", type=str, default="setup",
-        choices=("setup", "oracle", "zero"),
-        help="setup=static scene; oracle=IK bolt demo; zero=untrained rollout",
+        choices=("setup", "oracle", "zero", "policy", "replay"),
+        help="setup=static scene; oracle=IK bolt demo; "
+             "zero=untrained rollout; policy=trained PPO rollout (live torch); "
+             "replay=interactive replay of a recorded policy trajectory",
     )
+    ap.add_argument("--model", type=str, default=None,
+                    help="Path to trained PPO .zip (required for --mode policy).")
+    ap.add_argument("--traj", type=str, default=None,
+                    help="Recorded trajectory .npz (required for --mode replay).")
+    ap.add_argument("--alpha", type=float, default=0.0,
+                    help="hot-start alpha for policy mode (0=cold/real).")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--hold-steps", type=int, default=None,
                     help="Override nut_hold_steps for oracle (default: cfg value).")
@@ -289,8 +524,47 @@ def main() -> int:
     cfg = make_env_config(stage=3, phase=1, **overrides)
     hold = int(args.hold_steps if args.hold_steps is not None else cfg.nut_hold_steps)
 
-    env = TyroEnv(cfg=cfg, render=True, seed=args.seed)
-    env.reset(seed=args.seed)
+    # Load the PPO model BEFORE connecting the GUI/OpenGL context. Initializing
+    # torch after PyBullet's GUI renderer is live segfaults on the VNC display.
+    policy_model = None
+    if args.mode == "policy":
+        if not args.model:
+            print("[preview] --mode policy requires --model PATH")
+            return 2
+        policy_model = PPO.load(args.model, device="cpu")
+        try:
+            import torch
+            torch.set_num_threads(1)
+        except Exception:
+            pass
+
+    # Replay must reproduce the recorded scene (A pose, tire, bolts), so reset
+    # with the recording's seed/alpha.
+    reset_seed = args.seed
+    reset_alpha = args.alpha
+    if args.mode == "replay":
+        if not args.traj:
+            print("[preview] --mode replay requires --traj PATH")
+            return 2
+        _d = np.load(args.traj)
+        reset_seed = int(_d["seed"])
+        reset_alpha = float(_d["alpha"])
+
+    env = TyroEnv(cfg=cfg, render=True, seed=reset_seed)
+    # The nut reset re-creates bodies and runs ~640 IK solves with
+    # saveState/restoreState. With torch loaded, doing that while PyBullet's
+    # async GL render thread is actively drawing races and segfaults the
+    # render thread (intermittently). Freeze rendering across the heavy reset,
+    # then re-enable it for the live rollout.
+    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0,
+                               physicsClientId=env.client)
+    # Set the hot-start alpha BEFORE the (single) reset so policy mode never
+    # needs a second reset.
+    if args.mode in ("policy", "replay"):
+        env.set_nut_b_hotstart_alpha(float(reset_alpha))
+    reset_obs, _ = env.reset(seed=reset_seed)
+    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1,
+                               physicsClientId=env.client)
     _frame_camera(env)
 
     print("[preview] Robot-B nut-fastening GUI")
@@ -314,6 +588,20 @@ def main() -> int:
         try:
             while p.isConnected(env.client):
                 time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+    elif args.mode == "policy":
+        _run_policy(env, policy_model, reset_obs, float(args.alpha),
+                    int(args.max_steps), float(args.step_sleep))
+        print("[preview] GUI held open — close window or Ctrl-C to exit.")
+        try:
+            while p.isConnected(env.client):
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            pass
+    elif args.mode == "replay":
+        try:
+            _run_replay(env, args.traj, float(args.step_sleep), loop=True)
         except KeyboardInterrupt:
             pass
     else:

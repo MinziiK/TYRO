@@ -188,7 +188,16 @@ class RewardConfig:
     #: Positive reach kernel toward the current target bolt:
     #: ``w_nut_reach * exp(-d_B / nut_reach_decay)`` where d_B is the
     #: tool_tip→bolt distance. Bounded in [0, w_nut_reach].
-    w_nut_reach: float = 3.0
+    #: 2026-06-08 REBALANCE (3.0 → 0.5). The standing exp kernels (reach/
+    #: lateral/align/axial + clearance) summed to a dense "you're in a good
+    #: spot" reward of ~1.8/step that, over a 600-step episode (~1080), exceeded
+    #: the value of fastening all 10 bolts (~945). The policy correctly learned
+    #: to PARK near a bolt and farm dense reward instead of fastening (eval
+    #: success = 0 across the entire 3 M-step run, ep_len pinned at 600). Fix:
+    #: shrink the farmable standing kernels and lean on the (farm-proof)
+    #: potential-based ``pb_nut`` term for the approach gradient, while boosting
+    #: the sparse fasten bonuses so task completion dominates.
+    w_nut_reach: float = 0.5
     #: Lateral (off-axis) weight inside the APPROACH reach distance
     #: ``d_stage = hypot(axial_err, w * lateral)``. Retained for the d_B gate
     #: metric/logging; the APPROACH reward now uses an explicit two-stage
@@ -215,15 +224,23 @@ class RewardConfig:
     #: tightening the trigger gate added no matching pull to align; 18° gives
     #: a clear pull right where the gate closes (exp(-12/18)=0.51,
     #: exp(-5/18)=0.76) while still rewarding coarse alignment far out.
-    w_nut_align: float = 1.5
+    w_nut_align: float = 0.4  # 2026-06-08 REBALANCE (1.5 → 0.4): anti-farm.
     nut_align_decay_rad: float = np.deg2rad(18.0)
     #: Potential-based shaping on Δd_B (pays positively each step the
     #: tool closes on the target bolt). Reset across bolt advances.
-    w_pb_nut: float = 8.0
+    #: 2026-06-08 REBALANCE (8.0 → 14.0): PB shaping telescopes over a
+    #: trajectory (Σ = w·(d_start − d_end)) so it CANNOT be farmed by standing
+    #: still — it only pays for net progress toward the bolt and is negative
+    #: when retreating. Promoted to the primary approach driver now that the
+    #: standing exp kernels are shrunk, so the policy still gets a strong, dense
+    #: "get closer" gradient without a parkable plateau.
+    w_pb_nut: float = 14.0
     #: Sparse bonus paid once per bolt successfully fastened.
-    R_fasten: float = 50.0
+    #: 2026-06-08 REBALANCE (50 → 120): fastening must dominate dense farming.
+    R_fasten: float = 120.0
     #: Terminal success bonus paid once all ``n_bolts`` are fastened.
-    R_all_fastened: float = 300.0
+    #: 2026-06-08 REBALANCE (300 → 500).
+    R_all_fastened: float = 500.0
     # --- insertion-retract shaping (nut_fastening_task) -------------------
     #: Positive lateral kernel ``w_nut_lateral * exp(-lat / decay)`` where
     #: ``lat`` is the tool_tip distance off the bolt axis. Drives the
@@ -237,11 +254,71 @@ class RewardConfig:
     #: bolt 4, lateral 12 cm). 0.08 keeps a usable coaxial pull out to ~15 cm
     #: (``exp(-0.12/0.08)=0.22``) and the higher weight makes "get on the
     #: axis" compete with the raw reach term.
-    w_nut_lateral: float = 4.0
+    w_nut_lateral: float = 1.5  # 2026-06-08 REBALANCE (4.0 → 1.5): anti-farm,
+    #: but kept the largest of the standing kernels because getting ONTO the
+    #: bolt axis (small lateral) is the precision bottleneck for the arrive gate.
     nut_lateral_decay: float = 0.08
+    # --- Robot-B ↔ Robot-A clearance shaping (avoid A while fastening) -----
+    #: Instead of forcing an "arm-up" IK branch, teach the policy to keep
+    #: Robot B's arm clear of Robot A on its own: a positive, *saturating*
+    #: clearance bonus ``w_nut_ba_clear * clip((d_BA - floor)/(cap - floor),0,1)``
+    #: where ``d_BA`` is the minimum distance between B's and A's **joint-center
+    #: points** (skeleton separation — smoother & mesh-independent vs surface
+    #: closest-points). Because the centers sit inside the links, ``d_BA`` floors
+    #: near the sum of link radii at hard contact, so the bonus is normalised
+    #: between ``nut_ba_clear_floor`` (≈ contact, bonus→0) and ``nut_ba_clear_cap``
+    #: (comfortably clear, bonus→1). Measured staging clearances: ~0.43 m at the
+    #: tightest bolts (4,5) up to ~0.61 m at the open ones. Saturating at the cap
+    #: means once B is clear there is no incentive to flee further (it must still
+    #: approach the hub to fasten); below the cap a smooth gradient pulls B onto
+    #: higher-clearance approach corridors.
+    w_nut_ba_clear: float = 0.0  # 2026-06-08 (v9) REMOVED (0.4 → 0.0): the
+    #: joint-center clearance bonus is mesh-blind (floors at ~0.3 m even at hard
+    #: contact), so it gave almost no avoidance gradient in the tight ~6 cm
+    #: corridor at the bottom bolts while still constituting a parkable income.
+    #: Experiment: drop this shaping entirely, keep only the real-contact hard
+    #: penalty (w_nut_collision=40), and raise exploration (ent_coef) so the
+    #: policy finds collision-free joint angles on its own.
+    #: (history) 2026-06-08 REBALANCE (2.0 → 0.4): this was the single worst
+    #: farm — a saturating standing bonus paid every step B sat clear of A near
+    #: a bolt. The engagement gate already localised it to the work point.
+    nut_ba_clear_floor: float = 0.30
+    nut_ba_clear_cap: float = 0.60
+    #: 2026-06-08 — engagement gate length (m) for the clearance bonus. The
+    #: bonus is multiplied by ``exp(-d_engage / scale)`` where ``d_engage`` is
+    #: the Euclidean tool→target-staging distance, so the "keep clear of A"
+    #: reward is only earned while B is actually working the bolt — not by
+    #: fleeing the hub. ~0.35 m: full at staging, ≈0.06 once ~1 m away (the
+    #: camping distance that previously farmed the saturated bonus and stalled
+    #: n_fastened at 1). Without this gate the policy fastened bolt 0 (free via
+    #: hot-start) then camped far from A instead of approaching the next bolt.
+    nut_ba_clear_engage_scale: float = 0.35
+    #: Dedicated (stronger) per-step penalty for a Robot-B↔Robot-A bad
+    #: collision in the nut task. The shared ``w_collision`` (10) was too weak
+    #: to dominate the dense reach reward, so the policy tolerated grazing A.
+    #: Applied in both APPROACH and the forced macro.
+    w_nut_collision: float = 40.0
+    #: 2026-06-08 (v10) — soft ANSWER-PATH adherence bonus. All bolt staging
+    #: points share a fixed world Y (= staging plane), and the answer route
+    #: (HOME → hub center → bolts → HOME) moves within that constant-Y plane
+    #: (pure XZ transit). Reward B for keeping its tool Y near that plane during
+    #: APPROACH: ``w_nut_path * exp(-|ee_y - plane_y| / nut_path_decay)``. This
+    #: gently pulls B onto the in-plane hub-and-spoke route WITHOUT hard-forcing
+    #: it (the user wants "follow the path approximately"), so B still explores
+    #: joint angles freely while staying near the collision-free corridor.
+    #: Only applied in APPROACH (the macro intentionally moves along ±Y to
+    #: insert/retract, so an in-plane bonus there would fight the tighten).
+    w_nut_path: float = 0.6
+    nut_path_decay: float = 0.10  # m; full at plane, ~0.37 at 10 cm off-plane.
+    #: 2026-06-08 (v10) — minimal-joint-change penalty: ``-w_nut_joint_vel *
+    #: ||dq_B||`` over the arm joints during APPROACH. The user wants the path
+    #: followed with the least joint motion; the existing action/jerk penalties
+    #: act in EE-delta space, this adds a direct joint-space cost. Small so it
+    #: shapes smoothness without smothering the approach drive.
+    w_nut_joint_vel: float = 0.02
     #: Positive axial-progress kernel during INSERT: rewards driving the
     #: tool_tip to the bolt base (hub face) along the axis.
-    w_nut_axial: float = 2.0
+    w_nut_axial: float = 0.5  # 2026-06-08 REBALANCE (2.0 → 0.5): anti-farm.
     nut_axial_decay: float = 0.05
     #: Potential-based shaping on the RETRACT leg: pays positively per step
     #: the tool_tip backs out along +axis (−Y) toward clearing the stud.
@@ -249,10 +326,12 @@ class RewardConfig:
     #: Sparse bonus paid when the socket arrives coaxially + aligned at a
     #: bolt's staging point (triggers the scripted insert→hold→retract
     #: macro). This is the main signal the APPROACH policy chases.
-    R_arrive: float = 25.0
+    #: 2026-06-08 REBALANCE (25 → 40).
+    R_arrive: float = 40.0
     #: Sparse bonus paid when a bolt's INSERT+HOLD dwell completes (socket
     #: fully seated over the stud), before the retract leg.
-    R_insert: float = 30.0
+    #: 2026-06-08 REBALANCE (30 → 60).
+    R_insert: float = 60.0
 
     # Cooperation term: r_coop = w_c * exp(-alpha*d_A) * exp(-beta*d_B)
     w_c: float = 2.0
@@ -1117,8 +1196,9 @@ class EnvConfig:
     #: from either bore direction. 15° ≈ a forgiving coaxial seat.
     nut_align_tol_rad: float = np.deg2rad(15.0)
     #: Consecutive in-gate steps required before a bolt is registered as
-    #: fastened (models the run-down dwell). 12 ≈ 0.6 s at 20 Hz.
-    nut_hold_steps: int = 12
+    #: fastened (models the run-down dwell). 6 ≈ 0.3 s at 20 Hz (halved from
+    #: 12 for v6 — shorter dwell to speed the per-bolt cycle).
+    nut_hold_steps: int = 6
     # --- insertion-retract gate (the tighten cycle) ----------------------
     #: Max tool_tip distance off the bolt axis (m) admitted into the INSERT
     #: gate. The socket must enter coaxially (exactly along the bolt's Y
@@ -1136,11 +1216,19 @@ class EnvConfig:
     #: Standoff (m) beyond the bolt tip for the oracle/demo APPROACH pose
     #: (pre-insert staging point on the bolt axis). Unused by the policy.
     nut_insert_standoff: float = 0.05
-    #: When True, fasten bolts strictly in index order 0..n-1 (the env
-    #: forces ``target_bolt_idx = 0`` at reset and increments). When
-    #: False the per-episode random target is kept and a single bolt is
+    #: When True, fasten bolts strictly in the ``nut_bolt_order`` sequence
+    #: (the env forces the first entry at reset and advances along the list).
+    #: When False the per-episode random target is kept and a single bolt is
     #: trained (used for early single-bolt curriculum).
     nut_sequential: bool = True
+    #: Explicit bolt-fastening order (a permutation of the bolt indices). A
+    #: *balanced* / star-like order spreads the fastening around the lug
+    #: circle instead of walking it sequentially, which (a) mirrors how lug
+    #: nuts are torqued in practice and (b) gives the policy a more uniform
+    #: spatial spread of approach geometries early on. Entries outside the
+    #: actual bolt count are skipped; any bolts missing from the list are
+    #: appended in ascending index order so the sequence always covers all.
+    nut_bolt_order: tuple = (0, 5, 7, 2, 3, 8, 9, 4, 6, 1)
     #: Optional path to a ``.npz`` snapshot of Robot-A mount-completion
     #: poses (arrays ``qA`` [N,6], ``tire_pos`` [N,3], ``tire_orn`` [N,4]),
     #: produced by ``scripts/extract_mount_endpose.py`` from a trained mount
@@ -1167,6 +1255,16 @@ class EnvConfig:
     #: reverse-curriculum hot-start. The training callback ramps alpha
     #: 1 → 0 over ``nut_b_hotstart_*_steps``.
     nut_b_hotstart_enable: bool = True
+    #: 2026-06-08 (v10) — hot-start target = the **bolt-ring CENTER** at staging
+    #: depth, not the per-bolt approach point. Measured (0, -0.21, 0): reachable
+    #: (IK err 0.6 cm), no A↔B contact, and **equidistant (0.21 m) to all 10
+    #: bolts** at a **fixed Y = staging depth**. This removes the bolt-0 bias
+    #: (every bolt is now a symmetric pure-XZ radial reach in the constant-Y
+    #: plane) and matches the corrected "XZ-only transit at fixed Y" path. The
+    #: legacy per-bolt approach start floored bolt-0 as free while every other
+    #: bolt was unscaffolded; the center start makes the learned skill ("reach
+    #: radially to the target bolt at fixed Y") reusable for all bolts.
+    nut_b_hotstart_hub_center: bool = True
     #: Current hot-start interpolation (set per-rollout by the curriculum
     #: callback; the env reads it each reset). 1 = bolt approach, 0 = HOME.
     #: Default 0 = deployment/HOME so envs *without* the curriculum callback
@@ -1182,7 +1280,26 @@ class EnvConfig:
     #: advancing frontier (v2/v3 stuck at bolt 3, v4 at bolt 4) with the
     #: socket parked ~10 cm off the next bolt's axis. Uniform start gives
     #: every transition equal training mass and removes the frontier.
-    nut_b_hotstart_random_bolt: bool = True
+    #: 2026-06-08 — disabled, then RE-ENABLED. Disabling it (always start at
+    #: bolt 0) was meant to encourage bolt-specific approaches, but in practice
+    #: it meant ONLY bolt 0 ever received hot-start scaffolding: every episode
+    #: fastened bolt 0 trivially, then had to traverse to the next bolt
+    #: (bolt 5) entirely unscaffolded. At the ~1 m inter-bolt distance the
+    #: approach kernels (lateral exp(-d/0.08), coax-gated reach) are exactly 0,
+    #: so there was no gradient to learn that transition — n_fastened stalled
+    #: at 1 for the whole run (observed v7 @440k: nut_lateral pinned ~1 m,
+    #: max n_fastened = 1). Uniform random start gives EVERY bolt direct
+    #: hot-start training mass (start at a random order position k, bolts < k
+    #: pre-fastened, B teleported to bolt k's staging), so each bolt's approach
+    #: is learned; the alpha ramp then extends the start distance to stitch the
+    #: transitions into full sequential execution. This is the mechanism the
+    #: curriculum needs — re-enabled to get past bolt 0.
+    #: 2026-06-08 (v9) — DISABLED again for the collision-avoidance experiment:
+    #: always start at bolt 0 so the honest n_fastened_policy / eval success
+    #: reflect a true cold sequential run (no premark inflation), and the policy
+    #: must learn the full traverse + collision-free approach under raised
+    #: exploration (ent_coef) rather than leaning on per-bolt hot-start.
+    nut_b_hotstart_random_bolt: bool = False
     #: Per-joint motor torque caps (N·m) for Robot B during the nut task,
     #: overriding the tire-carrying default ([400,400,300,60,60,60]). The
     #: far-arc bolts need near-full extension where the default elbow cap is
@@ -2153,24 +2270,17 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: only WORSENS reach (hub is at +Y 0.20). ``obs_reference_pos`` stays at
     #: the world origin so the policy frame is unchanged.
     #: (scripts/validate_candidate_layout.py x=0 −y/z sweep.)
-    #: **2026-06-06 (nut-runner tool + B pushed -Y)** — a 30 cm socket
-    #: extension is bolted to the UR10e flange (``ur10e_with_nut_tool.urdf``,
-    #: ``ur10e_nut_tool_length=0.30``). The tool points +Z = +Y (toward the
-    #: hub), so it directly cancels a -Y base shift: with the tool, Robot B
-    #: can drive every bolt from a base ~0.6 m further -Y than bare, with the
-    #: worst-bolt 6-DOF IK ≈ 1 cm / <2°, while moving B off the carry/mount
-    #: corridor. (scripts: tool-length × base_y feasibility sweep.)
-    #: HUB-origin frame: B base was (0.0, -0.6, 1.0) in the B-origin frame;
-    #: + Δ(0.90, -0.20, -1.30) ⇒ (0.90, -0.80, -0.30).
-    cfg.ur10e_urdf = str(URDF_DIR / "ur10e_robot" / "ur10e_with_nut_tool.urdf")
-    cfg.ur10e_nut_tool_length = 0.30
-    #: **2026-06-06 (B nudged −Y for bolt-axis alignment + corridor margin)** —
-    #: shifted from y=−0.80 to −0.95. With the 30 cm nut-runner the tool +Z is
-    #: anti-parallel to the bolt axis (−Y), so pulling B further −Y *improves*
-    #: 6-DOF alignment (roll-free worst-bolt IK 0.66 cm/1.53° → 0.65 cm/0.42°)
-    #: while moving B further off the carry/mount corridor. All 10 bolts stay
-    #: reachable (worst ≤ 1 cm / < 1°). (focused −Y feasibility sweep.)
-    cfg.robot_B_base_pos = (0.90, -0.95, -0.30)
+    #: **2026-06-08 (v6 nut layout — shorter tool + raised B)** — nut-runner
+    #: shortened to ``bolt_length`` (10 cm) so B's forearm stays higher on the
+    #: far arc; base Z raised to hub centre (0.0) and shifted +Y by the 20 cm
+    #: tool reduction (−0.95 → −0.75) to preserve reach. Clears A↔B corridor
+    #: on bolts 0–3 vs the v5 layout; bolts 4–5 remain tight (6-o'clock A
+    #: grip vs 6-o'clock bolts). (scripts/diag_b_a_clearance.py)
+    cfg.ur10e_urdf = str(
+        URDF_DIR / "ur10e_robot" / "ur10e_with_nut_tool_10cm.urdf"
+    )
+    cfg.ur10e_nut_tool_length = 0.10
+    cfg.robot_B_base_pos = (0.90, -0.75, 0.0)
     #: Observation reference stays numerically at the world origin — which is
     #: now the HUB. Positional obs channels are therefore hub-centric.
     cfg.obs_reference_pos = (0.0, 0.0, 0.0)
