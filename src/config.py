@@ -1494,6 +1494,31 @@ class EnvConfig:
     #: the smallest tool→seat-point residual (jointly deepest AND coaxial) wins.
     #: More restarts ⇒ more reliably finds the reaching branch at the edge.
     nut_insert_reseat_tries: int = 8
+    #: v22 — COLLISION-AWARE clean-branch INSERT. The lug bolts sit recessed
+    #: inside the mounted tire; for ~4 bolts the IK branch the policy approaches
+    #: in drives the UR10e forearm 5-7 cm THROUGH the tire on the way to the
+    #: seat, tripping ``nut_collision_fail`` ~6 cm short — those bolts can never
+    #: seat (and the policy learns to avoid them). A tire-free coaxial seat
+    #: provably EXISTS for every bolt; the env just never selected it. When True,
+    #: at the APPROACH→INSERT handoff the env solves a collision-free seat branch
+    #: (and the staging config in that same branch) and switches B into it, so
+    #: the warm-started axial plunge stays in the clean branch and seats without
+    #: clipping the tire. Works for every hot-start alpha (per-leg AND full
+    #: chain). Requires retraining since the approach poses for the affected
+    #: bolts change (the policy must learn on the clean branch).
+    nut_b_clean_branch_insert: bool = False
+    #: scipy least_squares restarts for the clean-branch seat solve. The
+    #: residual jointly minimises [seat-point error, coaxiality, tire
+    #: penetration beyond 5 mm]; restarts explore joint branches. Cached per
+    #: bolt (in-memory + optional disk), so the cost is paid once per bolt.
+    nut_clean_seat_restarts: int = 80
+    #: Optional disk cache (npz) for the clean-branch staging configs so the 88
+    #: training workers don't each redo the (seconds-per-bolt) solve. Empty ⇒
+    #: in-memory only. Mirrors ``nut_hotstart_seed_cache``.
+    nut_clean_seat_cache: str = ""
+    #: Joint-space lerp length (macro steps) for the clean-branch INSERT plunge
+    #: (staging→seat). Should match the normal ~22-step axial servo stroke.
+    nut_clean_plunge_len: int = 25
     #: Lateral coaxiality gate (m) at the APPROACH→INSERT trigger (pure-RL).
     #: v17 used 2 × nut_lateral_tol = 3 cm which let the socket enter the
     #: plunge visibly off-axis; v19 tightens it ("nut runner must be exactly

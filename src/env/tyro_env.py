@@ -2015,6 +2015,13 @@ class TyroEnv(gym.Env):
                 self._nut_macro_step = 0
                 self._nut_hold_count = 0
                 self._nut_arrive_count = 0
+                # v22 — switch B into the collision-free seat branch BEFORE the
+                # plunge. The lug bolt is recessed inside the mounted tire; the
+                # approach branch's forearm would otherwise clip the tire mid-
+                # plunge and trip nut_collision_fail ~6 cm short of the seat.
+                # The warm-started axial servo keeps this clean branch to seat.
+                if bool(getattr(self.cfg, "nut_b_clean_branch_insert", False)):
+                    self._nut_switch_to_clean_branch(idx)
                 self._nut_macro_quat = self._coaxial_quat_preserving_roll(idx)
                 # Plan the INSERT leg (current staging → hub-face base).
                 self._setup_nut_macro_leg(self._nut_macro_target(idx)[0])
@@ -2238,6 +2245,248 @@ class TyroEnv(gym.Env):
                               physicsClientId=self.client)
         rb._cmd_q = None
         return False
+
+    # ------------------------------------------------------------------
+    # v22 — collision-aware clean-branch INSERT
+    # ------------------------------------------------------------------
+    def _nut_tire_penetration(self) -> float:
+        """Most-negative tire-vs-RobotB closest-point distance over non-base B
+        links (``< 0`` ⇒ penetration depth). ``getClosestPoints`` is geometric
+        (independent of the last ``stepSimulation``), so it is correct right
+        after a ``resetJointState`` teleport — exactly what the IK solve needs.
+        """
+        tire = getattr(self.handles, "tire", None)
+        if tire is None:
+            return 0.0
+        worst = 0.0
+        for cp in p.getClosestPoints(bodyA=tire, bodyB=self.robot_B.uid,
+                                     distance=0.05, physicsClientId=self.client):
+            if len(cp) > 8 and int(cp[4]) > 1:
+                worst = min(worst, float(cp[8]))
+        return worst
+
+    def _nut_clean_seat_q(self, idx: int) -> Optional[np.ndarray]:
+        """Collision-AWARE coaxial seat config for bolt ``idx``.
+
+        scipy least_squares with a residual that jointly minimises
+        [seat-point error, coaxiality, tire penetration beyond the 5 mm
+        ``_in_bad_collision`` tolerance], multi-restart over joint branches.
+        A tire-free coaxial full-seat provably exists for every lug bolt; this
+        finds it where the collision-blind ``_ik_b_rollfree`` / ``_nut_best_seat_q``
+        return a branch whose forearm clips the mounted tire. Restores the live
+        config; returns ``None`` if no clean seat is found.
+        """
+        try:
+            from scipy.optimize import least_squares
+        except ImportError:
+            return None
+        rb = self.robot_B
+        cl = self.client
+        L = float(getattr(self.cfg, "bolt_length", 0.10))
+        axis = self._nut_axis_unit(idx)
+        bolt = np.asarray(self.scene.bolt_pose(idx)[0], dtype=np.float64)
+        seat_pt = bolt + axis * (-0.5 * L)
+        want_z = -axis / max(float(np.linalg.norm(axis)), 1e-9)
+        lo, hi = rb.arm.lower, rb.arm.upper
+        depth_tol = float(getattr(self.cfg, "nut_insert_depth_tol", 0.007))
+        q_save, _ = rb.joint_state()
+
+        def set_q(q):
+            for s, qq in zip(rb.arm.indices, q):
+                p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                                  physicsClientId=cl)
+
+        def resid(q):
+            set_q(q)
+            ee, eq = rb.ee_pose()
+            ee = np.asarray(ee, dtype=np.float64)
+            gz = np.asarray(quat_axis(eq, "z"), dtype=np.float64)
+            mis = min(float(np.linalg.norm(gz - want_z)),
+                      float(np.linalg.norm(gz + want_z)))
+            viol = max(0.0, -(self._nut_tire_penetration()) - 0.005)
+            return np.concatenate([(ee - seat_pt) * 10.0, [mis * 2.0, viol * 40.0]])
+
+        rng = np.random.default_rng(977 + idx * 131)
+        n_restart = int(getattr(self.cfg, "nut_clean_seat_restarts", 80))
+        best_q, best_key = None, None
+        for r in range(n_restart):
+            q0 = (np.asarray(rb.arm.rest, dtype=np.float64) if r == 0
+                  else rng.uniform(lo, hi))
+            try:
+                sol = least_squares(resid, q0, bounds=(lo, hi), xtol=1e-10,
+                                    ftol=1e-10, max_nfev=400, diff_step=2e-3)
+            except Exception:
+                continue
+            q = np.clip(sol.x, lo, hi)
+            set_q(q)
+            ax, lat, _t = self._nut_axial_lateral(idx)
+            seated = (abs(ax - (-0.5 * L)) < depth_tol and lat < 0.015)
+            clean = self._nut_tire_penetration() >= -0.005
+            key = (bool(seated and clean), bool(seated),
+                   float(self._nut_tire_penetration()))
+            if best_key is None or key > best_key:
+                best_key, best_q = key, q.copy()
+            if best_key[0]:
+                break
+        set_q(q_save)
+        rb._cmd_q = None
+        return best_q if (best_key is not None and best_key[0]) else None
+
+    def _nut_clean_staging_q(self, idx: int) -> Optional[np.ndarray]:
+        """Staging config in the SAME clean branch as :meth:`_nut_clean_seat_q`.
+
+        IK to the on-axis staging point (just outside the stud tip), seeded from
+        the clean seat config and penalising tire penetration, so the approach
+        sits in the collision-free branch. The axial plunge (``apply_absolute_ee``
+        warm-starts from the current joints) then stays in that branch all the
+        way to the seat. Cached per bolt (in-memory + optional disk).
+        """
+        cache = getattr(self, "_nut_clean_stage_cache", None)
+        if cache is None:
+            cache = {}
+            path = str(getattr(self.cfg, "nut_clean_seat_cache", "") or "")
+            if path:
+                try:
+                    import os
+                    if os.path.exists(path):
+                        data = np.load(path)
+                        for k in data.files:
+                            cache[int(k)] = np.asarray(data[k], dtype=np.float64)
+                except Exception:
+                    pass
+            self._nut_clean_stage_cache = cache
+        if idx in cache:
+            return cache[idx]
+        try:
+            from scipy.optimize import least_squares
+        except ImportError:
+            cache[idx] = None
+            return None
+        seat_q = self._nut_clean_seat_q(idx)
+        if seat_q is None:
+            cache[idx] = None
+            return None
+        rb = self.robot_B
+        cl = self.client
+        axis = self._nut_axis_unit(idx)
+        stage_pt = self._nut_point_on_axis(idx, self._nut_staging_axial())
+        want_z = -axis / max(float(np.linalg.norm(axis)), 1e-9)
+        lo, hi = rb.arm.lower, rb.arm.upper
+        q_save, _ = rb.joint_state()
+
+        def set_q(q):
+            for s, qq in zip(rb.arm.indices, q):
+                p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                                  physicsClientId=cl)
+
+        def resid(q):
+            set_q(q)
+            ee, eq = rb.ee_pose()
+            ee = np.asarray(ee, dtype=np.float64)
+            gz = np.asarray(quat_axis(eq, "z"), dtype=np.float64)
+            mis = min(float(np.linalg.norm(gz - want_z)),
+                      float(np.linalg.norm(gz + want_z)))
+            viol = max(0.0, -(self._nut_tire_penetration()) - 0.005)
+            return np.concatenate([(ee - stage_pt) * 10.0, [mis * 2.0, viol * 40.0]])
+
+        rng = np.random.default_rng(613 + idx * 97)
+        best_q, best_key = None, None
+        for r in range(40):
+            q0 = (np.asarray(seat_q, dtype=np.float64) if r == 0
+                  else np.clip(seat_q + rng.uniform(-0.3, 0.3, size=len(seat_q)),
+                               lo, hi))
+            try:
+                sol = least_squares(resid, q0, bounds=(lo, hi), xtol=1e-10,
+                                    ftol=1e-10, max_nfev=300, diff_step=2e-3)
+            except Exception:
+                continue
+            q = np.clip(sol.x, lo, hi)
+            set_q(q)
+            ee = np.asarray(rb.ee_pose()[0], dtype=np.float64)
+            pe = float(np.linalg.norm(ee - stage_pt))
+            clean = self._nut_tire_penetration() >= -0.005
+            key = (bool(pe < 0.01 and clean), bool(clean), -pe)
+            if best_key is None or key > best_key:
+                best_key, best_q = key, q.copy()
+            if best_key[0]:
+                break
+        set_q(q_save)
+        rb._cmd_q = None
+        result = (best_q if (best_key is not None and best_key[1]) else None)
+        cache[idx] = result
+        path = str(getattr(self.cfg, "nut_clean_seat_cache", "") or "")
+        if path and result is not None:
+            try:
+                import os
+                import tempfile
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                payload = {str(k): v for k, v in cache.items() if v is not None}
+                fd, tmp = tempfile.mkstemp(
+                    dir=os.path.dirname(path) or ".", suffix=".npz")
+                os.close(fd)
+                np.savez(tmp, **payload)
+                os.replace(tmp, path)
+            except Exception:
+                pass
+        return result
+
+    def _nut_switch_to_clean_branch(self, idx: int) -> bool:
+        """Switch Robot B into the clean-branch staging config for bolt ``idx``.
+
+        Called once at the APPROACH→INSERT handoff. A ``resetJointState`` teleport
+        (instantaneous, so no swept-collision) into the collision-free staging
+        config; the subsequent warm-started axial plunge then seats without the
+        forearm clipping the tire. Returns ``True`` iff B was switched.
+        """
+        stage_q = self._nut_clean_staging_q(idx)
+        if stage_q is None:
+            return False
+        seat_q = self._nut_clean_seat_q(idx)
+        rb = self.robot_B
+        for s, qq in zip(rb.arm.indices, stage_q):
+            p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        rb._cmd_q = None
+        rb.drive_arm_targets(np.asarray(stage_q, dtype=np.float64))
+        rb.last_target_pos = np.asarray(rb.ee_pose()[0], dtype=np.float64).copy()
+        # Book-keep the joint-space plunge endpoints for _nut_drive_clean_plunge.
+        self._nut_clean_plunge_from = np.asarray(stage_q, dtype=np.float64).copy()
+        self._nut_clean_plunge_to = (
+            np.asarray(seat_q, dtype=np.float64).copy() if seat_q is not None
+            else None
+        )
+        return True
+
+    def _nut_drive_clean_plunge(self) -> None:
+        """Joint-space lerp staging→seat along the collision-free branch.
+
+        The Cartesian axial servo warm-starts IK from the current joints, which
+        can drift out of the clean branch mid-plunge (bolts 1/5: staging and
+        seat are tire-free but the swept path clips). Interpolating in joint
+        space between the two clean configs keeps the entire plunge in the
+        proven collision-free branch.
+        """
+        q_from = getattr(self, "_nut_clean_plunge_from", None)
+        q_to = getattr(self, "_nut_clean_plunge_to", None)
+        if q_from is None or q_to is None:
+            return
+        rb = self.robot_B
+        leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
+        t = float(np.clip(self._nut_macro_step / max(1, leg_len), 0.0, 1.0))
+        s = t * t * (3.0 - 2.0 * t)
+        arm_q = np.clip(
+            (1.0 - s) * np.asarray(q_from, dtype=np.float64)
+            + s * np.asarray(q_to, dtype=np.float64),
+            rb.arm.lower, rb.arm.upper,
+        )
+        for slot, q in zip(rb.arm.indices, arm_q):
+            p.resetJointState(
+                rb.uid, int(slot), targetValue=float(q), targetVelocity=0.0,
+                physicsClientId=self.client,
+            )
+        rb._cmd_q = None
+        rb.drive_arm_targets(arm_q)
+        rb.last_target_pos = np.asarray(rb.ee_pose()[0], dtype=np.float64).copy()
 
     # ------------------------------------------------------------------
     # Action / obs masks (Phase 1 feature isolation)
@@ -4834,6 +5083,17 @@ class TyroEnv(gym.Env):
             elif bool(getattr(self.cfg, "nut_b_lock_coaxial", True)):
                 ps = float(getattr(self.cfg, "nut_pos_scale",
                                    self.cfg.action.pos_scale))
+                # v22 — clean-branch INSERT: joint-space lerp staging→seat in
+                # the proven collision-free branch (replaces the Cartesian axial
+                # servo for this leg, which can drift out of the branch mid-
+                # plunge and clip the tire on bolts 1/5).
+                if (
+                    bool(getattr(self.cfg, "nut_b_clean_branch_insert", False))
+                    and int(self._nut_subphase) == 1
+                    and int(self._nut_macro_stage) == 0
+                ):
+                    self._nut_drive_clean_plunge()
+                    return
                 # v19 solo action: the whole action IS B's 3-d Δposition.
                 a_off = 0 if int(self.cfg.action.dim) == 3 else 6
                 d_pos_B = np.asarray(

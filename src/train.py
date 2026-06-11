@@ -1884,11 +1884,14 @@ def main() -> int:
             if bool(getattr(args, "nut_v20", False)):
                 overrides["nut_b_axial_insert_servo"] = True
                 overrides["nut_insert_depth_tol"] = 0.007
-                # v21 — branch-aware INSERT: a stalled plunge searches for a
-                # reachable seat branch instead of freezing short. Lets the
-                # workspace-edge bolts actually seat so the chain advances and
-                # the approach policy is rewarded for reaching them.
+                # v21 — branch-aware INSERT (superseded by v22 clean-branch for
+                # tire-collision bolts; kept on for backward compat).
                 overrides["nut_b_insert_branch_search"] = True
+                # v22 — collision-aware clean-branch INSERT: at arrive, switch B
+                # into a tire-free seat branch and lerp staging→seat in joint
+                # space so edge bolts (1/7/8/9) seat without nut_collision_fail.
+                overrides["nut_b_clean_branch_insert"] = True
+                overrides["nut_clean_seat_cache"] = "data/nut_clean_seat_cache.npz"
             if getattr(args, "nut_per_leg", None) is not None:
                 overrides["nut_per_leg_episode"] = bool(args.nut_per_leg)
         overrides["use_planner_residual"] = bool(args.use_planner_residual)

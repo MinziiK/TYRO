@@ -561,6 +561,15 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
 
+### 2026-06-12 — Robot B 너트 체결 **v22 (collision-aware clean-branch INSERT)** — forearm-vs-타이어 충돌 근본 수정
+
+자세한 내용은 `docs/TRAINING_REPORT.md`. **핵심: 가장자리 볼트(1/7/8/9)에서 INSERT plunge 중 forearm이 장착 타이어를 관통 → `nut_collision_fail` 즉시 종료.**
+
+- **근본 진단** (측정 기반): per-bolt eval(alpha=1)에서 6/10, 실패 볼트는 매번 [1,7,8,9]. 정렬(theta≈0.1°)은 완벽 — **자세(코축)는 도달 가능**. 실패 원인은 INSERT plunge ~16 step에서 `nut_collision` 종료(seat 6 cm 전). forearm_link가 타이어를 5–7 cm 관통. **타이어-free coaxial seat 자세는 10개 볼트 전부 존재**(scipy least_squares + tire-penetration cost로 검증). v21 branch-search는 충돌-blind IK + 40 step 트리거라 발동 전에 죽음.
+- **v22 수정** (`nut_b_clean_branch_insert=True`, `--nut-v20`에 묶임): APPROACH→INSERT 핸드오프 시 **타이어-free seat 분기의 staging 자세로 1회 전환**(`_nut_clean_seat_q`/`_nut_clean_staging_q`/`_nut_switch_to_clean_branch`). INSERT는 **관절공간 lerp staging→seat**(`_nut_drive_clean_plunge`)로 경로 전체가 깨끗한 분기 유지(Cartesian axial servo는 중간에 분기 이탈). 디스크 캐시: `data/nut_clean_seat_cache.npz`.
+- **검증** (v21 체크포인트, 재학습 없이): **6/10 → 10/10** per-bolt seat (alpha=1). v21 학습 중단 → v22 stage1 fresh 재학습 시작.
+- **스크립트**: `scripts/run_b_nut_train_v22_stage{1,2}.sh`, `scripts/chain_v22_stage2_after_stage1.sh`, `scripts/monitor_v22_train.sh`, `scripts/milestone_eval_v22.sh`. 신규 config: `nut_b_clean_branch_insert`, `nut_clean_seat_restarts`, `nut_clean_seat_cache`, `nut_clean_plunge_len`.
+
 ### 2026-06-11 — Robot B 너트 체결 **v21 (branch-aware INSERT)** — "일부 볼트만 체결하고 멈춤" 근본 수정
 
 자세한 내용은 `docs/TRAINING_REPORT.md`. **핵심: 가장자리 볼트에서 INSERT(plunge)가 무한 정지하던 구조적 버그 제거.**

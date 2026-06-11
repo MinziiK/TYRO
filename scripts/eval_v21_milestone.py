@@ -23,7 +23,7 @@ from src.env import TyroEnv
 V20 = dict(nut_b_align_servo=True, nut_a_kinematic_freeze=True, nut_collision_fail=True,
     nut_b_solo_action=True, nut_arrive_lat_tol=0.015, nut_seat_lat_mult=1.0,
     nut_b_axial_insert_servo=True, nut_insert_depth_tol=0.007,
-    nut_b_insert_branch_search=True)
+    nut_b_insert_branch_search=True, nut_b_clean_branch_insert=True)
 
 
 def per_bolt_seat(model):
