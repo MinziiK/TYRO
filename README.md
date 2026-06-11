@@ -561,6 +561,17 @@ python -m src.eval runs/phase1_grad_v7/best/best_model.zip --render --phase 1 --
 
 기존 README·코드 주석에 흩어져 있던 실험 근거를 한곳에 모았습니다. **날짜 = 커밋/실험 기준**, 세부 수치는 `src/config.py` 주석이 단일 진실 원천입니다.
 
+### 2026-06-11 — Robot B 너트 체결 **v21 (branch-aware INSERT)** — "일부 볼트만 체결하고 멈춤" 근본 수정
+
+자세한 내용은 `docs/TRAINING_REPORT.md`. **핵심: 가장자리 볼트에서 INSERT(plunge)가 무한 정지하던 구조적 버그 제거.**
+
+- **근본 진단** (측정 기반): pure-RL 체인 eval에서 4개 체결 후 항상 정지. 정지 시점은 `subphase=1`(MACRO)·`macro_stage=0`(INSERT). plunge는 **env가 구동**(`nut_b_axial_insert_servo`)하는데 접근 시 들어온 **관절 브랜치에서 직선으로 밀어넣어**, 작업공간 가장자리 볼트(예: bolt#3)는 IK가 seat 깊이(−0.043)에 약 1 cm 못 미침(−0.027). seat 게이트가 안 떠서 INSERT를 못 빠져나옴 → pure-RL은 leg watchdog을 끄므로(`leg_max=1e9`) **무한 정지**(GUI 멈춤 / 학습 `nut_stall` truncate, 보상 0). **정책은 plunge를 제어하지 않으므로 아무리 학습해도 못 넘김** = 구조적 학습 불가.
+- **볼트는 도달 가능**: 같은 bolt#3을 다른 elbow/wrist 브랜치로는 −0.0511(seat보다 깊게)까지 닿음. 재배치·skip 불필요 — plunge가 도달 가능한 브랜치를 안 찾았을 뿐.
+- **v21 수정** (`nut_b_insert_branch_search=True`, `--nut-v20`에 묶임): INSERT plunge가 정상 stroke(`nut_insert_reseat_after`)를 넘겨도 seat 못 하면 → 검증된 oracle seat IK(roll-free·multi-seed, 좌표 잔차 최소)로 **도달 가능한 seat 브랜치를 탐색해 전환**(`_nut_best_seat_q`/`_nut_switch_to_seat_branch`). 전환 후 `apply_absolute_ee`가 현재 관절 warm-start라 seated 브랜치 유지 → servo가 정상 체결. 정책은 접근을 그대로 RL로 학습(plunge는 원래도 env 영역). 전환 시 PB 베이스라인 리셋으로 보상 스파이크/farming 없음.
+- **검증** (동일 체크포인트, 재학습 없이): branch-search **OFF 4/10**(bolt#3 INSERT 무한정지) → **ON 5/10**(bolt#3 seat 후 진행, 13 step 만에 체결, 정지 없음). 초기 충돌률(180 ep: 61→62)·FPS 동등 → 부작용 없음.
+- **남은 한계**(이번 범위 밖): 일부 볼트는 INSERT가 아니라 **APPROACH 정렬 미숙**(lateral>게이트)으로 막힘 — 정책 추가 학습 영역. v21로 후반 볼트가 비로소 접근 보상을 받게 되어 RL 학습이 가능해짐.
+- **스크립트**: `scripts/run_b_nut_train_v21_stage1.sh`(fresh per-leg), `scripts/run_b_nut_train_v21_stage2.sh`(체인 fine-tune, stage1 resume), `scripts/chain_v21_stage2_after_stage1.sh`(자동 연결). 품질 점검: `scripts/eval_v21_milestone.py`(per-bolt seat + chain-from-home) + `scripts/milestone_eval_v21.sh`(마일스톤 자동 평가). 신규 config: `nut_b_insert_branch_search`, `nut_insert_reseat_after`, `nut_insert_reseat_tries`.
+
 ### 2026-06-08 (저녁) — Robot B 너트 체결 **v14 (Min-Jerk 플래너 + PPO 잔차)**
 
 자세한 내용은 `docs/TRAINING_REPORT.md` §10, §15. **핵심: Robot A와 동일하게 Robot B에도 명목 궤적 + 잔차 구조 적용.**

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Callable, Optional, Tuple
 
 import numpy as np
+import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     BaseCallback, CallbackList, CheckpointCallback, EvalCallback,
@@ -481,6 +482,127 @@ class NutArriveAngCurriculumCallback(BaseCallback):
         self.logger.record("curriculum/nut_arrive_ang_deg", float(np.degrees(a)))
 
 
+class NutArrivePosCurriculumCallback(BaseCallback):
+    """Ramp the nut arrive-position capture radius loose → tight during training.
+
+    Mirrors ``NutArriveAngCurriculumCallback`` but for the staging capture
+    sphere (``d_stage < nut_arrive_pos_tol``). Holds ``start_m`` for
+    ``hold_steps`` (so insert is reachable from a generous staging region while
+    the policy bootstraps the in/out), then linearly ramps to ``end_m`` over
+    ``ramp_steps`` so the final policy must arrive precisely. Broadcast via
+    ``env_method("set_nut_arrive_pos_tol", m)``.
+    """
+
+    def __init__(
+        self,
+        start_m: float,
+        end_m: float,
+        hold_steps: int,
+        ramp_steps: int,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._m0 = float(start_m)
+        self._m1 = float(end_m)
+        self._hold = int(max(0, hold_steps))
+        self._ramp = int(max(1, ramp_steps))
+        self._last_pushed: Optional[float] = None
+
+    def _scheduled(self, t: int) -> float:
+        t = int(max(0, t))
+        if t <= self._hold:
+            return self._m0
+        frac = min(1.0, (t - self._hold) / float(self._ramp))
+        return self._m0 * (1.0 - frac) + self._m1 * frac
+
+    def _broadcast(self, m: float) -> None:
+        try:
+            self.training_env.env_method("set_nut_arrive_pos_tol", float(m))
+        except AttributeError:
+            pass
+
+    def _on_training_start(self) -> None:
+        m = self._scheduled(int(self.model.num_timesteps))
+        self._last_pushed = m
+        self._broadcast(m)
+        if self.verbose:
+            print(f"[curriculum] nut_arrive_pos_tol init = "
+                  f"{m*100:.1f}cm (t={self.model.num_timesteps})")
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        t = int(self.model.num_timesteps)
+        m = self._scheduled(t)
+        if self._last_pushed is None or abs(m - self._last_pushed) > 1e-5:
+            self._broadcast(m)
+            self._last_pushed = m
+            if self.verbose:
+                print(f"[curriculum] nut_arrive_pos_tol = {m*100:.1f}cm (t={t})")
+        self.logger.record("curriculum/nut_arrive_pos_cm", float(m * 100.0))
+
+
+class DRRangeCurriculumCallback(BaseCallback):
+    """Ramp the domain-randomization hub-offset half-range during training.
+
+    Holds ``start_m`` (typically 0) for ``hold_steps`` so the policy first
+    re-confirms the nominal task, then linearly ramps to ``end_m`` (e.g.
+    0.05 m) over ``ramp_steps``. Broadcast via
+    ``env_method("set_random_position_range", m)`` each rollout boundary.
+    Used by the Robot-B nut DR fine-tune to grow hub placement error 0 → 5 cm.
+    """
+
+    def __init__(
+        self,
+        start_m: float,
+        end_m: float,
+        hold_steps: int,
+        ramp_steps: int,
+        verbose: int = 0,
+    ):
+        super().__init__(verbose)
+        self._m0 = float(max(0.0, start_m))
+        self._m1 = float(max(0.0, end_m))
+        self._hold = int(max(0, hold_steps))
+        self._ramp = int(max(1, ramp_steps))
+        self._last_pushed: Optional[float] = None
+
+    def _scheduled(self, t: int) -> float:
+        t = int(max(0, t))
+        if t <= self._hold:
+            return self._m0
+        frac = min(1.0, (t - self._hold) / float(self._ramp))
+        return self._m0 * (1.0 - frac) + self._m1 * frac
+
+    def _broadcast(self, m: float) -> None:
+        try:
+            self.training_env.env_method("set_random_position_range", float(m))
+        except AttributeError:
+            pass
+
+    def _on_training_start(self) -> None:
+        m = self._scheduled(int(self.model.num_timesteps))
+        self._last_pushed = m
+        self._broadcast(m)
+        if self.verbose:
+            print(f"[curriculum] dr_range init = {m*100:.1f}cm "
+                  f"(t={self.model.num_timesteps})")
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        t = int(self.model.num_timesteps)
+        m = self._scheduled(t)
+        if self._last_pushed is None or abs(m - self._last_pushed) > 1e-6:
+            self._broadcast(m)
+            self._last_pushed = m
+            if self.verbose:
+                print(f"[curriculum] dr_range = {m*100:.1f}cm (t={t})")
+        self.logger.record("curriculum/dr_range_cm", float(m * 100.0))
+
+
 class MountTolCurriculumCallback(BaseCallback):
     """Schedules the Stage 1 → 2 mount gate (radius, angle) over training.
 
@@ -869,6 +991,25 @@ def build_callbacks(args, eval_env, out_dir: Path) -> CallbackList:
             ramp_steps=int(getattr(args, "nut_arrive_ang_ramp_steps", 1_500_000)),
             verbose=1,
         ))
+    if (
+        bool(getattr(args, "nut_fastening", False))
+        and bool(getattr(args, "nut_arrive_pos_curriculum", False))
+    ):
+        cbs.append(NutArrivePosCurriculumCallback(
+            start_m=float(getattr(args, "nut_arrive_pos_start_cm", 12.0)) / 100.0,
+            end_m=float(getattr(args, "nut_arrive_pos_end_cm", 8.0)) / 100.0,
+            hold_steps=int(getattr(args, "nut_arrive_pos_hold_steps", 400_000)),
+            ramp_steps=int(getattr(args, "nut_arrive_pos_ramp_steps", 2_000_000)),
+            verbose=1,
+        ))
+    if bool(getattr(args, "dr_range_curriculum", False)):
+        cbs.append(DRRangeCurriculumCallback(
+            start_m=float(getattr(args, "dr_range_start_cm", 0.0)) / 100.0,
+            end_m=float(getattr(args, "dr_range_end_cm", 5.0)) / 100.0,
+            hold_steps=int(getattr(args, "dr_range_hold_steps", 200_000)),
+            ramp_steps=int(getattr(args, "dr_range_ramp_steps", 1_000_000)),
+            verbose=1,
+        ))
     cbs.append(CheckpointCallback(
         save_freq=max(args.save_freq // max(args.num_envs, 1), 1),
         save_path=str(out_dir / "ckpts"),
@@ -1001,6 +1142,9 @@ def main() -> int:
     ap.add_argument("--max-grad-norm", type=float, default=0.5)
     ap.add_argument("--net-arch", type=str, default="256,256",
                     help="Comma-separated hidden layer widths for MlpPolicy.")
+    ap.add_argument("--force-log-std", action="store_true",
+                    help="With policy-only --resume: overwrite the transferred "
+                         "log_std with --log-std-init (sharpening fine-tune).")
     ap.add_argument("--log-std-init", type=float, default=0.0,
                     help="Initial log-std of the Gaussian policy. 0.0 => std "
                          "1.0 (SB3 default); -0.5 => std ~0.61 (tighter "
@@ -1329,6 +1473,53 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--nut-v19",
+        action="store_true",
+        help=(
+            "v19 precision rework bundle (requires --nut-pure-rl): env align "
+            "servo during insert (geometrically exact on-axis plunge), arrive "
+            "gate tightened (lat 1.5cm), seat gate coaxial (1x lat tol), "
+            "Robot A kinematically frozen (rigid fixture), B collision = "
+            "instant episode FAILURE, solo 3-d action space, minimal-path "
+            "waste cost, 250-step stall truncation."
+        ),
+    )
+    ap.add_argument(
+        "--nut-v20",
+        action="store_true",
+        help=(
+            "v20 bundle (requires --nut-pure-rl): all v19 features plus "
+            "INSERT axial servo (socket drives to hub-face base, full bolt "
+            "envelopment), seat depth tol 0.7 cm (was 2 cm), joint-movement "
+            "penalty 0.06 across all phases."
+        ),
+    )
+    ap.add_argument(
+        "--nut-per-leg",
+        type=lambda s: s.strip().lower() in ("1", "true", "t", "yes", "y"),
+        default=None,
+        help=(
+            "Override per-leg episodes (default: auto-on with --nut-pure-rl). "
+            "Set false for the stage-2 multi-bolt CHAIN fine-tune."
+        ),
+    )
+    ap.add_argument(
+        "--nut-path-waste", type=float, default=5.0,
+        help="v19 wasted-motion cost weight (only with --nut-v19).",
+    )
+    ap.add_argument(
+        "--nut-pure-rl",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "nut_pure_rl", False)),
+        help=(
+            "Robot-B nut PURE-RL (hybrid): policy controls the whole cycle "
+            "(approach AND insert/hold/retract). No planner nominal, no scripted "
+            "macro. APPROACH/transit = free 3-DOF XYZ; INSERT/RETRACT = bolt-axis "
+            "only (±Y plunge). Bolt order enforced by FSM; collision = soft "
+            "penalty. Obs widened to 12-d; per-leg watchdog disabled."
+        ),
+    )
+    ap.add_argument(
         "--nut-planner-traj-steps", type=int,
         default=int(getattr(_cfg_defaults, "nut_planner_traj_steps", 120)),
         help="Samples along each APPROACH nominal leg.",
@@ -1358,6 +1549,18 @@ def main() -> int:
     ap.add_argument("--nut-hotstart-ramp-steps", type=int, default=1_500_000,
                     help="Steps to ramp alpha_start → alpha_end.")
     ap.add_argument(
+        "--nut-hotstart-random-bolt",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "nut_b_hotstart_random_bolt", False)),
+        help=(
+            "Random-bolt premark curriculum: each reset marks earlier bolts in "
+            "nut_bolt_order as already fastened and hot-starts B at a random "
+            "position in the sequence. Trains every bolt-to-bolt transition "
+            "evenly instead of always replaying from bolt 0 (frontier effect). "
+            "Requires hot-start (alpha > 0)."
+        ),
+    )
+    ap.add_argument(
         "--nut-arrive-ang-curriculum",
         action=argparse.BooleanOptionalAction,
         default=bool(getattr(_cfg_defaults, "nut_arrive_ang_curriculum", True)),
@@ -1383,6 +1586,84 @@ def main() -> int:
         "--nut-arrive-ang-ramp-steps", type=int,
         default=int(getattr(_cfg_defaults, "nut_arrive_ang_ramp_steps", 1_500_000)),
         help="Steps to ramp the arrive-alignment gate start → end.")
+    ap.add_argument(
+        "--nut-arrive-pos-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Ramp the arrive-position capture radius loose→tight during the nut "
+            "task: insert triggers from a generous staging region early (so the "
+            "in/out is reachable), then the capture sphere tightens so the "
+            "policy must stage precisely. (The pure-RL lateral coaxiality gate "
+            "is fixed by seat physics and is NOT ramped — only the axial "
+            "capture distance.)"
+        ),
+    )
+    ap.add_argument(
+        "--nut-arrive-pos-start-cm", type=float, default=12.0,
+        help="Loose start capture radius (cm) for the arrive-position gate.")
+    ap.add_argument(
+        "--nut-arrive-pos-end-cm", type=float, default=8.0,
+        help="Tight end capture radius (cm) for the arrive-position gate.")
+    ap.add_argument(
+        "--nut-arrive-pos-hold-steps", type=int, default=400_000,
+        help="Steps to hold the loose start before ramping the position gate.")
+    ap.add_argument(
+        "--nut-arrive-pos-ramp-steps", type=int, default=2_000_000,
+        help="Steps to ramp the arrive-position gate start → end.")
+    # --- domain randomization (hub placement error) ----------------------
+    ap.add_argument(
+        "--dr-hub-offset",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "USE_DOMAIN_RANDOMIZATION", False)),
+        help=(
+            "Enable static-pose domain randomization: perturb the hub XY by a "
+            "uniform +-RANDOM_POSITION_RANGE each reset (bolts move with the "
+            "hub; the nut nominal trajectory regenerates around them)."
+        ),
+    )
+    ap.add_argument(
+        "--dr-range-cm", type=float,
+        default=float(getattr(_cfg_defaults, "RANDOM_POSITION_RANGE", 0.02)) * 100.0,
+        help="DR hub-offset half-range (cm). Fixed value unless a curriculum ramps it.")
+    ap.add_argument(
+        "--dr-cargo",
+        action=argparse.BooleanOptionalAction,
+        default=bool(getattr(_cfg_defaults, "DR_CARGO_ENABLE", True)),
+        help="Also perturb cargo XY independently. Use --no-dr-cargo for hub-only DR.")
+    ap.add_argument(
+        "--dr-range-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Ramp the DR hub-offset half-range from --dr-range-start-cm to --dr-range-end-cm.")
+    ap.add_argument("--dr-range-start-cm", type=float, default=0.0,
+                    help="DR ramp start half-range (cm), held for --dr-range-hold-steps.")
+    ap.add_argument("--dr-range-end-cm", type=float, default=5.0,
+                    help="DR ramp end half-range (cm).")
+    ap.add_argument("--dr-range-hold-steps", type=int, default=200_000,
+                    help="Steps to hold --dr-range-start-cm before ramping.")
+    ap.add_argument("--dr-range-ramp-steps", type=int, default=1_000_000,
+                    help="Steps to ramp DR half-range start → end.")
+    ap.add_argument(
+        "--nut-a-hold-jitter-deg", type=float,
+        default=float(np.degrees(getattr(
+            _cfg_defaults, "nut_a_hold_jitter_rad", np.deg2rad(3.0),
+        ))),
+        help="Per-joint uniform jitter (deg) on Robot A's mount-hold fixture pose.",
+    )
+    ap.add_argument(
+        "--w-nut-ba-clear", type=float, default=None,
+        help="Robot A–B joint-center clearance shaping weight (RewardConfig).",
+    )
+    ap.add_argument(
+        "--planner-pos-offset-scale", type=float, default=None,
+        help=(
+            "Robot-A per-step EE residual authority (m) on the mount nominal "
+            "trajectory. Overrides the make_env_config default (0.03). Raise "
+            "(e.g. 0.06) when training under hub DR so the residual can correct "
+            "for the offset hub."
+        ),
+    )
     ap.add_argument(
         "--tighten-hold-steps", type=int,
         default=int(getattr(_cfg_defaults, "tighten_hold_steps", 40)),
@@ -1574,14 +1855,56 @@ def main() -> int:
             overrides["nut_b_planner_residual"] = bool(
                 getattr(args, "nut_b_planner_residual", False)
             )
+            overrides["nut_pure_rl"] = bool(getattr(args, "nut_pure_rl", False))
             overrides["nut_planner_traj_steps"] = int(
                 getattr(args, "nut_planner_traj_steps", 120)
             )
             overrides["nut_planner_pos_residual_scale"] = float(
                 getattr(args, "nut_planner_pos_residual_scale", 0.05)
             )
+            overrides["nut_a_hold_jitter_rad"] = float(
+                np.deg2rad(getattr(args, "nut_a_hold_jitter_deg", 3.0))
+            )
+            overrides["nut_b_hotstart_random_bolt"] = bool(
+                getattr(args, "nut_hotstart_random_bolt", False)
+            )
+            # v19/v20 precision-rework bundle (align servo / rigid fixture /
+            # collision=fail / solo 3-d action / minimal-path shaping /
+            # stall truncation). See scripts/run_b_nut_train_v19_*.sh.
+            if bool(getattr(args, "nut_v19", False)) or bool(
+                getattr(args, "nut_v20", False)
+            ):
+                overrides["nut_b_align_servo"] = True
+                overrides["nut_a_kinematic_freeze"] = True
+                overrides["nut_collision_fail"] = True
+                overrides["nut_b_solo_action"] = True
+                overrides["nut_arrive_lat_tol"] = 0.015
+                overrides["nut_seat_lat_mult"] = 1.0
+                overrides["nut_stall_steps"] = 250
+            if bool(getattr(args, "nut_v20", False)):
+                overrides["nut_b_axial_insert_servo"] = True
+                overrides["nut_insert_depth_tol"] = 0.007
+                # v21 — branch-aware INSERT: a stalled plunge searches for a
+                # reachable seat branch instead of freezing short. Lets the
+                # workspace-edge bolts actually seat so the chain advances and
+                # the approach policy is rewarded for reaching them.
+                overrides["nut_b_insert_branch_search"] = True
+            if getattr(args, "nut_per_leg", None) is not None:
+                overrides["nut_per_leg_episode"] = bool(args.nut_per_leg)
         overrides["use_planner_residual"] = bool(args.use_planner_residual)
         overrides["attached_spawn_when_easy"] = bool(args.attached_spawn_when_easy)
+        # Domain randomization (hub placement error). When a DR range curriculum
+        # is active the env starts at the ramp's start value and the callback
+        # grows it; otherwise the fixed --dr-range-cm is used. Either way the
+        # master switch is driven by --dr-hub-offset (or implied by the ramp).
+        dr_curr = bool(getattr(args, "dr_range_curriculum", False))
+        dr_on = bool(getattr(args, "dr_hub_offset", False)) or dr_curr
+        overrides["USE_DOMAIN_RANDOMIZATION"] = dr_on
+        overrides["DR_CARGO_ENABLE"] = bool(getattr(args, "dr_cargo", True))
+        if dr_curr:
+            overrides["RANDOM_POSITION_RANGE"] = float(args.dr_range_start_cm) / 100.0
+        elif dr_on:
+            overrides["RANDOM_POSITION_RANGE"] = float(args.dr_range_cm) / 100.0
         overrides["max_steps"] = int(args.max_steps)
         overrides["approach_A_gate"] = float(args.approach_a_gate)
         overrides["approach_tol_soft"] = float(args.approach_tol_soft)
@@ -1608,6 +1931,20 @@ def main() -> int:
             )
         if args.dense_baseline_scale is not None:
             cfg.reward.w_dense_baseline_scale = float(args.dense_baseline_scale)
+        if getattr(args, "w_nut_ba_clear", None) is not None:
+            cfg.reward.w_nut_ba_clear = float(args.w_nut_ba_clear)
+        if bool(getattr(args, "nut_v19", False)) or bool(
+            getattr(args, "nut_v20", False)
+        ):
+            # Minimal-path transit shaping (v19/v20): PB stays the driver; the
+            # waste cost makes the straight line the optimum.
+            cfg.reward.w_nut_path_waste = float(
+                getattr(args, "nut_path_waste", 5.0))
+        if bool(getattr(args, "nut_v20", False)):
+            cfg.reward.w_nut_joint_vel = 0.06
+        if getattr(args, "planner_pos_offset_scale", None) is not None:
+            # Applied after make_env_config, which otherwise forces 0.03.
+            cfg.planner_pos_offset_scale = float(args.planner_pos_offset_scale)
         return cfg
 
     if args.num_envs > 1:
@@ -1651,6 +1988,25 @@ def main() -> int:
     else:
         eval_env = DummyVecEnv([make_env(0, cfg_factory, args.seed + 10_000)])
         eval_env = VecMonitor(eval_env, info_keywords=("is_success", "termination"))
+        # Match eval to the TRAINING target. The hot-start curriculum only
+        # broadcasts alpha to the training envs, so the eval env keeps the cfg
+        # default (0.0 = full HOME) — which tests a HARDER start than the policy
+        # is ever trained for (the curriculum floors at --nut-hotstart-alpha-end,
+        # e.g. 0.3). That mismatch makes eval success_rate read ~0% even while
+        # the policy succeeds at its actual target distance. Pin the eval env's
+        # hot-start alpha to the curriculum's end value so eval measures the real
+        # deployment goal.
+        if (
+            bool(getattr(args, "nut_fastening", False))
+            and bool(getattr(args, "nut_hotstart_curriculum", True))
+        ):
+            _eval_alpha = float(getattr(args, "nut_hotstart_alpha_end", 0.0))
+            try:
+                eval_env.env_method("set_nut_b_hotstart_alpha", _eval_alpha)
+                print(f"[eval] nut_b_hotstart_alpha pinned to "
+                      f"curriculum end = {_eval_alpha:.3f}")
+            except AttributeError:
+                pass
 
     # ------------------------------------------------------------------
     # Model
@@ -1700,6 +2056,14 @@ def main() -> int:
             print(f"[train] policy-only resume from {args.resume}")
             ckpt = PPO.load(args.resume, device=args.device)
             model.policy.load_state_dict(ckpt.policy.state_dict())
+            if bool(args.force_log_std):
+                # Sharpening fine-tune: the transferred weights include the
+                # checkpoint's log_std, which can be too noisy for a
+                # deterministic-deployment polish. Clamp it back to the CLI
+                # value so exploration restarts tight around the learned mean.
+                with torch.no_grad():
+                    model.policy.log_std.fill_(float(args.log_std_init))
+                print(f"[train] log_std forced to {args.log_std_init}")
             if args.reset_timesteps:
                 print("[train] reset_timesteps: curriculum counters start at t=0 "
                       f"(checkpoint had {ckpt.num_timesteps:,} steps)")

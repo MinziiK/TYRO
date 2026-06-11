@@ -837,67 +837,109 @@ income을 빨아먹는 farm을 만든다(체결보다 이득). 하나를 막으�
 
 | 항목 | 결과 |
 |------|------|
-| 학습 | ✅ 수렴 (phase1_mount_v2 2.0M + ft03 3.84M, resume) |
+| 학습 | ✅ 수렴 — `phase1_mount_v2` 2.0M + `ft03` 3.84M + **`v3_dr` DR 2.0M** (2026-06-09) |
 | 마운트 정밀도 | d ≈ 0 (~0.4 cm), theta ≈ 0 |
 | 게이트 커리큘럼 | 반경 0.55→**0.12 m**, 각도 45°→**5°** (하드 스펙 도달) |
-| 성공률 | tol 0.55 m 구간 ~0.95, 하드 0.12 m/5° 구간 ~0.80 유지 |
-| Best model | `runs/phase1_mount_v2/best/best_model.zip` |
+| 성공률 (0 cm, ft03) | 하드 게이트 구간 rollout **~0.80** |
+| 성공률 (허브 DR **±5 cm**, v3_dr) | rollout **~0.81** (DR ramp 완료 구간) |
+| Best / deploy model | `runs/phase1_mount_v3_dr/final.zip` |
 
-#### 학습 곡선 — 성공률 vs 게이트 조임
+#### 학습 곡선 — 성공률 vs 게이트 조임 + 허브 DR
 
 ![Robot A Phase-A 마운트 성공률 vs 게이트 조임](phase_a_progress.png)
 
-**그래프 읽는 법.** 가로축은 학습 스텝(×10⁶), 두 개의 세로축을 쓴다.
+**그래프 읽는 법.** 가로축은 **세 run을 이어 붙인** 학습 스텝(×10⁶): `v2` → `ft03` → `v3_dr`.
 
 | 요소 | 축 | 의미 |
 |------|-----|------|
 | 진한 초록 선 | 왼쪽 | `success_rate` 이동평균(7-window) — 마운트 성공 비율 |
-| 연한 초록 선 | 왼쪽 | rollout별 raw `success_rate`(평활 전, 노이즈 포함) |
-| 파란 점선 | 오른쪽 | `mount_radius_tol` — 마운트 성공으로 인정하는 거리 게이트(작을수록 엄격) |
+| 연한 초록 선 | 왼쪽 | rollout별 raw `success_rate` |
+| 파란 점선 | 오른쪽 | `mount_radius_tol` — 마운트 거리 게이트(작을수록 엄격) |
+| 주황 점선 | 오른쪽 | `hub DR offset` (m) — 허브 XY 랜덤 오프셋 half-range |
+| 노란 음영 | — | 허브 DR fine-tune 구간 (0→5 cm) |
+| 회색 세로 점선 | — | run resume 지점 (`ft03`, `v3_dr`) |
 | 빨강 점선 | 왼쪽 | 성공률 1.0 기준선 |
-| 회색 세로 점선 | — | 파인튜닝 resume 지점(약 2.0M step) |
 
-**해석.** 핵심은 **"게이트를 조여도 성공률이 무너지지 않는다"**는 점이다. 파란 점선이
-0.55 m에서 시작해 커리큘럼을 따라 내려가는데(=요구 정밀도 상승), 그 동안 초록 선은
-~0.95를 유지한다. 2.0M에서 파인튜닝을 resume하며 게이트를 **하드 스펙(0.12 m / 5°)**까지
-끝까지 조이면 성공률이 ~0.95 → ~0.80으로 안착한다 — 정밀도 요구가 최고로 높아진 만큼의
-합리적인 비용이며, 결정론적 eval에서는 타이어 중심 오차 ~0.4 cm로 허브에 안착한다.
+**해석.** `v2`→`ft03` 구간에서 게이트를 0.55 m→0.12 m로 조여도 성공률은 ~0.95→~0.80을 유지한다.
+`v3_dr`(약 5.8M step~)에서 허브를 0→5 cm로 흔들어도 **성공률 ~0.80–0.90**을 유지 — DR fine-tune이
+허브 위치 변화에 대한 A 강건성을 실제로 확보했다. (DR run에서는 mount 게이트도 함께
+ramp되므로 파란 점선이 일시적으로 다시 넓어지는 구간이 보인다.)
 
-> 재생성: `python scripts/plot_phase_a_progress.py` (`runs/phase1_mount_v2*.log` 파싱).
+> 재생성: `python scripts/plot_phase_a_progress.py` (`v2` + `ft03` + `v3_dr` 로그 파싱).
 
 ### 16.2 Robot B (Nut Fastening)
 
-| 항목 | 결과 (2026-06-08 기준) |
-|------|------------------------|
-| **잔차=0 스모크** | **10/10 체결** (명목 궤적만, 1592 step) — `smoke_nut_planner_v14.py` |
-| Oracle E2E | **10/10** 충돌-free (볼트 순서 + XZ transit, `e2e_nut_oracle.py`) |
-| 학습 | 🔄 진행 중 — `n_fastened_policy` 상승 중 |
-| 정직 지표 | `n_fastened_policy`, `eval/success_rate` (premark 제외) |
+| 항목 | 결과 (2026-06-09) |
+|------|-------------------|
+| **잔차=0 스모크** | **10/10 체결** (명목 궤적만, 1592 step) |
+| Oracle E2E | **10/10** 충돌-free (볼트 순서 + XZ transit) |
+| 학습 (nominal) | ✅ `nut_fastening_v15` 3.5M — rollout `success_rate` **~0.74**, `n_fastened_policy` **~4.3** |
+| DR fine-tune | ✅ `nut_fastening_v16_dr` 1.5M — 허브 0→5 cm ramp |
+| DR **±5 cm** (v16 종료) | rollout `success_rate` **~0.59**, `n_fastened_policy` **~3.7** |
+| Deploy model | `runs/nut_fastening_v16_dr/final.zip` (DR), `runs/nut_fastening_v15/final.zip` (0 cm nominal) |
 
-#### 학습 곡선 — 정책 체결 볼트 수
+#### 학습 곡선 — 정책 체결 볼트 수 + 허브 DR
 
 ![Robot B 너트 체결 학습 곡선](nut_fastening_progress.png)
 
-**그래프 읽는 법.** 가로축은 학습 스텝(×10⁶), 세로축은 `n_fastened_policy`
-(정책이 한 에피소드에서 **스스로 체결한** 볼트 수, premark 제외 0~10).
+**그래프 읽는 법.** 가로축은 **두 run을 이어 붙인** 학습 스텝(×10⁶): `v15`(nominal) → `v16_dr`.
 
-| 요소 | 의미 |
-|------|------|
-| 진한 초록 선 | `n_fastened_policy` 이동평균(7-window) |
-| 연한 초록 선 | rollout별 raw 값(노이즈 포함) |
-| 빨강 점선 | 목표 10/10 (전 볼트 체결) |
+| 요소 | 축 | 의미 |
+|------|-----|------|
+| 진한 초록 선 | 왼쪽 | `n_fastened_policy` 이동평균(7-window) |
+| 연한 초록 선 | 왼쪽 | rollout별 raw 값 |
+| 파란 점선 | 오른쪽 | rollout `success_rate` (10/10 전체 성공) |
+| 빨강 점선 | 왼쪽 | 목표 10/10 |
+| 노란 음영 | — | 허브 DR fine-tune 구간 (0→5 cm) |
+| 회색 세로 점선 | — | `v16_dr` resume 지점 (~3.5M step) |
 
-**해석.** 명목 궤적이 충돌-free 접근 경로를 제공하므로, 정책은 "경로 발견"이 아니라
-잔차 보정만 학습한다. 따라서 곡선은 학습 초반부터 0보다 위에서 출발해 우상향한다
-(단순 RL은 같은 구간에서 0 부근을 벗어나지 못한다, §15.4). 학습이 진행될수록 곡선은
-우측으로 연장되며 10/10 목표선을 향해 수렴하는 것을 모니터링한다.
+**해석.** `v15`에서 명목(0 cm) 기준 `n_fastened_policy`는 ~4.3, `success_rate` ~0.74로
+수렴 — 잔차=0 스모크(10/10) 대비 정책 잔차·게이트·horizon(2000 step) 때문에 10/10
+전체 성공은 ~75% 수준. `v16_dr`에서 허브 DR 0→5 cm ramp 후 **success_rate ~0.55–0.60**으로
+하락 — DR에 대한 B 강건성은 부분적으로 학습됐으나 **5 cm에서 목표(0.92+)에는 미달**.
+실패 원인은 대부분 `max_steps` 타임아웃(§15.4).
 
-> 재생성: `python scripts/plot_nut_progress.py` (최신 `runs/nut_fastening_*.log` 파싱).
+> 재생성: `python scripts/plot_nut_progress.py` (`v15` + `v16_dr` 로그 파싱).
 
-### 16.3 향후 계획
+#### 학습 로그 기반 수렴 성능 (Measured, rollout)
 
-1. **학습 모니터링** → `n_fastened_policy` / `eval success`가 10/10에 수렴하는지 확인
-2. 수렴 후 **잔차 스케일 축소**(0.05→0.02)로 명목 경로 추종 강화 / 도메인 랜덤화 대비
+> 아래는 **별도 eval 하니스가 아닌** SB3 rollout 로그의 이동평균 구간 실측이다.
+> `success_rate` = 에피소드 10/10 전체 성공 비율.
+
+| 조건 | `n_fastened_policy` | `success_rate` (10/10) | 근거 run |
+|------|---------------------|------------------------|----------|
+| 0 cm (nominal) | ~4.3 | ~0.74 | `nut_fastening_v15` 종료 |
+| ±5 cm (DR ramp 완료) | ~3.7 | ~0.59 | `nut_fastening_v16_dr` 종료 |
+
+### 16.3 End-to-end 강건성 (학습 rollout 기반 추정)
+
+> ⚠️ **본 절 표는 formal multi-scenario eval 하니스가 아니라**, A/B DR fine-tune
+> rollout `success_rate`의 곱으로 **1차 추정**한 값이다. 허브별 N=100 시나리오 실측은
+> 아직 미실행. `e2e_projected.png`는 초기 구조 기반 예상치이며, 아래 표가 **현재
+> 학습 실측에 더 가깝다.**
+
+**평가 정의 (목표).** 1회 성공 = A 마운트 성공 AND B 10/10 체결.
+아래 표는 각 로봇 rollout 성공률의 독립 곱: `P(A) × P(B)`.
+
+| 허브 오프셋 | A mount (rollout) | B 10/10 (rollout) | **E2E 추정** | 출처 |
+|------------|-------------------|-------------------|-------------|------|
+| 0 cm | ~0.80 | ~0.74 | **~0.59** | ft03 + v15 |
+| ±5 cm | ~0.81 | ~0.59 | **~0.48** | v3_dr + v16_dr |
+
+![예상 end-to-end 강건성 곡선 (projected — 초기 추정, 아래 표로 대체 예정)](e2e_projected.png)
+
+**해석.** A는 DR fine-tune 후 ±5 cm에서도 mount 성공률 ~81%로 **강건**.
+B는 5 cm에서 10/10 성공률 ~59%로 **E2E 병목** — A(0.81) × B(0.59) ≈ **48%**.
+초기 projected(~71% @5 cm)보다 낮다. B 쪽 추가 DR 학습·horizon 확대·5 cm 구간
+집중 fine-tune이 필요.
+
+> 재생성: `python scripts/plot_e2e_projected.py` (formal eval 준비 전 참고용).
+> E2E 실측: A/B checkpoint + `--dr-hub-offset` eval 하니스 (향후).
+
+### 16.4 향후 계획
+
+1. **B 5 cm 강건성 보완** — `max_steps` 2500+, 추가 DR fine-tune, v16 checkpoint resume
+2. **Formal E2E eval** — 허브 ±0/2/5 cm × N=100 시나리오, `e2e_projected.png`를 실측으로 교체
 3. **Phase B:** 6-stage full cycle (A+B 동시) — `--remount-cycle`
 4. **Sim2Real:** domain randomization Phase 2/3, A 실 policy + B 협동
 5. **통합 평가:** A mount → B nut → A hold → cycle repeat

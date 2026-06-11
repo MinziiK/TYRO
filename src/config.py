@@ -250,6 +250,28 @@ class RewardConfig:
     #: standing exp kernels are shrunk, so the policy still gets a strong, dense
     #: "get closer" gradient without a parkable plateau.
     w_pb_nut: float = 25.0  # 2026-06-08 (v13) 14→25: sole positive dense driver.
+    #: 2026-06-09 (v17 pure-RL) — potential-based axial-progress weight used in
+    #: the INSERT/RETRACT legs when ``nut_pure_rl`` is on. Pays ``w·(prev_err −
+    #: err)`` where ``err = |axial − stage_target_axial|`` along the bolt axis,
+    #: so it telescopes (Σ = w·(err_start − err_end)) and cannot be farmed by
+    #: standing still — it only rewards net progress toward the seated base
+    #: (INSERT) or the cleared point (RETRACT). Matches ``w_pb_nut`` so approach
+    #: and insert pull with the same authority. Unused unless ``nut_pure_rl``.
+    w_nut_pb_axial: float = 25.0
+    #: 2026-06-09 (v17 pure-RL) — linear coaxiality COST during the policy-driven
+    #: insert/retract: ``-w·lateral`` (tool_tip off-axis distance). A negative
+    #: penalty (never farmable) that keeps the socket on the stud axis while the
+    #: policy plunges, so it cannot satisfy the seat gate by crabbing in
+    #: sideways. Unused unless ``nut_pure_rl``.
+    w_nut_lateral_pen: float = 2.0
+    #: 2026-06-10 (v19) — wasted-motion COST during APPROACH/transit:
+    #: ``-w · max(0, |Δee| − progress)`` where ``progress`` is the per-step
+    #: decrease of the distance-to-staging potential. Straight-line moves
+    #: toward the target cost ~0; detours/zigzags pay for every metre that
+    #: doesn't close distance. Combined with the telescoping PB this makes
+    #: the MINIMAL path the optimum (PB alone is path-independent).
+    #: Unused unless > 0.
+    w_nut_path_waste: float = 0.0
     #: Sparse bonus paid once per bolt successfully fastened.
     #: 2026-06-08 REBALANCE (50 → 120): fastening must dominate dense farming.
     R_fasten: float = 120.0
@@ -1399,6 +1421,112 @@ class EnvConfig:
     #: correct and collision-free. The per-bolt fasten still requires the
     #: *measured* socket to seat at the base then clear the tip.
     nut_scripted_macro: bool = True
+    #: 2026-06-09 (v17) — PURE-RL mode. When True the policy controls the WHOLE
+    #: nut-fastening cycle (approach AND insert→hold→retract) with NO min-jerk
+    #: planner nominal and NO scripted insert/retract macro — the env only reads
+    #: the physics gates (seated / hold-dwell / cleared) to advance the FSM and
+    #: pay the sparse bonuses. Dense shaping switches from "approach-only PB
+    #: toward staging" to a per-stage axial potential (drive the socket to the
+    #: stage target along the bolt axis) so the insert/retract are learnable.
+    #: ``make_env_config`` forces ``nut_scripted_macro=False``,
+    #: ``nut_b_planner_residual=False``, ``nut_b_lock_coaxial=True`` and widens
+    #: ``nut_obs_extra_dim`` to 12 (adds axial depth, lateral, subphase, macro
+    #: stage and axial-error-to-stage-target). The per-leg watchdog is disabled
+    #: so the policy cannot get a free force-advanced insert. Reverts the v14–v16
+    #: planner+macro scheme back to a direct-RL motion (no robotic teleport).
+    #: INSERT/RETRACT (subphase 1) motion is projected onto the bolt axis only
+    #: (±Y plunge/retract); APPROACH/transit (subphase 0) stays full 3-DOF XYZ.
+    nut_pure_rl: bool = False
+    #: When True (auto-enabled with ``nut_pure_rl``), terminate the episode as
+    #: soon as the policy fastens ONE bolt. Each reset picks a random bolt via
+    #: ``nut_b_hotstart_random_bolt`` and hot-starts B at that bolt's staging,
+    #: so every episode is a single approach+insert cycle — no bolt-to-bolt
+    #: transit within the horizon. Without this, max_steps=2000 lets the policy
+    #: farm insert at the spawn bolt (~0.5 n_fastened_policy) and never learn
+    #: transit; when alpha decays the insert-only skill collapses to 0.
+    nut_per_leg_episode: bool = False
+    #: Hot-start IK posture preference. When True, among the IK solutions that
+    #: reach the staging target the env picks the one carrying the arm HIGHEST
+    #: (mean link-Z), so the wrist/elbow stay above the hub and the tool
+    #: descends onto the bolt from above — instead of folding the elbow DOWN
+    #: into Robot A (which holds the tire at the hub face). Auto-on with
+    #: ``nut_pure_rl``.
+    nut_b_hotstart_elbow_up: bool = False
+    #: Reach-error gate (m) below which an IK solve counts as "reached" for the
+    #: elbow-up posture scoring above.
+    nut_b_hotstart_reach_gate: float = 0.04
+    # --- v19 (pure-RL precision rework) ----------------------------------
+    #: When True, during INSERT/RETRACT (subphase 1) the env actively servoes
+    #: the tool's LATERAL offset to the bolt axis to zero (rate-limited per
+    #: step) while the policy keeps control of the AXIAL plunge only. This
+    #: makes every insert a geometrically exact on-axis (±Y) slide — the v17/
+    #: v18 noise-dependence (deterministic mean laterally 3–6 cm off, stalling
+    #: the seat gate) is structurally removed.
+    nut_b_align_servo: bool = False
+    #: Max lateral correction (m/step) the align servo may apply. ~0.5 cm/step
+    #: closes the worst arrive-gate offset (1.5 cm) in 3 steps — fast but not
+    #: a teleport.
+    nut_b_align_servo_rate: float = 0.005
+    #: v20 — during INSERT (macro_stage 0) the env actively servoes the socket
+    #: along the bolt axis to the hub-face base (−L/2) so the nut runner fully
+    #: envelops the stud. The policy keeps approach control; plunge depth is
+    #: no longer learned (v19 stopped at ~−3 cm because depth_tol was 2 cm).
+    nut_b_axial_insert_servo: bool = False
+    #: Max axial correction (m/step) the insert servo may apply (~0.8 cm/step
+    #: covers the 5 cm bolt in ~7 steps).
+    nut_b_axial_insert_servo_rate: float = 0.008
+    #: v21 — branch-aware INSERT. The plunge is env-driven and warm-starts IK
+    #: from the joint branch the APPROACH ended in; at edge-of-workspace bolts
+    #: that branch saturates IK ~1-2 cm short of the seat, so the seat gate
+    #: never fires and the INSERT leg stalls (truncates in training, freezes in
+    #: the GUI). The bolt itself IS reachable — a different elbow/wrist branch
+    #: seats it (validated: bolt#3 −0.027 stuck → −0.051 seated). When True, a
+    #: stalled plunge searches for a reachable seat branch and switches to it so
+    #: the plunge always seats. Env-side control only — the policy never owned
+    #: the axial DOF here, so no retrain is required.
+    nut_b_insert_branch_search: bool = False
+    #: INSERT steps (``_nut_macro_step``) after which, if the socket still is
+    #: not seated, the branch search fires (and retries every this-many steps
+    #: while stuck). Set well past the normal ~22-step plunge so it only acts
+    #: on genuinely stuck legs, never on a slow-but-progressing good plunge.
+    nut_insert_reseat_after: int = 40
+    #: Independent roll-free IK restarts per branch search; the solution with
+    #: the smallest tool→seat-point residual (jointly deepest AND coaxial) wins.
+    #: More restarts ⇒ more reliably finds the reaching branch at the edge.
+    nut_insert_reseat_tries: int = 8
+    #: Lateral coaxiality gate (m) at the APPROACH→INSERT trigger (pure-RL).
+    #: v17 used 2 × nut_lateral_tol = 3 cm which let the socket enter the
+    #: plunge visibly off-axis; v19 tightens it ("nut runner must be exactly
+    #: above the bolt"). The align servo makes the residual offset vanish
+    #: during the plunge anyway.
+    nut_arrive_lat_tol: float = 0.015
+    #: Multiplier on ``nut_lateral_tol`` for the SEAT gate's lateral band
+    #: (legacy 2.0 ⇒ 3 cm). v19 sets 1.0 so a seat only counts when the
+    #: socket is truly coaxial.
+    nut_seat_lat_mult: float = 2.0
+    #: When True, Robot A is kinematically locked at its frozen hold pose
+    #: every step (``resetJointState``) instead of PD-held — Robot B contact
+    #: can no longer push A's arm (A is a rigid fixture, per spec).
+    nut_a_kinematic_freeze: bool = False
+    #: When True, any bad B↔A / B↔floor collision terminates the episode
+    #: immediately as a FAILURE (no soft-penalty survival). Mirrors the
+    #: process rule "B colliding with the fixture = failed cycle".
+    nut_collision_fail: bool = False
+    #: Early-truncate after this many consecutive steps without progress
+    #: (approach: d_stage decrease; insert: axial-error decrease) of at least
+    #: ``nut_stall_eps``. 0 disables. Saves the ~800-step horizon burn of
+    #: stalled episodes.
+    nut_stall_steps: int = 0
+    #: Minimum per-step progress (m) that resets the stall counter.
+    nut_stall_eps: float = 0.001
+    #: When True (pure-RL), the action space is the 3-d Robot-B Δposition
+    #: block ONLY (no dead Robot-A/rotation/gripper channels). PPO's
+    #: log-prob/entropy then live entirely on the live control manifold.
+    nut_b_solo_action: bool = False
+    #: Optional .npz path caching the scipy hot-start branch seeds per bolt
+    #: (solved once, shared across the 88 workers / runs instead of each
+    #: worker re-solving ~10 × multi-start IK on first encounter).
+    nut_hotstart_seed_cache: str = "data/nut_hotstart_seeds.npz"
     #: Consecutive in-gate steps at the staging point required to trigger the
     #: macro. 2026-06-07 — dropped 3 → 1. With exploration noise of ~3 cm/step
     #: (log_std −0.5 × pos_scale 0.05) the policy almost never held the old
@@ -1441,8 +1569,11 @@ class EnvConfig:
     #: IK-teleports the socket toward the leg target capped at this stride
     #: so the in/out is *visible* (several steps per leg) yet fast enough
     #: that all 10 bolts fit the episode horizon (PD tracking the full
-    #: plunge took ~50 steps/bolt — too slow). ~4 cm ⇒ ~5-step legs.
-    nut_macro_step_m: float = 0.04
+    #: plunge took ~50 steps/bolt — too slow). 2026-06-09: lowered 0.04 → 0.015
+    #: so the ~0.18 m plunge spreads over ~12 steps (was ~5) — the insert /
+    #: retract now reads as a smooth stroke instead of a near-teleport. Still
+    #: well under ``nut_macro_leg_max_steps`` and fits the 2000-step horizon.
+    nut_macro_step_m: float = 0.015
     #: Extra axial margin (m) for the in/out cycle. The APPROACH staging
     #: point is pushed this much further out in −Y (away from the hub, more
     #: clearance before the plunge), so the forced macro plunges from
@@ -1451,6 +1582,14 @@ class EnvConfig:
     #: anything past it). The RETRACT then backs out this much further past
     #: the tip too. 0 ⇒ legacy park-at-tip / seat-at-base cycle.
     nut_insert_margin: float = 0.03
+    #: Bolt→bolt transit clearance (m). 2026-06-09 — the inter-bolt APPROACH
+    #: nominal used to back the socket out to the *previous* bolt's deep retract
+    #: Y-plane and shuffle across there, an over-large, repetitive detour. The
+    #: new path arcs directly from the current (retract) pose to the next
+    #: staging point, bowing the midpoint this much further out along the bolt
+    #: axis so the short chord clears the intervening stud tips. Smaller ⇒
+    #: tighter, more minimal bolt-to-bolt moves; too small risks grazing studs.
+    nut_transit_clear: float = 0.04
     #: S2 retract gate — EE must come within this of the HOME EE pose for the
     #: empty-handed retract (S2 → S3) to fire.
     home_return_radius_tol: float = 0.12
@@ -2016,6 +2155,13 @@ class EnvConfig:
     #: reachable but large enough to force the policy to rely on the
     #: observed hub pose rather than a memorised target.
     RANDOM_POSITION_RANGE: float = 0.02
+    #: When ``USE_DOMAIN_RANDOMIZATION`` is True, also perturb the cargo XY
+    #: independently of the hub. Set False to randomize the **hub only** — used
+    #: by the Robot-B nut-fastening DR fine-tune so the measured robustness is
+    #: attributable purely to hub placement error (the nut task does not depend
+    #: on the cargo spawn, and an independent cargo offset would only add noise
+    #: to the Robot-A side of an end-to-end eval).
+    DR_CARGO_ENABLE: bool = True
 
     # Sub-configs
     reward: RewardConfig = field(default_factory=RewardConfig)
@@ -2580,6 +2726,39 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
     # target + insertion direction directly instead of inferring them from
     # the bolt-centre vector + quaternion. ``_compute_obs`` appends the same
     # block under ``nut_fastening_task``.
+    # v17 pure-RL: the policy drives the whole cycle, so force off the planner
+    # nominal + scripted macro, keep the coaxial orientation lock (position-only
+    # 3-DOF control), and widen the task obs block to 12-d (adds axial depth,
+    # lateral, subphase, macro stage and axial-error-to-stage-target) so the
+    # policy can sense and learn the insert/retract it now performs itself.
+    if nut_task_cfg and bool(getattr(cfg, "nut_pure_rl", False)):
+        cfg.nut_scripted_macro = False
+        cfg.nut_b_planner_residual = False
+        cfg.nut_b_lock_coaxial = True
+        cfg.nut_obs_extra_dim = 12
+        # Hot-start ON-AXIS (not hub-center). The hub-center start spawns B at
+        # the bolt-ring centroid, ~16 cm off EACH bolt's axis — fine for the
+        # planner's symmetric radial reach, but for pure-RL the axis-only insert
+        # needs lateral < ~3 cm to even trigger arrive, so a 16 cm spawn means
+        # arrive NEVER fires and the insert is never bootstrapped. On-axis spawn
+        # (alpha=1) parks the socket coaxially at the target bolt's staging so
+        # the policy can immediately practice insert→hold→retract; as alpha
+        # decays it learns the full approach from HOME.
+        cfg.nut_b_hotstart_hub_center = False
+        if "nut_per_leg_episode" not in user_overrides:
+            cfg.nut_per_leg_episode = True
+        cfg.nut_b_hotstart_elbow_up = True
+        # v19 — solo 3-d action space: the policy's only live control manifold
+        # in the pure-RL nut task is B's Δposition (orientation is the coaxial
+        # lock, A is a frozen fixture, gripper is dead). Recompute obs.dim
+        # since the trailing prev_action block shrinks 13 → 3.
+        if bool(getattr(cfg, "nut_b_solo_action", False)):
+            cfg.action.dim = 3
+            tail = 73 + 3 + 3
+            if bool(getattr(cfg, "include_hub_guide_obs", True)):
+                cfg.obs.dim = tail + 3
+            else:
+                cfg.obs.dim = tail
     if nut_task_cfg:
         cfg.obs.dim += int(getattr(cfg, "nut_obs_extra_dim", 7))
     if legacy_obs_dim is not None:
@@ -2595,6 +2774,24 @@ def make_env_config(stage: int = 3, phase: int = 1, **overrides) -> EnvConfig:
         # caller's explicit overrides so CLI flags always win over layout presets.
         for k, v in user_overrides.items():
             setattr(cfg, k, v)
+        # Pure-RL invariants must win over stale override keys (view_nut used to
+        # pass nut_b_planner_residual=True before --v20 flipped nut_pure_rl on;
+        # re-applying overrides here clobbered the pure-RL block and disabled
+        # hot-start, so the GUI showed HOME spawns while training used staging).
+        if nut_task_cfg and bool(getattr(cfg, "nut_pure_rl", False)):
+            cfg.nut_scripted_macro = False
+            cfg.nut_b_planner_residual = False
+            cfg.nut_b_lock_coaxial = True
+            cfg.nut_b_hotstart_hub_center = False
+            cfg.nut_b_hotstart_elbow_up = True
+            if bool(getattr(cfg, "nut_b_solo_action", False)):
+                cfg.action.dim = 3
+                tail = 73 + 3 + 3
+                if bool(getattr(cfg, "include_hub_guide_obs", True)):
+                    cfg.obs.dim = tail + 3
+                else:
+                    cfg.obs.dim = tail
+            cfg.obs.dim += int(getattr(cfg, "nut_obs_extra_dim", 7))
     # Nut-fastening: disable the contact-force termination after the layout
     # preset (which sets it to 50 kN) unless the caller set it explicitly —
     # the nut-runner tool legitimately seats against the studs / wheel face.

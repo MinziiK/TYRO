@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Plot Robot-A Phase-A mount learning: success_rate vs the tightening gate.
+"""Plot Robot-A Phase-A mount learning (initial run only).
 
-Concatenates the initial run (phase1_mount_v2) and the resumed finetune
-(phase1_mount_v2_ft03) and overlays:
-  - success_rate (left axis)
-  - mount_radius_tol curriculum (right axis, tightening 0.55 -> 0.12 m)
-showing the policy holds ~100% success while the mount gate tightens to the
-hard 0.12 m / 5 deg spec.
+Plots the initial mount training run ``phase1_mount_v2`` on its own:
+  - success_rate (left axis, raw + 7-window moving average)
+  - mount_radius_tol curriculum (right axis, m; tightening 0.55 -> 0.12)
 """
 from __future__ import annotations
 
@@ -22,18 +19,19 @@ _REPO = Path(__file__).resolve().parents[1]
 _RUNS = _REPO / "runs"
 _OUT = _REPO / "docs" / "phase_a_progress.png"
 
-RUNS = ["phase1_mount_v2", "phase1_mount_v2_ft03"]
+# Single initial mount run.
+RUN = "phase1_mount_v2"
 
 
 def parse(logf: Path) -> list[dict]:
-    """Parse rollout blocks only (skip eval/ success_rate to avoid the
-    post-eval truncation dips contaminating the rollout curve)."""
+    """Parse rollout blocks only (skip eval/ to avoid post-eval dips)."""
     pts, cur = [], {}
     section = None
     pats = {
         "rew": r"ep_rew_mean\s*\|\s*([-\d.]+)",
         "tol": r"mount_radius_tol\s*\|\s*([\d.]+)",
         "ang": r"mount_angle_tol_deg\s*\|\s*([\d.]+)",
+        "dr": r"dr_range_cm\s*\|\s*([\d.]+)",
         "t": r"total_timesteps\s*\|\s*([\d.e+]+)",
     }
     for line in logf.open(errors="ignore"):
@@ -54,10 +52,8 @@ def parse(logf: Path) -> list[dict]:
     return pts
 
 
-def smooth(ys: list[float], w: int = 5) -> list[float]:
-    """Centered moving average (NaN-safe), window w."""
-    out = []
-    n = len(ys)
+def smooth(ys: list[float], w: int = 7) -> list[float]:
+    out, n = [], len(ys)
     for i in range(n):
         lo, hi = max(0, i - w // 2), min(n, i + w // 2 + 1)
         vals = [v for v in ys[lo:hi] if v == v]
@@ -66,44 +62,28 @@ def smooth(ys: list[float], w: int = 5) -> list[float]:
 
 
 def main() -> None:
-    series = []
-    for r in RUNS:
-        f = _RUNS / f"{r}.log"
-        if f.exists():
-            p = parse(f)
-            if p:
-                series.append((r, p))
-    if not series:
-        print("no Phase-A logs found")
+    f = _RUNS / f"{RUN}.log"
+    if not f.exists():
+        print(f"no Phase-A log found: {f}")
+        return
+    pts = parse(f)
+    if not pts:
+        print(f"no data points in {f}")
         return
 
     fig, ax1 = plt.subplots(figsize=(9, 5.2))
     ax2 = ax1.twinx()
 
-    # success_rate (left), one continuous curve across both runs
-    all_t, all_s, all_tol, all_ang = [], [], [], []
-    boundary = None
-    for i, (r, p) in enumerate(series):
-        if i == 1:
-            boundary = p[0]["t"] / 1e6
-        for d in p:
-            all_t.append(d["t"] / 1e6)
-            all_s.append(d.get("succ", float("nan")))
-            all_tol.append(d.get("tol", float("nan")))
-            all_ang.append(d.get("ang", float("nan")))
+    all_t = [d["t"] / 1e6 for d in pts]
+    all_s = [d.get("succ", float("nan")) for d in pts]
+    all_tol = [d.get("tol", float("nan")) for d in pts]
 
-    ax1.plot(all_t, all_s, color="#a5d6a7", linewidth=1.0,
-             alpha=0.6, zorder=3)
+    ax1.plot(all_t, all_s, color="#a5d6a7", linewidth=1.0, alpha=0.55,
+             zorder=3)
     ax1.plot(all_t, smooth(all_s, 7), color="#2e7d32", linewidth=2.6,
              label="success_rate (smoothed)", zorder=5)
     ax2.plot(all_t, all_tol, color="#1565c0", linewidth=1.8,
              linestyle="--", label="mount_radius_tol (m)")
-
-    if boundary is not None:
-        ax1.axvline(boundary, color="#999999", linestyle=":", linewidth=1.2)
-        ax1.text(boundary, 0.04, "  finetune (ft03) resume",
-                 color="#666666", fontsize=8, rotation=90,
-                 va="bottom", ha="left")
 
     ax1.set_xlabel("training steps (x1e6)")
     ax1.set_ylabel("success_rate", color="#2e7d32")
@@ -114,7 +94,7 @@ def main() -> None:
     ax2.set_ylim(0.0, 0.60)
 
     ax1.axhline(1.0, color="#c62828", linestyle="--", linewidth=0.8, alpha=0.5)
-    ax1.set_title("Robot A Phase-A mount - success vs tightening gate")
+    ax1.set_title("Robot A mount - success vs tightening gate")
     ax1.grid(True, alpha=0.3)
 
     lines1, labels1 = ax1.get_legend_handles_labels()
@@ -125,7 +105,7 @@ def main() -> None:
     fig.tight_layout()
     _OUT.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(_OUT, dpi=130)
-    print(f"saved {_OUT}")
+    print(f"saved {_OUT} ({len(pts)} pts from {RUN})")
 
 
 if __name__ == "__main__":

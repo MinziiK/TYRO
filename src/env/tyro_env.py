@@ -214,6 +214,9 @@ class TyroEnv(gym.Env):
         self.cfg = cfg or EnvConfig()
         self.cfg.render = render or self.cfg.render
         self._np_random, _ = gym.utils.seeding.np_random(seed)
+        # Eval hook: when set, ``reset()`` uses this hub XY offset instead of
+        # sampling from ``RANDOM_POSITION_RANGE`` (see ``set_dr_hub_xy_offset``).
+        self._dr_hub_xy_override: Optional[np.ndarray] = None
 
         self.client: int = -1
         self.scene: Optional[Scene] = None
@@ -320,6 +323,11 @@ class TyroEnv(gym.Env):
         p.setAdditionalSearchPath(pybullet_data.getDataPath(),
                                   physicsClientId=self.client)
         p.setTimeStep(1.0 / self.cfg.sim_freq_hz, physicsClientId=self.client)
+        # GUI mode defaults to real-time stepping, which advances physics
+        # during wall-clock sleeps (e.g. eval viewer pacing) and desynchronises
+        # the policy loop. Force manual stepping only.
+        if mode == p.GUI:
+            p.setRealTimeSimulation(0, physicsClientId=self.client)
 
     def close(self) -> None:
         if self.client >= 0:
@@ -341,6 +349,12 @@ class TyroEnv(gym.Env):
             self._np_random, _ = gym.utils.seeding.np_random(seed)
 
         p.resetSimulation(physicsClientId=self.client)
+        # Invalidate the obs/action mask caches so they track the active cfg
+        # layout. This matters when a single env is reconfigured between phases
+        # (e.g. the E2E viewer switches mount→nut, changing obs/action dims);
+        # the masks are cheap to rebuild, so always refreshing is safe.
+        self._obs_mask_cache = None
+        self._action_mask_cache = None
         # resetSimulation() invalidates all body / constraint ids — clear cache.
         self._grasp_constraint = None
         self._grasp_kinematic = False
@@ -462,6 +476,28 @@ class TyroEnv(gym.Env):
         )
         self.handles = self.scene.build()
         self._maybe_disable_tire_hub_collision()
+
+        # **2026-06-09 (DR mount-target sync)** — the Stage-1 mount planner
+        # bakes its nominal end-pose from ``cfg.tire_mount_pos`` (a static
+        # config value). Under hub DR the scene hub translates by
+        # ``_dr_hub_xy_offset`` but this target did not move, so the baked
+        # nominal pointed at the *nominal* hub and the whole offset had to be
+        # absorbed by the RL residual alone (un-correctable past the residual
+        # cap, and the seated-tire bond target drifted off the real hub).
+        # Re-derive the seat target each reset = base target + the live hub XY
+        # offset, so A's nominal trajectory tracks the offset hub (mirrors how
+        # Robot B reads live bolt coords). Z is preserved. When DR is off the
+        # offset is zero ⇒ bit-identical to the pre-patch path.
+        if not hasattr(self, "_tire_mount_pos_base"):
+            self._tire_mount_pos_base = tuple(
+                float(x) for x in self.cfg.tire_mount_pos
+            )
+        dr_xy = getattr(self, "_dr_hub_xy_offset", np.zeros(2))
+        self.cfg.tire_mount_pos = (
+            self._tire_mount_pos_base[0] + float(dr_xy[0]),
+            self._tire_mount_pos_base[1] + float(dr_xy[1]),
+            self._tire_mount_pos_base[2],
+        )
 
         self.robot_A = make_robot_a(self.client, self.cfg)
         self.robot_B = make_robot_b(self.client, self.cfg)
@@ -744,6 +780,32 @@ class TyroEnv(gym.Env):
         i = int(self._np_random.integers(0, len(bank)))
         return bank[i].copy()
 
+    def _ik_mount_hold_qA(
+        self,
+        ee_target: np.ndarray,
+        warm_start_q: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """IK Robot A to the seated-tire 6-o'clock support grasp."""
+        ur = self.robot_A
+        if warm_start_q is not None:
+            warm_start = np.asarray(warm_start_q, dtype=np.float64)
+        else:
+            warm_start, _ = ur.joint_state()
+        ik = p.calculateInverseKinematics(
+            ur.uid, ur.EE_LINK_INDEX,
+            ee_target.tolist(), list(ur.FINAL_LOCK_QUATERNION),
+            lowerLimits=ur.arm.lower.tolist(),
+            upperLimits=ur.arm.upper.tolist(),
+            jointRanges=ur.arm.range.tolist(),
+            restPoses=warm_start.tolist(),
+            maxNumIterations=300, residualThreshold=1e-5,
+            physicsClientId=self.client,
+        )
+        ik = np.asarray(ik, dtype=np.float64)
+        if ur._ik_arm_slots and len(ik) > max(ur._ik_arm_slots):
+            return ik[ur._ik_arm_slots]
+        return np.asarray(ur.HOME_POSE, dtype=np.float64)
+
     def _apply_nut_fastening_setup(self) -> None:
         """Set up the Robot-B nut-fastening start state.
 
@@ -798,31 +860,25 @@ class TyroEnv(gym.Env):
             tread_dir = proj / proj_norm
         ee_target = tire_pos + R * tread_dir
 
-        # 3. Resolve Robot A's mount-hold joint vector. Prefer a recorded
-        #    snapshot of the *actual* learned mount-completion pose (exact
-        #    deployment-distribution match); fall back to analytic IK on the
-        #    6-o'clock grasp anchor. A small per-joint jitter is then added
-        #    so the Robot-B policy sees a distribution of support poses
-        #    rather than a single memorised configuration.
+        # 3. Resolve Robot A's mount-hold joint vector.
+        #    * Nominal hub: sample from the recorded mount-completion bank
+        #      (deployment-distribution match).
+        #    * Hub DR active: IK to the *current* seated-tire 6-o'clock
+        #      anchor so A tracks the offset hub/tire; the bank row (if any)
+        #      seeds the IK rest pose only.
+        #    Per-joint jitter is added in both cases so B sees a spread of
+        #    support poses rather than a single memorised configuration.
         ur = self.robot_A
-        arm_q = self._sample_mount_hold_qA()
-        if arm_q is None:
-            warm_start, _ = ur.joint_state()
-            ik = p.calculateInverseKinematics(
-                ur.uid, ur.EE_LINK_INDEX,
-                ee_target.tolist(), list(ur.FINAL_LOCK_QUATERNION),
-                lowerLimits=ur.arm.lower.tolist(),
-                upperLimits=ur.arm.upper.tolist(),
-                jointRanges=ur.arm.range.tolist(),
-                restPoses=warm_start.tolist(),
-                maxNumIterations=300, residualThreshold=1e-5,
-                physicsClientId=self.client,
-            )
-            ik = np.asarray(ik, dtype=np.float64)
-            if ur._ik_arm_slots and len(ik) > max(ur._ik_arm_slots):
-                arm_q = ik[ur._ik_arm_slots]
-            else:
-                arm_q = np.asarray(ur.HOME_POSE, dtype=np.float64)
+        hub_off = float(np.linalg.norm(
+            getattr(self, "_dr_hub_xy_offset", np.zeros(2)),
+        ))
+        bank_q = self._sample_mount_hold_qA()
+        if hub_off > 1e-5:
+            arm_q = self._ik_mount_hold_qA(ee_target, warm_start_q=bank_q)
+        elif bank_q is not None:
+            arm_q = bank_q
+        else:
+            arm_q = self._ik_mount_hold_qA(ee_target)
         # Per-joint robustness jitter (uniform, symmetric).
         jit = float(getattr(self.cfg, "nut_a_hold_jitter_rad", 0.0))
         if jit > 0.0:
@@ -883,10 +939,17 @@ class TyroEnv(gym.Env):
         self._nut_macro_leg_len = 1
         self._prev_axial_B = None
         self._nut_done = False
+        # v21 — branch-aware INSERT: last macro step a seat branch search ran.
+        self._nut_last_reseat_step = -(10 ** 9)
         self._nut_lock_quat = None
         self._nut_traj_pos = None
         self._nut_traj_q = None
         self._nut_traj_step = 0
+        # v19 — per-episode reset of the stall-truncation / path-waste state.
+        self._nut_stall_key = None
+        self._nut_stall_count = 0
+        self._nut_prog_best = None
+        self._nut_prev_ee = None
         self.task_stage = 0
 
         n = len(self.handles.bolts)
@@ -943,6 +1006,110 @@ class TyroEnv(gym.Env):
         axis = axis / max(float(np.linalg.norm(axis)), 1e-9)
         ang = math.acos(max(-1.0, min(1.0, c)))
         return axisangle3_to_quat(axis * ang)
+
+    def _nut_hotstart_branch_seed(self, idx: int, pos: np.ndarray,
+                                  want_z: np.ndarray) -> Optional[np.ndarray]:
+        """Per-bolt arm-joint seed that reaches the staging pose coaxially.
+
+        PyBullet's DLS IK cannot hop into the joint branch required for the
+        bottom-arc bolts (4–7) from a HOME/random seed — it saturates 60–90 cm
+        short, which previously mis-classified those bolts as 'unreachable'
+        and silently degraded the hot-start to HOME. Direct joint-space
+        optimisation (scipy least_squares over the 6 arm joints, multi-start)
+        reaches EVERY bolt with <1 mm error, so we solve it once per bolt here
+        and cache the result. The cached branch then seeds the regular
+        iterative IK at every reset (hub DR only shifts the target a few cm,
+        which the iterative refine absorbs).
+        """
+        cache = getattr(self, "_nut_hotstart_seed_q", None)
+        if cache is None:
+            cache = {}
+            # v19 — disk-backed seed sharing: the multi-start solve below costs
+            # seconds per bolt, and EVERY worker (88 in training) used to redo
+            # it on first encounter. Load the npz once; solves merge back in.
+            path = str(getattr(self.cfg, "nut_hotstart_seed_cache", "") or "")
+            if path:
+                try:
+                    import os
+                    if os.path.exists(path):
+                        data = np.load(path)
+                        for k in data.files:
+                            cache[int(k)] = np.asarray(
+                                data[k], dtype=np.float64)
+                except Exception:
+                    pass
+            self._nut_hotstart_seed_q = cache
+        if idx in cache:
+            return cache[idx]
+        try:
+            from scipy.optimize import least_squares
+        except ImportError:
+            cache[idx] = None
+            return None
+        rb = self.robot_B
+        lo, hi = rb.arm.lower, rb.arm.upper
+        q_save, _ = rb.joint_state()
+        q_save = np.asarray(q_save, dtype=np.float64)
+        pos = np.asarray(pos, dtype=np.float64)
+        want_z = np.asarray(want_z, dtype=np.float64)
+        want_z = want_z / max(float(np.linalg.norm(want_z)), 1e-9)
+
+        def _fk(q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            for s, qq in zip(rb.arm.indices, q):
+                p.resetJointState(rb.uid, int(s), float(qq),
+                                  targetVelocity=0.0,
+                                  physicsClientId=self.client)
+            ee, eq = rb.ee_pose()
+            return np.asarray(ee, dtype=np.float64), np.asarray(
+                quat_axis(eq, "z"), dtype=np.float64)
+
+        def _resid(q: np.ndarray) -> np.ndarray:
+            ee, gz = _fk(q)
+            # Sign-free coaxiality: the socket may bore from either direction.
+            mis = min(float(np.linalg.norm(gz - want_z)),
+                      float(np.linalg.norm(gz + want_z)))
+            return np.concatenate([(ee - pos) * 10.0, [mis * 2.0]])
+
+        best_q, best_pe = None, 1e9
+        for si in range(40):
+            q0 = q_save if si == 0 else self._np_random.uniform(lo, hi)
+            try:
+                r = least_squares(_resid, q0, bounds=(lo, hi), xtol=1e-10,
+                                  ftol=1e-10, max_nfev=300, diff_step=1e-4)
+            except Exception:
+                continue
+            ee, gz = _fk(r.x)
+            pe = float(np.linalg.norm(ee - pos))
+            ang = min(float(np.linalg.norm(gz - want_z)),
+                      float(np.linalg.norm(gz + want_z)))
+            if pe < best_pe:
+                best_pe, best_q = pe, np.asarray(r.x, dtype=np.float64).copy()
+            if pe < 0.003 and ang < 0.05:
+                break
+        # Restore the live config (caller owns the actual teleport).
+        for s, qq in zip(rb.arm.indices, q_save):
+            p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        cache[idx] = best_q if best_pe < 0.02 else None
+        # Persist (atomic rename; concurrent writers race benignly — the
+        # winning file is always a valid superset solved by SOME worker).
+        path = str(getattr(self.cfg, "nut_hotstart_seed_cache", "") or "")
+        if path and cache[idx] is not None:
+            try:
+                import os
+                import tempfile
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                payload = {str(k): v for k, v in cache.items()
+                           if v is not None}
+                fd, tmp = tempfile.mkstemp(
+                    dir=os.path.dirname(path) or ".", suffix=".npz")
+                os.close(fd)
+                np.savez(tmp, **payload)
+                # np.savez appends .npz when missing; mkstemp already has it.
+                os.replace(tmp, path)
+            except Exception:
+                pass
+        return cache[idx]
 
     def _apply_nut_b_hotstart(self) -> None:
         """Reverse-curriculum start pose for Robot B (nut task).
@@ -1002,15 +1169,36 @@ class TyroEnv(gym.Env):
         n_roll = 12
         best_ik = warm.copy()
         best_err = 1e9
-        for ri in range(n_roll):
-            roll = 2.0 * math.pi * ri / n_roll
-            roll_q = np.asarray(
-                axisangle3_to_quat(want_z * roll), dtype=np.float64)
-            _, target_quat = p.multiplyTransforms(
-                [0.0, 0.0, 0.0], roll_q.tolist(),
-                [0.0, 0.0, 0.0], base_quat.tolist(),
+        prefer_up = bool(getattr(self.cfg, "nut_b_hotstart_elbow_up", False))
+        up_gate = float(getattr(self.cfg, "nut_b_hotstart_reach_gate", 0.04))
+        best_score = -1e9
+        best_score_ik = None
+        if not hasattr(self, "_nut_hotstart_ik_cache"):
+            self._nut_hotstart_ik_cache: Dict[int, Tuple[float, np.ndarray]] = {}
+        ik_cache = self._nut_hotstart_ik_cache
+
+        def _arm_height_score() -> float:
+            zs = []
+            for s in rb.arm.indices:
+                ls = p.getLinkState(rb.uid, int(s),
+                                    physicsClientId=self.client)
+                zs.append(float(ls[0][2]))
+            return float(np.mean(zs)) if zs else 0.0
+
+        def _refine_from_seed(
+                seed: np.ndarray, target_quat,
+                ) -> Tuple[np.ndarray, float]:
+            """One hot-start IK refine (12 PyBullet iters) from ``seed``."""
+            ik = np.asarray(seed, dtype=np.float64).copy()
+            seed_arm = np.clip(
+                ik[: len(rb.arm.indices)]
+                if len(ik) >= len(rb.arm.indices) else ik,
+                rb.arm.lower, rb.arm.upper,
             )
-            ik = warm.copy()
+            for s, q in zip(rb.arm.indices, seed_arm):
+                p.resetJointState(rb.uid, int(s), float(q),
+                                  targetVelocity=0.0,
+                                  physicsClientId=self.client)
             for _ in range(12):
                 sol = p.calculateInverseKinematics(
                     rb.uid, rb.EE_LINK_INDEX,
@@ -1025,7 +1213,8 @@ class TyroEnv(gym.Env):
                 sol = np.asarray(sol, dtype=np.float64)
                 if not (rb._ik_arm_slots and len(sol) > max(rb._ik_arm_slots)):
                     break
-                arm_sol = np.clip(sol[rb._ik_arm_slots], rb.arm.lower, rb.arm.upper)
+                arm_sol = np.clip(
+                    sol[rb._ik_arm_slots], rb.arm.lower, rb.arm.upper)
                 for s, q in zip(rb.arm.indices, arm_sol):
                     p.resetJointState(rb.uid, int(s), float(q),
                                       targetVelocity=0.0,
@@ -1036,49 +1225,94 @@ class TyroEnv(gym.Env):
                     break
             err = float(np.linalg.norm(
                 np.asarray(rb.ee_pose()[0]) - start_pos))
+            return ik, err
+
+        def _record_candidate(ik: np.ndarray, err: float, roll: float) -> None:
+            nonlocal best_err, best_ik, best_score, best_score_ik, best_roll
             if err < best_err:
                 best_err = err
                 best_ik = np.asarray(ik, dtype=np.float64).copy()
-            # Reset to HOME before trying the next roll so each solve starts
-            # from the same warm-start branch.
-            for s, q in zip(rb.arm.indices, warm):
-                p.resetJointState(rb.uid, int(s), float(q), targetVelocity=0.0,
-                                  physicsClientId=self.client)
-            if best_err < 0.01:
-                break
-        # Restore HOME joints; the block below re-applies the final solution.
-        for s, q in zip(rb.arm.indices, warm):
-            p.resetJointState(rb.uid, int(s), float(q), targetVelocity=0.0,
-                              physicsClientId=self.client)
-        ik = best_ik
-        if rb._ik_arm_slots and len(ik) > max(rb._ik_arm_slots):
+                best_roll = float(roll)
+            if prefer_up and err < up_gate:
+                score = _arm_height_score()
+                if score > best_score:
+                    best_score = score
+                    best_score_ik = np.asarray(ik, dtype=np.float64).copy()
+
+        def _apply_ik_teleport(ik: np.ndarray) -> None:
+            if not (rb._ik_arm_slots and len(ik) > max(rb._ik_arm_slots)):
+                return
             arm_q = np.clip(ik[rb._ik_arm_slots], rb.arm.lower, rb.arm.upper)
             for s, q in zip(rb.arm.indices, arm_q):
                 p.resetJointState(
                     rb.uid, int(s), targetValue=float(q), targetVelocity=0.0,
                     physicsClientId=self.client,
                 )
-            # Re-seed the delta-EE accumulator + smoothing filter so the
-            # first zero-Δ step holds the hot-start pose instead of yanking
-            # back toward the stale HOME target.
             rb.last_target_pos = rb.ee_pose()[0].copy()
-            # Pin the motor targets to the teleported config and seed the
-            # smoothing filter with it. Without this the joints are only
-            # *reset* (kinematically) while the PD targets still point at the
-            # stale HOME branch; the first step's IK then re-solves from the
-            # HOME warm-start and can land a *different* arm branch for bolts
-            # on the far arc (4–6), swinging the socket ~30 cm off-axis before
-            # the policy ever acts (observed: zero-action failed to hold the
-            # staging pose for bolts 4/5/6 while 0/1/2/8 held).
             rb._cmd_q = arm_q.copy()
             rb.drive_arm_targets(arm_q)
-            # Capture the achieved (reachable, coaxial) tool orientation so the
-            # APPROACH lock holds exactly this branch — the analytic minimal-
-            # rotation quat is NOT always the reachable roll (the hub-center
-            # start needs a specific roll the single-quat solve misses).
             self._nut_lock_quat = np.asarray(
-                rb.ee_pose()[1], dtype=np.float64
+                rb.ee_pose()[1], dtype=np.float64,
             ).copy()
+
+        def _target_quat_for_roll(roll: float):
+            roll_q = np.asarray(
+                axisangle3_to_quat(want_z * float(roll)), dtype=np.float64)
+            _, tq = p.multiplyTransforms(
+                [0.0, 0.0, 0.0], roll_q.tolist(),
+                [0.0, 0.0, 0.0], base_quat.tolist(),
+            )
+            return tq
+
+        best_roll = 0.0
+        # Fast path — one refine from the cached (roll, arm seed). Skips the
+        # scipy branch seed + 12-roll grid that cost ~1.3 s/reset.
+        cached = ik_cache.get(idx)
+        if cached is not None:
+            c_roll, c_seed = cached
+            ik, err = _refine_from_seed(
+                np.asarray(c_seed), _target_quat_for_roll(c_roll))
+            if err < 0.05:
+                _apply_ik_teleport(ik)
+                return
+
+        # Slow path — full roll × seed search (first visit per bolt / cache miss).
+        seed_pool = [warm]
+        if bool(getattr(self.cfg, "nut_pure_rl", False)):
+            branch_seed = self._nut_hotstart_branch_seed(idx, approach, want_z)
+            if branch_seed is not None:
+                seed_pool.insert(0, np.asarray(branch_seed, dtype=np.float64))
+            for _ in range(4):
+                seed_pool.append(
+                    self._np_random.uniform(rb.arm.lower, rb.arm.upper)
+                )
+        for ri in range(n_roll):
+            roll = 2.0 * math.pi * ri / n_roll
+            target_quat = _target_quat_for_roll(roll)
+            for seed in seed_pool:
+                ik, err = _refine_from_seed(seed, target_quat)
+                _record_candidate(ik, err, roll)
+                for s, q in zip(rb.arm.indices, warm):
+                    p.resetJointState(rb.uid, int(s), float(q),
+                                      targetVelocity=0.0,
+                                      physicsClientId=self.client)
+            if not prefer_up and best_err < 0.01:
+                break
+        if prefer_up and best_score_ik is not None:
+            best_ik = best_score_ik
+        for s, q in zip(rb.arm.indices, warm):
+            p.resetJointState(rb.uid, int(s), float(q), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        if (
+            bool(getattr(self.cfg, "nut_pure_rl", False))
+            and best_err > 0.05
+        ):
+            return
+        _apply_ik_teleport(best_ik)
+        if best_err < 0.05 and rb._ik_arm_slots:
+            arm_q = np.clip(
+                best_ik[rb._ik_arm_slots], rb.arm.lower, rb.arm.upper)
+            ik_cache[idx] = (best_roll, arm_q.copy())
 
     def _nut_gate_metrics(self, idx: int) -> Tuple[float, float]:
         """(d_B, theta_B) for the nut-runner tool_tip vs bolt ``idx``.
@@ -1130,8 +1364,29 @@ class TyroEnv(gym.Env):
         a = np.asarray(self.scene.bolt_axis(idx), dtype=np.float64)
         return a / max(float(np.linalg.norm(a)), 1e-9)
 
+    def _nut_stage_target_axial(self) -> float:
+        """Signed axial depth the policy is currently driving the socket to.
+
+        * APPROACH (``_nut_subphase == 0``) → the staging point (just past the
+          tip).
+        * INSERT / HOLD (subphase 1, macro_stage ≤ 1) → the hub-face **base**
+          (``−L/2``), the deepest reachable seat.
+        * RETRACT (subphase 1, macro_stage 2) → the cleared point past the tip.
+
+        This is the per-leg goal for the pure-RL axial potential (and the
+        ``axial_err`` obs channel) so the policy always knows which way to plunge.
+        """
+        if int(self._nut_subphase) == 0:
+            return float(self._nut_staging_axial())
+        if int(self._nut_macro_stage) >= 2:
+            return float(self._nut_retract_axial())
+        L = float(getattr(self.cfg, "bolt_length", 0.10))
+        return -0.5 * L
+
     def _nut_obs_block(self, eeB_pos: np.ndarray, ws: float) -> np.ndarray:
-        """7-d nut-task observation block for the current target bolt.
+        """Nut-task observation block for the current target bolt.
+
+        Base 7-d (always):
 
         * [0:3] ``(staging_point − tool_tip) / ws`` — the direct approach
           target vector (on-axis, just outside the stud tip). This is exactly
@@ -1140,16 +1395,39 @@ class TyroEnv(gym.Env):
           bolt-centre vector + orientation quaternion.
         * [3:6] bolt axis unit vector (world) — the insertion direction.
         * [6]   ``θ / (π/2)`` — tool +Z ↔ bolt-axis angle (0 aligned, 1 perp).
+
+        Pure-RL extra 5-d (``nut_pure_rl`` only; the policy now drives the whole
+        insert→hold→retract, so it needs to sense the in/out state):
+
+        * [7]  ``axial / L``    — signed depth along the stud (base −0.5, tip
+          +0.5, staging ≈ +1.3).
+        * [8]  ``lateral / ws`` — off-axis (coaxiality) error.
+        * [9]  ``subphase``     — 0 APPROACH, 1 INSERT/HOLD/RETRACT.
+        * [10] ``stage / 2``    — macro stage 0 insert / 1 hold / 2 retract.
+        * [11] ``axial_err / L``— signed (target − axial), i.e. how far / which
+          way to plunge to reach the current leg's goal depth.
         """
         idx = int(self._nut_target_idx)
         a = self._nut_axis_unit(idx)
         staging = self._nut_point_on_axis(idx, self._nut_staging_axial())
         vec_to_staging = (staging - np.asarray(eeB_pos, dtype=np.float64)) / ws
-        _, _, theta = self._nut_axial_lateral(idx)
+        axial, lateral, theta = self._nut_axial_lateral(idx)
         theta_n = float(np.clip(theta / (0.5 * math.pi), 0.0, 1.0))
-        return np.concatenate(
+        base = np.concatenate(
             [vec_to_staging, a, np.array([theta_n], dtype=np.float64)]
         ).astype(np.float64)
+        if not bool(getattr(self.cfg, "nut_pure_rl", False)):
+            return base
+        L = max(float(getattr(self.cfg, "bolt_length", 0.10)), 1e-6)
+        tgt = self._nut_stage_target_axial()
+        extra = np.array([
+            float(axial) / L,
+            float(lateral) / ws,
+            float(self._nut_subphase),
+            float(self._nut_macro_stage) / 2.0,
+            float(tgt - axial) / L,
+        ], dtype=np.float64)
+        return np.concatenate([base, extra]).astype(np.float64)
 
     def _nut_point_on_axis(self, idx: int, axial: float) -> np.ndarray:
         """World point at signed depth ``axial`` along bolt ``idx``'s axis."""
@@ -1230,12 +1508,18 @@ class TyroEnv(gym.Env):
             center = self._nut_ref_center()
             wps = [from_pos, center, staging]
         else:
-            prev_idx = int(self._nut_fastened[-1])
-            retr_y = float(
-                self._nut_point_on_axis(prev_idx, self._nut_retract_axial())[1]
-            )
-            hop = np.array([staging[0], retr_y, staging[2]], dtype=np.float64)
-            wps = [from_pos, hop, staging]
+            # Minimal bolt→bolt move (2026-06-09). Previously the socket backed
+            # out to the *previous* bolt's deep retract Y-plane and shuffled
+            # across — a large, repetitive in/out detour that looked clumsy.
+            # Instead arc directly from the current (retract) pose to the next
+            # staging point. Both lie ~one standoff outside the ring face, so a
+            # straight chord between adjacent bolts can graze the studs in
+            # between; bow the midpoint a little further OUT along the bolt axis
+            # (``nut_transit_clear``) so the short arc clears the stud tips.
+            axis_out = self._nut_axis_unit(idx)  # points away from the hub face
+            clear = float(getattr(self.cfg, "nut_transit_clear", 0.04))
+            mid = 0.5 * (from_pos + staging) + axis_out * clear
+            wps = [from_pos, mid, staging]
 
         self._nut_traj_pos = _multi_min_jerk_positions(wps, n_steps)
         self._nut_traj_step = 0
@@ -1693,6 +1977,13 @@ class TyroEnv(gym.Env):
             getattr(self.cfg, "nut_arrive_ang_tol_rad", np.deg2rad(35.0))
         )
         leg_max = int(getattr(self.cfg, "nut_macro_leg_max_steps", 50))
+        # Pure-RL: the policy must actually achieve the seat/clear gates itself.
+        # Disable the per-leg watchdog so a stall can't force-advance the leg and
+        # hand the policy a free R_insert / R_fasten it didn't earn (which would
+        # be farmable: arrive, wait out the watchdog, collect). A genuinely stuck
+        # bolt then just runs out the horizon with no sparse reward, as it should.
+        if bool(getattr(self.cfg, "nut_pure_rl", False)):
+            leg_max = 1_000_000_000
         staging_axial = self._nut_staging_axial()
 
         if self._nut_subphase == 0:
@@ -1703,6 +1994,15 @@ class TyroEnv(gym.Env):
             # the policy actually sample the macro reward under exploration.
             d_stage = float(math.hypot(axial - staging_axial, lateral))
             parked = d_stage < arrive_pos_tol and theta < arrive_ang_tol
+            # Pure-RL insert is axis-only (±Y): require coaxial alignment at
+            # arrive before handing off to insert. v19 tightens this to a
+            # dedicated gate ("the nut runner must be exactly above the bolt,
+            # aligned along Y, before it may plunge"); the align servo then
+            # erases the residual offset during the slide.
+            if bool(getattr(self.cfg, "nut_pure_rl", False)):
+                arrive_lat = float(getattr(
+                    self.cfg, "nut_arrive_lat_tol", 2.0 * lat_tol))
+                parked = parked and lateral < arrive_lat
             if parked:
                 self._nut_arrive_count += 1
             else:
@@ -1718,6 +2018,11 @@ class TyroEnv(gym.Env):
                 self._nut_macro_quat = self._coaxial_quat_preserving_roll(idx)
                 # Plan the INSERT leg (current staging → hub-face base).
                 self._setup_nut_macro_leg(self._nut_macro_target(idx)[0])
+                # Pure-RL: fresh axial-PB baseline so the first INSERT step
+                # doesn't book a spurious Δ from the (stale) approach phase.
+                self._prev_axial_err_B = None
+                # v21 — fresh branch-aware plunge bookkeeping for this leg.
+                self._nut_last_reseat_step = -(10 ** 9)
                 events["arrived"] = True
                 self._set_bolt_color(idx, self._NUT_COLOR_RETRACT)
             return events
@@ -1730,9 +2035,31 @@ class TyroEnv(gym.Env):
             # INSERT — wait until the socket has seated at the hub-face base
             # (deepest reachable; the −Y approach margin makes the plunge a
             # longer/deeper stroke, but the endpoint is still the base).
+            seat_lat = lat_tol * float(
+                getattr(self.cfg, "nut_seat_lat_mult", 2.0))
             seated = (
-                abs(axial - (-0.5 * L)) < depth_tol and lateral < 2.0 * lat_tol
+                abs(axial - (-0.5 * L)) < depth_tol and lateral < seat_lat
             )
+            # v21 — branch-aware plunge. The env-driven servo warm-starts IK
+            # from the APPROACH branch; at the workspace edge that branch can
+            # saturate ~1-2 cm short of the seat, so the gate never fires and
+            # the leg stalls. The bolt IS reachable from a different branch, so
+            # once the plunge has clearly overrun a normal stroke without
+            # seating, search for a reaching seat branch and switch B into it;
+            # the servo then seats. Retries periodically while stuck. Policy
+            # never owned this DOF, so this is pure env-side control (no retrain).
+            reseat_after = int(getattr(self.cfg, "nut_insert_reseat_after", 40))
+            if (not seated
+                    and bool(getattr(self.cfg, "nut_b_insert_branch_search", False))
+                    and bool(getattr(self.cfg, "nut_pure_rl", False))
+                    and self._nut_macro_step >= reseat_after
+                    and (self._nut_macro_step - self._nut_last_reseat_step)
+                    >= reseat_after):
+                self._nut_last_reseat_step = int(self._nut_macro_step)
+                if self._nut_switch_to_seat_branch(idx):
+                    axial, lateral, _th = self._nut_axial_lateral(idx)
+                    seated = (abs(axial - (-0.5 * L)) < depth_tol
+                              and lateral < seat_lat)
             if seated or stalled:
                 self._nut_macro_stage = 1
                 self._nut_macro_step = 0
@@ -1752,6 +2079,9 @@ class TyroEnv(gym.Env):
                 self._setup_nut_macro_leg(self._nut_macro_target(idx)[0])
                 events["inserted"] = True
                 self._prev_axial_B = None
+                # Pure-RL: the stage target jumps base → cleared point, so reset
+                # the axial-PB baseline to avoid a one-step reward spike.
+                self._prev_axial_err_B = None
         else:
             # RETRACT — wait until the socket clears the tip + clearance, and
             # the extra ``margin`` further out (symmetric to the deeper insert).
@@ -1800,6 +2130,114 @@ class TyroEnv(gym.Env):
                     if bool(getattr(self.cfg, "nut_b_planner_residual", False)):
                         self._generate_nut_approach_traj()
         return events
+
+    def _nut_best_seat_q(self, idx: int) -> Optional[np.ndarray]:
+        """Strongest reachable coaxial seat config for bolt ``idx``.
+
+        Runs ``nut_insert_reseat_tries`` independent roll-free, multi-seed IK
+        restarts to the hub-face base (``axial = −L/2``) and returns the joint
+        vector achieving the DEEPEST coaxial socket pose. The extra restarts
+        (vs a single ``_ik_b_rollfree`` call) are what reliably find the
+        elbow/wrist branch that reaches the workspace-edge bolts — a single
+        warm-started solve stays in the (short-reaching) approach branch.
+        Returns ``None`` if no candidate is found. Restores the live config.
+        """
+        rb = self.robot_B
+        L = float(getattr(self.cfg, "bolt_length", 0.10))
+        axis = self._nut_axis_unit(idx)
+        bolt = np.asarray(self.scene.bolt_pose(idx)[0], dtype=np.float64)
+        seat_pt = bolt + axis * (-0.5 * L)
+        want_z = -axis / max(float(np.linalg.norm(axis)), 1e-9)
+        lo, hi = rb.arm.lower, rb.arm.upper
+        tries = max(1, int(getattr(self.cfg, "nut_insert_reseat_tries", 8)))
+        q_save, _ = rb.joint_state()
+        best_q, best_cost = None, 1e9
+        # Mirror the validated oracle seat IK (``scripts._best_b_ik``): seed only
+        # from the rest pose + fresh random restarts (NOT the live config — that
+        # biases every solve back into the short-reaching stuck branch). Each
+        # ``try`` is an independent random sweep; the deepest+coaxial wins.
+        for tri in range(tries):
+            rng = np.random.default_rng(
+                11 + idx * 131 + tri * 17 + int(self._step_count))
+            for ri in range(16):
+                quat = np.asarray(
+                    self._quat_z_roll(want_z, 2.0 * math.pi * ri / 16),
+                    dtype=np.float64,
+                ).tolist()
+                for k in range(4):
+                    seed = (rb.arm.rest if k == 0
+                            else rng.uniform(lo, hi)).tolist()
+                    ik = p.calculateInverseKinematics(
+                        rb.uid, rb.EE_LINK_INDEX, seat_pt.tolist(), quat,
+                        lowerLimits=lo.tolist(), upperLimits=hi.tolist(),
+                        jointRanges=rb.arm.range.tolist(), restPoses=seed,
+                        maxNumIterations=400, residualThreshold=1e-6,
+                        physicsClientId=self.client,
+                    )
+                    ik = np.asarray(ik, dtype=np.float64)
+                    if not (rb._ik_arm_slots and len(ik) > max(rb._ik_arm_slots)):
+                        continue
+                    q = np.clip(ik[rb._ik_arm_slots], lo, hi)
+                    for s, qq in zip(rb.arm.indices, q):
+                        p.resetJointState(rb.uid, int(s), float(qq),
+                                          targetVelocity=0.0,
+                                          physicsClientId=self.client)
+                    ee, eq = rb.ee_pose()
+                    dp = float(np.linalg.norm(
+                        np.asarray(ee, dtype=np.float64) - seat_pt))
+                    gz = quat_axis(eq, "z")
+                    ang = float(angle_between(gz, want_z))
+                    ang = min(ang, math.pi - ang)
+                    cost = dp + 0.02 * ang
+                    if cost < best_cost:
+                        best_cost = cost
+                        best_q = np.asarray(q, dtype=np.float64).copy()
+                if best_cost < 0.01:
+                    break
+            if best_cost < 0.01:
+                break
+        # Restore the live config; the caller commits the branch only if useful.
+        for s, qq in zip(rb.arm.indices, q_save):
+            p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        rb._cmd_q = None
+        return best_q
+
+    def _nut_switch_to_seat_branch(self, idx: int) -> bool:
+        """On a stalled plunge, switch Robot B into a reachable seat branch.
+
+        Finds the deepest coaxial seat config (:meth:`_nut_best_seat_q`) and,
+        only if it is *strictly deeper* than the stuck plunge AND reaches the
+        seat band, commits it (``resetJointState`` — a one-time branch swap at a
+        config the oracle proved collision-free) and re-seeds the servo target.
+        Returns ``True`` iff B was switched into a seated branch.
+        """
+        L = float(getattr(self.cfg, "bolt_length", 0.10))
+        depth_tol = float(getattr(self.cfg, "nut_insert_depth_tol", 0.02))
+        lat_tol = float(getattr(self.cfg, "nut_lateral_tol", 0.015))
+        seat_lat = lat_tol * float(getattr(self.cfg, "nut_seat_lat_mult", 2.0))
+        rb = self.robot_B
+        q_save, _ = rb.joint_state()
+        q = self._nut_best_seat_q(idx)
+        if q is None:
+            return False
+        for s, qq in zip(rb.arm.indices, q):
+            p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        ax, lat, _th = self._nut_axial_lateral(idx)
+        if abs(ax - (-0.5 * L)) < depth_tol and lat < seat_lat:
+            rb._cmd_q = None
+            rb.drive_arm_targets(np.asarray(q, dtype=np.float64))
+            rb.last_target_pos = np.asarray(
+                rb.ee_pose()[0], dtype=np.float64).copy()
+            return True
+        # Best branch still can't seat — restore the live (stuck) config so the
+        # plunge servo keeps trying rather than freezing in a worse pose.
+        for s, qq in zip(rb.arm.indices, q_save):
+            p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        rb._cmd_q = None
+        return False
 
     # ------------------------------------------------------------------
     # Action / obs masks (Phase 1 feature isolation)
@@ -1966,6 +2404,31 @@ class TyroEnv(gym.Env):
         ``_advance_nut_fastening`` at the APPROACH→macro trigger.
         """
         self.cfg.nut_arrive_ang_tol_rad = float(max(1e-3, value_rad))
+
+    def set_nut_arrive_pos_tol(self, value_m: float) -> None:
+        """Curriculum entry point for the arrive-position capture radius (m).
+
+        Broadcast each rollout boundary by ``NutArrivePosCurriculumCallback``
+        as it ramps the staging capture sphere from a loose start to a tight
+        end; read by ``_advance_nut_fastening`` at the APPROACH→insert trigger
+        (``d_stage < nut_arrive_pos_tol``). Note this is the *axial* capture
+        distance; the pure-RL coaxiality (lateral) gate is fixed by the seat
+        physics (axis-only insert can't change lateral) and is NOT ramped.
+        """
+        self.cfg.nut_arrive_pos_tol = float(max(1e-3, value_m))
+
+    def set_random_position_range(self, value_m: float) -> None:
+        """Curriculum entry point for the DR hub-offset half-range (metres).
+
+        Broadcast each rollout boundary by ``DRRangeCurriculumCallback`` as it
+        ramps the offset from 0 up to the target (e.g. 0.05 m); read at reset by
+        ``_maybe_apply_domain_randomization``. Enabling a non-zero range also
+        flips the DR master switch on so the offset actually takes effect.
+        """
+        v = float(max(0.0, value_m))
+        self.cfg.RANDOM_POSITION_RANGE = v
+        if v > 0.0:
+            self.cfg.USE_DOMAIN_RANDOMIZATION = True
 
     def get_start_pos_alpha(self) -> float:
         """Mirror of ``set_start_pos_alpha`` — useful for logging callbacks."""
@@ -3234,12 +3697,39 @@ class TyroEnv(gym.Env):
         if rng <= 0.0:
             return
 
-        self._dr_hub_xy_offset = self._np_random.uniform(
-            -rng, rng, size=2
-        ).astype(np.float64, copy=False)
-        self._dr_cargo_xy_offset = self._np_random.uniform(
-            -rng, rng, size=2
-        ).astype(np.float64, copy=False)
+        override = getattr(self, "_dr_hub_xy_override", None)
+        if override is not None:
+            self._dr_hub_xy_offset = np.asarray(
+                override, dtype=np.float64
+            )[:2].copy()
+        else:
+            self._dr_hub_xy_offset = self._np_random.uniform(
+                -rng, rng, size=2
+            ).astype(np.float64, copy=False)
+        # Cargo is perturbed independently of the hub only when enabled. The
+        # nut-fastening DR fine-tune sets ``DR_CARGO_ENABLE = False`` so the
+        # measured robustness is attributable purely to hub placement error.
+        if bool(getattr(self.cfg, "DR_CARGO_ENABLE", True)):
+            self._dr_cargo_xy_offset = self._np_random.uniform(
+                -rng, rng, size=2
+            ).astype(np.float64, copy=False)
+
+    def set_dr_hub_xy_offset(
+        self, offset_xy: Optional[np.ndarray],
+    ) -> None:
+        """Pin (or clear) the hub XY offset used on the next ``reset()``.
+
+        Pass ``None`` to restore uniform sampling from
+        ``cfg.RANDOM_POSITION_RANGE``. Passing a 2-vector enables DR and
+        forces that exact hub translation every reset until cleared.
+        """
+        if offset_xy is None:
+            self._dr_hub_xy_override = None
+            return
+        self._dr_hub_xy_override = np.asarray(
+            offset_xy, dtype=np.float64
+        )[:2].copy()
+        self.cfg.USE_DOMAIN_RANDOMIZATION = True
 
     def _create_grasp_constraint_in_place(
         self, *, force_fixed: bool = False,
@@ -4286,6 +4776,16 @@ class TyroEnv(gym.Env):
         # whole planner/residual machinery — it is Robot-A-only.
         if bool(getattr(self.cfg, "nut_fastening_task", False)):
             if self._nut_frozen_qA is not None:
+                if bool(getattr(self.cfg, "nut_a_kinematic_freeze", False)):
+                    # v19 — A is a RIGID fixture: hard-reset its joints to the
+                    # frozen hold pose every step so Robot-B contact can never
+                    # push the arm (PD holding alone is compliant and visibly
+                    # yields when B brushes it).
+                    ra = self.robot_A
+                    for s, q in zip(ra.arm.indices, self._nut_frozen_qA):
+                        p.resetJointState(ra.uid, int(s), float(q),
+                                          targetVelocity=0.0,
+                                          physicsClientId=self.client)
                 self.robot_A.drive_arm_targets(self._nut_frozen_qA)
             # MACRO leg (subphase 1): the env forces a coaxial insert→hold→
             # retract straight along the bolt axis; the policy is ignored.
@@ -4334,10 +4834,81 @@ class TyroEnv(gym.Env):
             elif bool(getattr(self.cfg, "nut_b_lock_coaxial", True)):
                 ps = float(getattr(self.cfg, "nut_pos_scale",
                                    self.cfg.action.pos_scale))
-                d_pos_B = np.asarray(action[6:9], dtype=np.float64) * ps
+                # v19 solo action: the whole action IS B's 3-d Δposition.
+                a_off = 0 if int(self.cfg.action.dim) == 3 else 6
+                d_pos_B = np.asarray(
+                    action[a_off:a_off + 3], dtype=np.float64) * ps
+                # Pure-RL insert/retract: plunge and retract ONLY along the bolt
+                # axis (±Y in the hub frame). Approach/transit (subphase 0)
+                # keeps full 3-DOF so B can move freely between bolts; once the
+                # arrive gate fires the in/out is a coaxial slide the policy learns.
+                if (
+                    bool(getattr(self.cfg, "nut_pure_rl", False))
+                    and int(self._nut_subphase) == 1
+                ):
+                    idx_t = int(self._nut_target_idx)
+                    axis = self._nut_axis_unit(idx_t)
+                    d_pos_B = float(np.dot(d_pos_B, axis)) * axis
+                    # v19 align servo — the env zeroes the residual lateral
+                    # offset (rate-limited) so the plunge is a geometrically
+                    # exact on-axis slide; the policy keeps the axial DOF.
+                    ee_now = np.asarray(rb.ee_pose()[0], dtype=np.float64)
+                    bolt_pos = np.asarray(
+                        self.scene.bolt_pose(idx_t)[0], dtype=np.float64)
+                    # v20 — INSERT axial servo: drive the socket to the hub-
+                    # face base so the nut runner fully envelops the stud.
+                    if (
+                        bool(getattr(self.cfg, "nut_b_axial_insert_servo", False))
+                        and int(self._nut_macro_stage) == 0
+                    ):
+                        L_ax = float(getattr(self.cfg, "bolt_length", 0.10))
+                        target_ax = -0.5 * L_ax
+                        ax_now = float(np.dot(ee_now - bolt_pos, axis))
+                        ax_err = target_ax - ax_now
+                        ax_rate = float(getattr(
+                            self.cfg, "nut_b_axial_insert_servo_rate", 0.008))
+                        if ax_err < -1e-6:
+                            ax_drive = -min(ax_rate, -ax_err)
+                            d_pos_B = ax_drive * axis
+                    # v19 align servo — zero lateral offset (rate-limited).
+                    if bool(getattr(self.cfg, "nut_b_align_servo", False)):
+                        v = ee_now - bolt_pos
+                        lat_vec = v - float(np.dot(v, axis)) * axis
+                        lat = float(np.linalg.norm(lat_vec))
+                        rate = float(getattr(
+                            self.cfg, "nut_b_align_servo_rate", 0.005))
+                        if lat > 1e-6:
+                            d_pos_B = d_pos_B - lat_vec * min(1.0, rate / lat)
                 if rb.last_target_pos is None:
                     rb.last_target_pos = rb.ee_pose()[0].copy()
                 rb.last_target_pos = rb.last_target_pos + d_pos_B
+                # v19 — clamp the INSERT/RETRACT target onto the working band
+                # of the bolt axis. Without this an over-plunging policy
+                # accumulates an IK target metres past the hub-face base; the
+                # arm physically wedges into the hub (collision => instant
+                # fail under nut_collision_fail) even though the intended
+                # motion was a few cm. Band: just past the seat depth to just
+                # outside the staging point.
+                if (
+                    bool(getattr(self.cfg, "nut_pure_rl", False))
+                    and int(self._nut_subphase) == 1
+                    and bool(getattr(self.cfg, "nut_b_align_servo", False))
+                ):
+                    idx_t = int(self._nut_target_idx)
+                    axis = self._nut_axis_unit(idx_t)
+                    bolt_pos = np.asarray(
+                        self.scene.bolt_pose(idx_t)[0], dtype=np.float64)
+                    L = float(getattr(self.cfg, "bolt_length", 0.10))
+                    v = rb.last_target_pos - bolt_pos
+                    ax = float(np.dot(v, axis))
+                    ax_cl = float(np.clip(
+                        ax, -0.5 * L - 0.01,
+                        self._nut_staging_axial() + 0.05,
+                    ))
+                    if ax_cl != ax:
+                        rb.last_target_pos = (
+                            rb.last_target_pos + (ax_cl - ax) * axis
+                        )
                 lock_quat = self._nut_lock_quat
                 if lock_quat is None:
                     lock_quat = self._quat_align_tool_z(
@@ -4630,7 +5201,7 @@ class TyroEnv(gym.Env):
         if bool(getattr(self.cfg, "include_hub_guide_obs", True)):
             parts.append(hub_guide_vector)            # 3  ← v7 vector guide
         if bool(getattr(self.cfg, "nut_fastening_task", False)):
-            parts.append(self._nut_obs_block(eeB_pos, ws))  # 7 ← nut task
+            parts.append(self._nut_obs_block(eeB_pos, ws))  # 7 (12 pure-RL) ← nut
         obs = np.concatenate(parts).astype(np.float32)
 
         # Phase 1 feature isolation: zero the Panda-side channels so the
@@ -4709,8 +5280,10 @@ class TyroEnv(gym.Env):
 
             wpb = float(rcfg.w_pb_nut)
             pb_nut = 0.0
+            progress = 0.0
             if wpb > 0.0 and self._prev_d_B is not None:
-                pb_nut = wpb * float(self._prev_d_B - d_stage)
+                progress = float(self._prev_d_B - d_stage)
+                pb_nut = wpb * progress
             b.pb_nut = float(pb_nut)
             self._prev_d_B = float(d_stage)
 
@@ -4722,8 +5295,69 @@ class TyroEnv(gym.Env):
             b.nut_path_dev = float(y_excursion)
             b.nut_path = -w_corr * y_excursion if w_corr > 0.0 else 0.0
 
+            # v19 — wasted-motion cost: every metre of EE travel that does not
+            # close distance to the staging target is paid for. PB telescopes
+            # (path-independent), so this term is what makes the MINIMAL
+            # (straight) transit the optimum instead of any wandering path.
+            w_waste = float(getattr(rcfg, "w_nut_path_waste", 0.0))
+            prev_ee = getattr(self, "_nut_prev_ee", None)
+            if w_waste > 0.0 and prev_ee is not None:
+                moved = float(np.linalg.norm(ee_pos - prev_ee))
+                waste = max(0.0, moved - max(0.0, progress))
+                b.nut_path += -w_waste * waste
+            self._nut_prev_ee = ee_pos.copy()
+
             w_jv = float(getattr(rcfg, "w_nut_joint_vel", 0.0))
             if w_jv > 0.0:
+                _, dqB = self.robot_B.joint_state()
+                b.nut_joint_vel = -w_jv * float(
+                    np.linalg.norm(np.asarray(dqB, dtype=np.float64))
+                )
+        elif bool(getattr(self.cfg, "nut_pure_rl", False)):
+            # PURE-RL INSERT/HOLD/RETRACT — the policy drives the in/out itself,
+            # so shape it with a per-leg axial potential (drive the socket to the
+            # current stage target depth along the bolt axis) plus a coaxiality
+            # cost. Both are non-farmable: the PB telescopes (net progress only)
+            # and the lateral term is a pure negative penalty.
+            b.nut_align = 0.0
+            b.nut_reach = 0.0
+            b.nut_axial_term = 0.0
+            b.nut_path = 0.0
+            b.nut_path_dev = 0.0
+            b.nut_joint_vel = 0.0
+            self._prev_d_B = None
+
+            # v20 — when the INSERT axial servo is driving the plunge (macro
+            # stage 0), the env (not the policy) owns the axial DOF, so the
+            # axial-PB reward and the joint-velocity penalty would be paid for
+            # motion the policy did not command. Gate them off in that window
+            # (same reasoning the scripted macro uses) and keep the PB baseline
+            # frozen so RETRACT doesn't book a spurious one-step jump.
+            insert_servo = (
+                bool(getattr(self.cfg, "nut_b_axial_insert_servo", False))
+                and int(self._nut_macro_stage) == 0
+            )
+
+            if insert_servo:
+                b.pb_nut = 0.0
+            else:
+                tgt_axial = self._nut_stage_target_axial()
+                axial_err = abs(float(axial) - float(tgt_axial))
+                wpb_ax = float(getattr(rcfg, "w_nut_pb_axial", 0.0))
+                pb_ax = 0.0
+                if wpb_ax > 0.0 and self._prev_axial_err_B is not None:
+                    pb_ax = wpb_ax * float(self._prev_axial_err_B - axial_err)
+                b.pb_nut = float(pb_ax)
+                self._prev_axial_err_B = float(axial_err)
+
+            w_lat = float(getattr(rcfg, "w_nut_lateral_pen", 0.0))
+            b.nut_lateral_term = -w_lat * float(lateral) if w_lat > 0.0 else 0.0
+
+            # v20 — joint-movement penalty in policy-driven HOLD/RETRACT (not
+            # the servo-driven INSERT plunge). Shapes smooth motion without
+            # capping joint velocity.
+            w_jv = float(getattr(rcfg, "w_nut_joint_vel", 0.0))
+            if w_jv > 0.0 and not insert_servo:
                 _, dqB = self.robot_B.joint_state()
                 b.nut_joint_vel = -w_jv * float(
                     np.linalg.norm(np.asarray(dqB, dtype=np.float64))
@@ -4739,6 +5373,26 @@ class TyroEnv(gym.Env):
             b.nut_path_dev = 0.0
             b.nut_joint_vel = 0.0
             self._prev_d_B = None
+
+        # v19 — stalled-progress bookkeeping for the early-truncation gate.
+        # Tracks the best value of the phase's own progress metric (approach:
+        # distance-to-staging; insert/retract: axial error to the stage
+        # target); any phase/bolt change resets the window.
+        ns = int(getattr(self.cfg, "nut_stall_steps", 0))
+        if ns > 0:
+            key = (int(self._nut_subphase), idx, int(self._nut_macro_stage))
+            metric = d_stage if not macro else abs(
+                float(axial) - float(self._nut_stage_target_axial()))
+            eps = float(getattr(self.cfg, "nut_stall_eps", 0.001))
+            best = getattr(self, "_nut_prog_best", None)
+            if (getattr(self, "_nut_stall_key", None) != key
+                    or best is None or metric < best - eps):
+                self._nut_stall_key = key
+                self._nut_prog_best = float(metric)
+                self._nut_stall_count = 0
+            else:
+                self._nut_stall_count = int(
+                    getattr(self, "_nut_stall_count", 0)) + 1
 
         # Sparse FSM bonuses.
         if fsm_events.get("arrived"):
@@ -4795,7 +5449,21 @@ class TyroEnv(gym.Env):
                                   float(rcfg.w_collision)))
         b.collision = -w_nut_col if in_collision else 0.0
         b.workspace = rewards.workspace_penalty(out_of_workspace, rcfg)
-        if not macro:
+        # Action/jerk L2 only makes sense while the POLICY controls B. That's
+        # the APPROACH always, and (pure-RL only) the insert/retract too. Under
+        # the scripted macro the policy is ignored, so penalising its dead
+        # outputs would inject spurious cost across the whole tighten window.
+        policy_active = (not macro) or bool(getattr(self.cfg, "nut_pure_rl", False))
+        # v20 — the INSERT axial servo overrides the policy action during the
+        # plunge (macro stage 0), so its action/jerk outputs are dead there too.
+        if (
+            macro
+            and bool(getattr(self.cfg, "nut_pure_rl", False))
+            and bool(getattr(self.cfg, "nut_b_axial_insert_servo", False))
+            and int(self._nut_macro_stage) == 0
+        ):
+            policy_active = False
+        if policy_active:
             action_mask = self._build_action_mask()
             b.action = rewards.action_penalty(action, rcfg, mask=action_mask)
             b.jerk = rewards.jerk_penalty(
@@ -5353,11 +6021,39 @@ class TyroEnv(gym.Env):
                            fsm_events: Dict[str, Any],
                            ) -> Tuple[bool, bool, Dict[str, Any]]:
         info: Dict[str, Any] = {"is_success": b.is_success}
+        if bool(getattr(self.cfg, "nut_fastening_task", False)):
+            # v19 — hard process rule: Robot B colliding with the fixture
+            # (Robot A / floor / walls — whatever _in_bad_collision flags)
+            # fails the cycle immediately. Checked FIRST so a same-step
+            # fasten cannot mask the violation.
+            if bool(getattr(self.cfg, "nut_collision_fail", False)) \
+                    and in_collision:
+                b.is_success = False
+                info["is_success"] = False
+                return True, False, {**info, "termination": "nut_collision"}
+            # v19 — stalled-progress early truncation (saves the ~800-step
+            # horizon burn of episodes parked with no approach/insert
+            # progress). Truncation (not termination) so the value bootstrap
+            # stays unbiased.
+            ns = int(getattr(self.cfg, "nut_stall_steps", 0))
+            if ns > 0 and int(getattr(self, "_nut_stall_count", 0)) >= ns:
+                info["is_success"] = False
+                return False, True, {**info, "termination": "nut_stall"}
         # Nut-fastening task — success once every bolt is fastened.
         if fsm_events.get("all_fastened"):
             b.is_success = True
             info["is_success"] = True
             return True, False, {**info, "termination": "all_fastened"}
+        # Pure-RL per-leg curriculum: one bolt per episode. Terminate on the
+        # first policy-driven fasten so the horizon is spent on approach+insert
+        # for the hot-started bolt, not on failed transit to the next bolt.
+        if (
+            bool(getattr(self.cfg, "nut_per_leg_episode", False))
+            and fsm_events.get("fastened")
+        ):
+            b.is_success = True
+            info["is_success"] = True
+            return True, False, {**info, "termination": "nut_per_leg_fasten"}
         # Final Phase-1 success — tire landed on the cradle (Stage 3 done).
         if fsm_events.get("landed"):
             info["is_success"] = True
