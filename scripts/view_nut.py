@@ -155,6 +155,9 @@ def main() -> int:
                 nut_b_axial_insert_servo=True,
                 nut_insert_depth_tol=0.007,
                 nut_b_insert_branch_search=True,
+                # v22 — collision-aware clean-branch INSERT/HOLD/RETRACT so the
+                # GUI shows the same tire-free seating the trained model uses.
+                nut_b_clean_branch_insert=True,
             )
     cfg = make_env_config(stage=3, phase=1, **nut_overrides)
     if bool(args.nut_pure_rl) and args.per_leg is None:

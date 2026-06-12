@@ -1519,6 +1519,13 @@ class EnvConfig:
     #: Joint-space lerp length (macro steps) for the clean-branch INSERT plunge
     #: (staging→seat). Should match the normal ~22-step axial servo stroke.
     nut_clean_plunge_len: int = 25
+    #: Joint-space lerp length (macro steps) for the smooth APPROACH→clean-
+    #: staging transition at arrive (replaces the instantaneous teleport).
+    #: Set 0 to keep the old snap (not recommended for GUI / sim-to-real).
+    nut_clean_prep_len: int = 30
+    #: If the live approach joints are already within this L2 distance (rad)
+    #: of the clean staging config, skip the prep lerp (visually negligible).
+    nut_clean_prep_skip_rad: float = 0.15
     #: Lateral coaxiality gate (m) at the APPROACH→INSERT trigger (pure-RL).
     #: v17 used 2 × nut_lateral_tol = 3 cm which let the socket enter the
     #: plunge visibly off-axis; v19 tightens it ("nut runner must be exactly

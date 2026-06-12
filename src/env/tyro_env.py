@@ -2022,10 +2022,19 @@ class TyroEnv(gym.Env):
                 # The warm-started axial servo keeps this clean branch to seat.
                 # Clear stale endpoints first so a failed switch (no clean
                 # branch for this bolt) can't reuse the previous bolt's lerp.
+                self._nut_clean_approach_q = None
                 self._nut_clean_plunge_from = None
                 self._nut_clean_plunge_to = None
                 if bool(getattr(self.cfg, "nut_b_clean_branch_insert", False)):
-                    self._nut_switch_to_clean_branch(idx)
+                    if self._nut_prepare_clean_branch(idx):
+                        if bool(getattr(self, "_nut_clean_use_prep", False)):
+                            self._nut_macro_stage = -1
+                        else:
+                            # Path clips the tire — snap once to staging.
+                            self._nut_snap_to_clean_staging()
+                            self._nut_macro_stage = 0
+                    else:
+                        self._nut_macro_stage = 0
                 self._nut_macro_quat = self._coaxial_quat_preserving_roll(idx)
                 # Plan the INSERT leg (current staging → hub-face base).
                 self._setup_nut_macro_leg(self._nut_macro_target(idx)[0])
@@ -2042,7 +2051,15 @@ class TyroEnv(gym.Env):
         margin = float(getattr(self.cfg, "nut_insert_margin", 0.0))
         self._nut_macro_step += 1
         stalled = self._nut_macro_step >= leg_max
-        if self._nut_macro_stage == 0:
+        if self._nut_macro_stage == -1:
+            # PREP — smooth joint lerp from the policy's approach config into
+            # the collision-free staging branch (no teleport). Advance to INSERT
+            # once the lerp completes (or immediately if prep_len==0).
+            prep_len = int(getattr(self.cfg, "nut_clean_prep_len", 30))
+            if prep_len <= 0 or self._nut_macro_step >= prep_len:
+                self._nut_macro_stage = 0
+                self._nut_macro_step = 0
+        elif self._nut_macro_stage == 0:
             # INSERT — wait until the socket has seated at the hub-face base
             # (deepest reachable; the −Y approach margin makes the plunge a
             # longer/deeper stroke, but the endpoint is still the base).
@@ -2434,32 +2451,74 @@ class TyroEnv(gym.Env):
                 pass
         return result
 
-    def _nut_switch_to_clean_branch(self, idx: int) -> bool:
-        """Switch Robot B into the clean-branch staging config for bolt ``idx``.
+    def _nut_joint_lerp_path_tire_clean(
+            self, q_from: np.ndarray, q_to: np.ndarray, steps: int) -> bool:
+        """True iff a joint-space smoothstep from ``q_from``→``q_to`` stays
+        tire-free at every sampled configuration."""
+        rb = self.robot_B
+        q_save, _ = rb.joint_state()
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        lo, hi = rb.arm.lower, rb.arm.upper
+        n = max(1, int(steps))
+        ok = True
+        for i in range(n + 1):
+            t = float(i) / float(n)
+            s = t * t * (3.0 - 2.0 * t)
+            q = np.clip((1.0 - s) * q_from + s * q_to, lo, hi)
+            for slot, qq in zip(rb.arm.indices, q):
+                p.resetJointState(rb.uid, int(slot), float(qq),
+                                  targetVelocity=0.0,
+                                  physicsClientId=self.client)
+            if self._nut_tire_penetration() < -0.005:
+                ok = False
+                break
+        for slot, qq in zip(rb.arm.indices, q_save):
+            p.resetJointState(rb.uid, int(slot), float(qq), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        rb._cmd_q = None
+        return ok
 
-        Called once at the APPROACH→INSERT handoff. A ``resetJointState`` teleport
-        (instantaneous, so no swept-collision) into the collision-free staging
-        config; the subsequent warm-started axial plunge then seats without the
-        forearm clipping the tire. Returns ``True`` iff B was switched.
+    def _nut_snap_to_clean_staging(self) -> None:
+        """Instant fallback: jump B to the cached clean staging config."""
+        stage_q = getattr(self, "_nut_clean_plunge_from", None)
+        if stage_q is not None:
+            self._nut_set_arm_q(np.asarray(stage_q, dtype=np.float64))
+
+    def _nut_prepare_clean_branch(self, idx: int) -> bool:
+        """Cache clean-branch endpoints at APPROACH→INSERT handoff (no teleport).
+
+        Saves the live approach joint vector and the collision-free staging/seat
+        configs solved by :meth:`_nut_clean_staging_q` / :meth:`_nut_clean_seat_q`.
+        :meth:`_nut_drive_clean_macro` then smoothsteps approach→staging (PREP
+        leg, ``macro_stage==-1``) before INSERT/HOLD/RETRACT. Returns ``False``
+        if no clean staging config exists.
         """
         stage_q = self._nut_clean_staging_q(idx)
         if stage_q is None:
             return False
         seat_q = self._nut_clean_seat_q(idx)
         rb = self.robot_B
-        for s, qq in zip(rb.arm.indices, stage_q):
-            p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
-                              physicsClientId=self.client)
-        rb._cmd_q = None
-        rb.drive_arm_targets(np.asarray(stage_q, dtype=np.float64))
-        rb.last_target_pos = np.asarray(rb.ee_pose()[0], dtype=np.float64).copy()
-        # Book-keep the joint-space plunge endpoints for _nut_drive_clean_plunge.
-        self._nut_clean_plunge_from = np.asarray(stage_q, dtype=np.float64).copy()
+        approach_q, _ = rb.joint_state()
+        approach_q = np.asarray(approach_q, dtype=np.float64)
+        stage_q = np.asarray(stage_q, dtype=np.float64)
+        self._nut_clean_approach_q = approach_q.copy()
+        self._nut_clean_plunge_from = stage_q.copy()
         self._nut_clean_plunge_to = (
             np.asarray(seat_q, dtype=np.float64).copy() if seat_q is not None
             else None
         )
-        return True
+        skip = float(getattr(self.cfg, "nut_clean_prep_skip_rad", 0.15))
+        self._nut_clean_skip_prep = (
+            float(np.linalg.norm(approach_q - stage_q)) < skip
+        )
+        prep_len = int(getattr(self.cfg, "nut_clean_prep_len", 30))
+        if prep_len <= 0 or self._nut_clean_skip_prep:
+            self._nut_clean_use_prep = False
+        else:
+            self._nut_clean_use_prep = self._nut_joint_lerp_path_tire_clean(
+                approach_q, stage_q, prep_len)
+        return self._nut_clean_plunge_to is not None
 
     def _nut_set_arm_q(self, arm_q: np.ndarray) -> None:
         """Teleport + motor-command Robot B's arm to ``arm_q`` (joint space)."""
@@ -2476,21 +2535,16 @@ class TyroEnv(gym.Env):
         rb.last_target_pos = np.asarray(rb.ee_pose()[0], dtype=np.float64).copy()
 
     def _nut_drive_clean_macro(self) -> None:
-        """Joint-space INSERT→HOLD→RETRACT entirely inside the clean branch.
+        """Joint-space PREP→INSERT→HOLD→RETRACT inside the clean branch.
 
-        The clean seat branch (tire-free) can be kinematically isolated from the
-        natural branch (bolt 7): once seated, handing axial control back to the
-        Cartesian servo (``apply_absolute_ee`` warm-starts IK from the current
-        joints) re-solves IK and can SNAP back to the natural (tire-clipping)
-        branch on the very first HOLD/RETRACT step — a 17 cm lateral jump that
-        trips ``nut_collision_fail``. Driving all three macro legs as a joint-
-        space lerp between the proven-clean staging/seat configs keeps B in the
-        collision-free branch end to end. HOLD/RETRACT are env-scripted by
-        design (the policy only owns APPROACH), so this changes no learned DOF.
+        * PREP    (stage -1): smooth lerp approach → clean staging (no teleport)
+        * INSERT  (stage  0): lerp staging → seat
+        * HOLD    (stage  1): freeze at seat
+        * RETRACT (stage  2): lerp seat → staging
 
-        * INSERT  (stage 0): lerp staging → seat
-        * HOLD    (stage 1): freeze at seat
-        * RETRACT (stage 2): lerp seat → staging (back outside the tip)
+        All legs are env-scripted joint-space smoothsteps so B never hands
+        control back to the Cartesian IK servo mid-macro (which would snap an
+        isolated clean branch back into a tire-clipping natural branch).
         """
         stage_q = getattr(self, "_nut_clean_plunge_from", None)
         seat_q = getattr(self, "_nut_clean_plunge_to", None)
@@ -2498,11 +2552,19 @@ class TyroEnv(gym.Env):
             return
         stage_q = np.asarray(stage_q, dtype=np.float64)
         seat_q = np.asarray(seat_q, dtype=np.float64)
-        leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
         stg = int(self._nut_macro_stage)
-        if stg == 0:        # INSERT: staging → seat
+        if stg == -1:
+            approach_q = getattr(self, "_nut_clean_approach_q", None)
+            if approach_q is None:
+                return
+            leg_len = int(getattr(self.cfg, "nut_clean_prep_len", 30))
+            q_from = np.asarray(approach_q, dtype=np.float64)
+            q_to = stage_q
+        elif stg == 0:
+            leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
             q_from, q_to = stage_q, seat_q
-        elif stg == 2:      # RETRACT: seat → staging
+        elif stg == 2:
+            leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
             q_from, q_to = seat_q, stage_q
         else:               # HOLD: hold the seat config
             self._nut_set_arm_q(seat_q)
