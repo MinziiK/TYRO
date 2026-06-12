@@ -2020,6 +2020,10 @@ class TyroEnv(gym.Env):
                 # approach branch's forearm would otherwise clip the tire mid-
                 # plunge and trip nut_collision_fail ~6 cm short of the seat.
                 # The warm-started axial servo keeps this clean branch to seat.
+                # Clear stale endpoints first so a failed switch (no clean
+                # branch for this bolt) can't reuse the previous bolt's lerp.
+                self._nut_clean_plunge_from = None
+                self._nut_clean_plunge_to = None
                 if bool(getattr(self.cfg, "nut_b_clean_branch_insert", False)):
                     self._nut_switch_to_clean_branch(idx)
                 self._nut_macro_quat = self._coaxial_quat_preserving_roll(idx)
@@ -2457,28 +2461,11 @@ class TyroEnv(gym.Env):
         )
         return True
 
-    def _nut_drive_clean_plunge(self) -> None:
-        """Joint-space lerp staging→seat along the collision-free branch.
-
-        The Cartesian axial servo warm-starts IK from the current joints, which
-        can drift out of the clean branch mid-plunge (bolts 1/5: staging and
-        seat are tire-free but the swept path clips). Interpolating in joint
-        space between the two clean configs keeps the entire plunge in the
-        proven collision-free branch.
-        """
-        q_from = getattr(self, "_nut_clean_plunge_from", None)
-        q_to = getattr(self, "_nut_clean_plunge_to", None)
-        if q_from is None or q_to is None:
-            return
+    def _nut_set_arm_q(self, arm_q: np.ndarray) -> None:
+        """Teleport + motor-command Robot B's arm to ``arm_q`` (joint space)."""
         rb = self.robot_B
-        leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
-        t = float(np.clip(self._nut_macro_step / max(1, leg_len), 0.0, 1.0))
-        s = t * t * (3.0 - 2.0 * t)
-        arm_q = np.clip(
-            (1.0 - s) * np.asarray(q_from, dtype=np.float64)
-            + s * np.asarray(q_to, dtype=np.float64),
-            rb.arm.lower, rb.arm.upper,
-        )
+        arm_q = np.clip(np.asarray(arm_q, dtype=np.float64),
+                        rb.arm.lower, rb.arm.upper)
         for slot, q in zip(rb.arm.indices, arm_q):
             p.resetJointState(
                 rb.uid, int(slot), targetValue=float(q), targetVelocity=0.0,
@@ -2487,6 +2474,42 @@ class TyroEnv(gym.Env):
         rb._cmd_q = None
         rb.drive_arm_targets(arm_q)
         rb.last_target_pos = np.asarray(rb.ee_pose()[0], dtype=np.float64).copy()
+
+    def _nut_drive_clean_macro(self) -> None:
+        """Joint-space INSERT→HOLD→RETRACT entirely inside the clean branch.
+
+        The clean seat branch (tire-free) can be kinematically isolated from the
+        natural branch (bolt 7): once seated, handing axial control back to the
+        Cartesian servo (``apply_absolute_ee`` warm-starts IK from the current
+        joints) re-solves IK and can SNAP back to the natural (tire-clipping)
+        branch on the very first HOLD/RETRACT step — a 17 cm lateral jump that
+        trips ``nut_collision_fail``. Driving all three macro legs as a joint-
+        space lerp between the proven-clean staging/seat configs keeps B in the
+        collision-free branch end to end. HOLD/RETRACT are env-scripted by
+        design (the policy only owns APPROACH), so this changes no learned DOF.
+
+        * INSERT  (stage 0): lerp staging → seat
+        * HOLD    (stage 1): freeze at seat
+        * RETRACT (stage 2): lerp seat → staging (back outside the tip)
+        """
+        stage_q = getattr(self, "_nut_clean_plunge_from", None)
+        seat_q = getattr(self, "_nut_clean_plunge_to", None)
+        if stage_q is None or seat_q is None:
+            return
+        stage_q = np.asarray(stage_q, dtype=np.float64)
+        seat_q = np.asarray(seat_q, dtype=np.float64)
+        leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
+        stg = int(self._nut_macro_stage)
+        if stg == 0:        # INSERT: staging → seat
+            q_from, q_to = stage_q, seat_q
+        elif stg == 2:      # RETRACT: seat → staging
+            q_from, q_to = seat_q, stage_q
+        else:               # HOLD: hold the seat config
+            self._nut_set_arm_q(seat_q)
+            return
+        t = float(np.clip(self._nut_macro_step / max(1, leg_len), 0.0, 1.0))
+        s = t * t * (3.0 - 2.0 * t)
+        self._nut_set_arm_q((1.0 - s) * q_from + s * q_to)
 
     # ------------------------------------------------------------------
     # Action / obs masks (Phase 1 feature isolation)
@@ -5083,16 +5106,19 @@ class TyroEnv(gym.Env):
             elif bool(getattr(self.cfg, "nut_b_lock_coaxial", True)):
                 ps = float(getattr(self.cfg, "nut_pos_scale",
                                    self.cfg.action.pos_scale))
-                # v22 — clean-branch INSERT: joint-space lerp staging→seat in
-                # the proven collision-free branch (replaces the Cartesian axial
-                # servo for this leg, which can drift out of the branch mid-
-                # plunge and clip the tire on bolts 1/5).
+                # v22 — clean-branch macro: drive INSERT→HOLD→RETRACT entirely
+                # in joint space inside the proven collision-free branch. The
+                # Cartesian servo re-solves IK from the live joints and can snap
+                # the (kinematically isolated) clean seat branch back to the
+                # natural tire-clipping branch on HOLD/RETRACT (bolt 7: 17 cm
+                # jump → nut_collision). Only fires once a clean branch was
+                # actually committed at arrive (endpoints cached).
                 if (
                     bool(getattr(self.cfg, "nut_b_clean_branch_insert", False))
                     and int(self._nut_subphase) == 1
-                    and int(self._nut_macro_stage) == 0
+                    and getattr(self, "_nut_clean_plunge_to", None) is not None
                 ):
-                    self._nut_drive_clean_plunge()
+                    self._nut_drive_clean_macro()
                     return
                 # v19 solo action: the whole action IS B's 3-d Δposition.
                 a_off = 0 if int(self.cfg.action.dim) == 3 else 6
