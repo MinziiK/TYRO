@@ -1516,6 +1516,26 @@ class EnvConfig:
     #: training workers don't each redo the (seconds-per-bolt) solve. Empty ⇒
     #: in-memory only. Mirrors ``nut_hotstart_seed_cache``.
     nut_clean_seat_cache: str = ""
+    #: When True, clean-branch seat/staging solves prefer the joint winding
+    #: nearest the live approach config (shortest ±2π per joint). Removes the
+    #: spurious full-revolution PREP spins (e.g. wrist_1) and keeps macro
+    #: endpoints in the same obs distribution the policy was trained on.
+    #: Requires retraining/fine-tuning since approach poses shift slightly.
+    nut_clean_approach_seed: bool = False
+    #: Lightweight winding-cleanup for the clean-branch macro (NO IK re-solve).
+    #: Re-expresses the raw IK staging/seat on the joint winding nearest the live
+    #: approach config (FK-identical ±2πk) so the scripted PREP leg stops spinning
+    #: a wrist joint a full turn. The RETRACT/resume endpoint is moved to the same
+    #: winding (consistent, unlike approach_seed's hybrid). Cheap enough to run at
+    #: inference; validate the continuous chain still holds before trusting it.
+    nut_clean_shortest_macro: bool = False
+    #: Visual "real robot" cleanup for the clean-branch macro (no retrain).
+    #: When the direct approach→staging joint lerp would clip the tire (the
+    #: PREP leg otherwise snaps in one frame), search a collision-free outward
+    #: waypoint and traverse approach→W→staging smoothly instead. Endpoints
+    #: (the staging/seat branch) are unchanged, so the policy resume
+    #: distribution — and the continuous chain — are preserved.
+    nut_clean_macro_smooth: bool = False
     #: Joint-space lerp length (macro steps) for the clean-branch INSERT plunge
     #: (staging→seat). Should match the normal ~22-step axial servo stroke.
     nut_clean_plunge_len: int = 25

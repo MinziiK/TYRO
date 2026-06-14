@@ -1495,6 +1495,25 @@ def main() -> int:
         ),
     )
     ap.add_argument(
+        "--nut-v23",
+        action="store_true",
+        help=(
+            "v23 bundle: all v20/v22 features plus approach-seeded clean-branch "
+            "IK (shortest joint winding from the live approach config — removes "
+            "wrist_1 360° PREP spins). Fine-tune from v22 stage-2 recommended."
+        ),
+    )
+    ap.add_argument(
+        "--nut-v24",
+        action="store_true",
+        help=(
+            "v24 bundle: all v20/v22 features plus lightweight clean-branch "
+            "winding cleanup (nut_clean_shortest_macro — FK-identical ±2πk "
+            "re-express, NO approach-seed IK re-solve). Fine-tune from v22 "
+            "stage-2 to recover the continuous chain at spin-free macro dynamics."
+        ),
+    )
+    ap.add_argument(
         "--nut-per-leg",
         type=lambda s: s.strip().lower() in ("1", "true", "t", "yes", "y"),
         default=None,
@@ -1871,9 +1890,10 @@ def main() -> int:
             # v19/v20 precision-rework bundle (align servo / rigid fixture /
             # collision=fail / solo 3-d action / minimal-path shaping /
             # stall truncation). See scripts/run_b_nut_train_v19_*.sh.
-            if bool(getattr(args, "nut_v19", False)) or bool(
-                getattr(args, "nut_v20", False)
-            ):
+            _nut_v20_bundle = bool(getattr(args, "nut_v20", False)) or bool(
+                getattr(args, "nut_v23", False)
+            ) or bool(getattr(args, "nut_v24", False))
+            if bool(getattr(args, "nut_v19", False)) or _nut_v20_bundle:
                 overrides["nut_b_align_servo"] = True
                 overrides["nut_a_kinematic_freeze"] = True
                 overrides["nut_collision_fail"] = True
@@ -1881,7 +1901,7 @@ def main() -> int:
                 overrides["nut_arrive_lat_tol"] = 0.015
                 overrides["nut_seat_lat_mult"] = 1.0
                 overrides["nut_stall_steps"] = 250
-            if bool(getattr(args, "nut_v20", False)):
+            if _nut_v20_bundle:
                 overrides["nut_b_axial_insert_servo"] = True
                 overrides["nut_insert_depth_tol"] = 0.007
                 # v21 — branch-aware INSERT (superseded by v22 clean-branch for
@@ -1891,7 +1911,18 @@ def main() -> int:
                 # into a tire-free seat branch and lerp staging→seat in joint
                 # space so edge bolts (1/7/8/9) seat without nut_collision_fail.
                 overrides["nut_b_clean_branch_insert"] = True
+            if bool(getattr(args, "nut_v20", False)):
                 overrides["nut_clean_seat_cache"] = "data/nut_clean_seat_cache.npz"
+            if bool(getattr(args, "nut_v23", False)):
+                # v23 — approach-seeded clean IK: pick the tire-free branch whose
+                # joint winding is nearest the live approach (no 360° PREP spins).
+                overrides["nut_clean_approach_seed"] = True
+                overrides["nut_clean_seat_cache"] = ""
+            if bool(getattr(args, "nut_v24", False)):
+                # v24 — lightweight winding cleanup: re-express the raw IK staging
+                # on the joint winding nearest the live approach (FK-identical,
+                # no scipy re-solve). RETRACT resumes on the same winding.
+                overrides["nut_clean_shortest_macro"] = True
             if getattr(args, "nut_per_leg", None) is not None:
                 overrides["nut_per_leg_episode"] = bool(args.nut_per_leg)
         overrides["use_planner_residual"] = bool(args.use_planner_residual)
@@ -1938,12 +1969,16 @@ def main() -> int:
             cfg.reward.w_nut_ba_clear = float(args.w_nut_ba_clear)
         if bool(getattr(args, "nut_v19", False)) or bool(
             getattr(args, "nut_v20", False)
+        ) or bool(getattr(args, "nut_v23", False)) or bool(
+            getattr(args, "nut_v24", False)
         ):
             # Minimal-path transit shaping (v19/v20): PB stays the driver; the
             # waste cost makes the straight line the optimum.
             cfg.reward.w_nut_path_waste = float(
                 getattr(args, "nut_path_waste", 5.0))
-        if bool(getattr(args, "nut_v20", False)):
+        if bool(getattr(args, "nut_v20", False)) or bool(
+            getattr(args, "nut_v23", False)
+        ) or bool(getattr(args, "nut_v24", False)):
             cfg.reward.w_nut_joint_vel = 0.06
         if getattr(args, "planner_pos_offset_scale", None) is not None:
             # Applied after make_env_config, which otherwise forces 0.03.

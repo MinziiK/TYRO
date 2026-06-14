@@ -39,6 +39,7 @@ Observation: 89-d (spec §2.1 base + 3-d hub–tire mating diagnostics).
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
+import contextlib
 import math
 import os
 
@@ -337,6 +338,36 @@ class TyroEnv(gym.Env):
             except p.error:
                 pass
             self.client = -1
+
+    # ------------------------------------------------------------------
+    # GUI render freeze (nestable). Internal IK / collision probing teleports
+    # Robot B all over via resetJointState and restores it; in GUI mode those
+    # intermediate poses get drawn as a "flicker / pose snaps away and back".
+    # Suppress the visualiser for the duration of any such probe so only the
+    # final committed pose is ever shown. Reference-counted so nested probes
+    # don't prematurely re-enable rendering. No effect in DIRECT / headless.
+    # ------------------------------------------------------------------
+    @contextlib.contextmanager
+    def _render_frozen(self):
+        gui = bool(getattr(self.cfg, "render", False)) and self.client >= 0
+        depth = getattr(self, "_render_freeze_depth", 0)
+        if gui and depth == 0:
+            try:
+                p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 0,
+                                           physicsClientId=self.client)
+            except p.error:
+                gui = False
+        self._render_freeze_depth = depth + 1
+        try:
+            yield
+        finally:
+            self._render_freeze_depth -= 1
+            if gui and self._render_freeze_depth == 0:
+                try:
+                    p.configureDebugVisualizer(p.COV_ENABLE_RENDERING, 1,
+                                               physicsClientId=self.client)
+                except p.error:
+                    pass
 
     # ------------------------------------------------------------------
     # Reset
@@ -2025,6 +2056,8 @@ class TyroEnv(gym.Env):
                 self._nut_clean_approach_q = None
                 self._nut_clean_plunge_from = None
                 self._nut_clean_plunge_to = None
+                self._nut_clean_stage_retract = None
+                self._nut_clean_prep_path = None
                 if bool(getattr(self.cfg, "nut_b_clean_branch_insert", False)):
                     if self._nut_prepare_clean_branch(idx):
                         if bool(getattr(self, "_nut_clean_use_prep", False)):
@@ -2246,7 +2279,10 @@ class TyroEnv(gym.Env):
         seat_lat = lat_tol * float(getattr(self.cfg, "nut_seat_lat_mult", 2.0))
         rb = self.robot_B
         q_save, _ = rb.joint_state()
-        q = self._nut_best_seat_q(idx)
+        # Freeze the GUI during the seat-branch IK search (resetJointState
+        # restarts would otherwise flicker on screen); no effect headless.
+        with self._render_frozen():
+            q = self._nut_best_seat_q(idx)
         if q is None:
             return False
         for s, qq in zip(rb.arm.indices, q):
@@ -2286,7 +2322,35 @@ class TyroEnv(gym.Env):
                 worst = min(worst, float(cp[8]))
         return worst
 
-    def _nut_clean_seat_q(self, idx: int) -> Optional[np.ndarray]:
+    def _nut_shortest_arm_target(
+            self, q_from: np.ndarray, q_to: np.ndarray) -> np.ndarray:
+        """FK-identical ``q_to`` reached via the shortest per-joint path from
+        ``q_from`` (each revolute joint may shift by ``±2πk``)."""
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        out = q_to.copy()
+        rb = self.robot_B
+        lo, hi = rb.arm.lower, rb.arm.upper
+        two_pi = 2.0 * np.pi
+        for i in range(out.shape[0]):
+            delta = q_to[i] - q_from[i]
+            wrapped = delta - two_pi * np.round(delta / two_pi)
+            cand = q_from[i] + wrapped
+            if lo[i] <= cand <= hi[i]:
+                out[i] = cand
+        return out
+
+    def _nut_joint_path_cost(
+            self, q_from: np.ndarray, q_to: np.ndarray) -> float:
+        """Sum of squared shortest-path joint deltas (rad²)."""
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_short = self._nut_shortest_arm_target(q_from, q_to)
+        d = q_short - q_from
+        return float(np.dot(d, d))
+
+    def _nut_clean_seat_q(
+            self, idx: int,
+            seed_q: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
         """Collision-AWARE coaxial seat config for bolt ``idx``.
 
         scipy least_squares with a residual that jointly minimises
@@ -2329,10 +2393,20 @@ class TyroEnv(gym.Env):
 
         rng = np.random.default_rng(977 + idx * 131)
         n_restart = int(getattr(self.cfg, "nut_clean_seat_restarts", 80))
+        seed_q = (np.asarray(seed_q, dtype=np.float64)
+                  if seed_q is not None else None)
         best_q, best_key = None, None
         for r in range(n_restart):
-            q0 = (np.asarray(rb.arm.rest, dtype=np.float64) if r == 0
-                  else rng.uniform(lo, hi))
+            if seed_q is not None and r == 0:
+                q0 = seed_q.copy()
+            elif seed_q is not None and r < 8:
+                q0 = np.clip(
+                    seed_q + rng.uniform(-0.35, 0.35, size=len(seed_q)),
+                    lo, hi)
+            elif r == (0 if seed_q is None else 8):
+                q0 = np.asarray(rb.arm.rest, dtype=np.float64)
+            else:
+                q0 = rng.uniform(lo, hi)
             try:
                 sol = least_squares(resid, q0, bounds=(lo, hi), xtol=1e-10,
                                     ftol=1e-10, max_nfev=400, diff_step=2e-3)
@@ -2343,7 +2417,9 @@ class TyroEnv(gym.Env):
             ax, lat, _t = self._nut_axial_lateral(idx)
             seated = (abs(ax - (-0.5 * L)) < depth_tol and lat < 0.015)
             clean = self._nut_tire_penetration() >= -0.005
-            key = (bool(seated and clean), bool(seated),
+            path_cost = (self._nut_joint_path_cost(seed_q, q)
+                         if seed_q is not None else 0.0)
+            key = (bool(seated and clean), bool(seated), -path_cost,
                    float(self._nut_tire_penetration()))
             if best_key is None or key > best_key:
                 best_key, best_q = key, q.copy()
@@ -2351,22 +2427,33 @@ class TyroEnv(gym.Env):
                 break
         set_q(q_save)
         rb._cmd_q = None
+        if best_q is not None and seed_q is not None:
+            best_q = self._nut_shortest_arm_target(seed_q, best_q)
         return best_q if (best_key is not None and best_key[0]) else None
 
-    def _nut_clean_staging_q(self, idx: int) -> Optional[np.ndarray]:
+    def _nut_clean_staging_q(
+            self, idx: int,
+            seed_q: Optional[np.ndarray] = None,
+            seat_q: Optional[np.ndarray] = None,
+            return_raw: bool = False):
         """Staging config in the SAME clean branch as :meth:`_nut_clean_seat_q`.
 
         IK to the on-axis staging point (just outside the stud tip), seeded from
         the clean seat config and penalising tire penetration, so the approach
         sits in the collision-free branch. The axial plunge (``apply_absolute_ee``
         warm-starts from the current joints) then stays in that branch all the
-        way to the seat. Cached per bolt (in-memory + optional disk).
+        way to the seat. Cached per bolt (in-memory + optional disk) unless
+        ``nut_clean_approach_seed`` is active (staging then depends on the live
+        approach winding).
         """
+        approach_seed = bool(getattr(self.cfg, "nut_clean_approach_seed", False))
+        seed_q = (np.asarray(seed_q, dtype=np.float64)
+                  if seed_q is not None else None)
         cache = getattr(self, "_nut_clean_stage_cache", None)
         if cache is None:
             cache = {}
             path = str(getattr(self.cfg, "nut_clean_seat_cache", "") or "")
-            if path:
+            if path and not approach_seed:
                 try:
                     import os
                     if os.path.exists(path):
@@ -2376,17 +2463,21 @@ class TyroEnv(gym.Env):
                 except Exception:
                     pass
             self._nut_clean_stage_cache = cache
-        if idx in cache:
+        if not approach_seed and idx in cache:
             return cache[idx]
         try:
             from scipy.optimize import least_squares
         except ImportError:
-            cache[idx] = None
+            if not approach_seed:
+                cache[idx] = None
             return None
-        seat_q = self._nut_clean_seat_q(idx)
         if seat_q is None:
-            cache[idx] = None
+            seat_q = self._nut_clean_seat_q(idx, seed_q=seed_q)
+        if seat_q is None:
+            if not approach_seed:
+                cache[idx] = None
             return None
+        seat_q = np.asarray(seat_q, dtype=np.float64)
         rb = self.robot_B
         cl = self.client
         axis = self._nut_axis_unit(idx)
@@ -2413,9 +2504,17 @@ class TyroEnv(gym.Env):
         rng = np.random.default_rng(613 + idx * 97)
         best_q, best_key = None, None
         for r in range(40):
-            q0 = (np.asarray(seat_q, dtype=np.float64) if r == 0
-                  else np.clip(seat_q + rng.uniform(-0.3, 0.3, size=len(seat_q)),
-                               lo, hi))
+            if seed_q is not None and r == 0:
+                q0 = seed_q.copy()
+            elif seed_q is not None and r < 6:
+                q0 = np.clip(
+                    seed_q + rng.uniform(-0.25, 0.25, size=len(seed_q)),
+                    lo, hi)
+            elif r == (0 if seed_q is None else 6):
+                q0 = np.asarray(seat_q, dtype=np.float64)
+            else:
+                q0 = np.clip(seat_q + rng.uniform(-0.3, 0.3, size=len(seat_q)),
+                               lo, hi)
             try:
                 sol = least_squares(resid, q0, bounds=(lo, hi), xtol=1e-10,
                                     ftol=1e-10, max_nfev=300, diff_step=2e-3)
@@ -2426,17 +2525,23 @@ class TyroEnv(gym.Env):
             ee = np.asarray(rb.ee_pose()[0], dtype=np.float64)
             pe = float(np.linalg.norm(ee - stage_pt))
             clean = self._nut_tire_penetration() >= -0.005
-            key = (bool(pe < 0.01 and clean), bool(clean), -pe)
+            path_cost = (self._nut_joint_path_cost(seed_q, q)
+                         if seed_q is not None else 0.0)
+            key = (bool(pe < 0.01 and clean), bool(clean), -path_cost, -pe)
             if best_key is None or key > best_key:
                 best_key, best_q = key, q.copy()
             if best_key[0]:
                 break
         set_q(q_save)
         rb._cmd_q = None
-        result = (best_q if (best_key is not None and best_key[1]) else None)
-        cache[idx] = result
+        result_raw = (best_q if (best_key is not None and best_key[1]) else None)
+        result = result_raw
+        if result is not None and seed_q is not None:
+            result = self._nut_shortest_arm_target(seed_q, result)
+        if not approach_seed:
+            cache[idx] = result
         path = str(getattr(self.cfg, "nut_clean_seat_cache", "") or "")
-        if path and result is not None:
+        if path and not approach_seed and result is not None:
             try:
                 import os
                 import tempfile
@@ -2449,6 +2554,8 @@ class TyroEnv(gym.Env):
                 os.replace(tmp, path)
             except Exception:
                 pass
+        if return_raw:
+            return result, result_raw
         return result
 
     def _nut_joint_lerp_path_tire_clean(
@@ -2485,6 +2592,170 @@ class TyroEnv(gym.Env):
         if stage_q is not None:
             self._nut_set_arm_q(np.asarray(stage_q, dtype=np.float64))
 
+    def _nut_pathB_clear(self, q_from: np.ndarray, q_to: np.ndarray,
+                         steps: int, tire_margin: float = -0.005,
+                         body_margin: float = 0.008) -> bool:
+        """True iff the joint smoothstep ``q_from→q_to`` keeps Robot B clear of
+        the tire, Robot A, the floor and the walls/vehicle at every sample.
+
+        Per-body tolerance (mirrors the live ``_in_bad_collision`` gate but
+        geometrically, valid right after a teleport):
+
+        * tire — allowed to sit close (the staging capture parks the socket just
+          outside the stud); reject only on real penetration (< ``tire_margin``,
+          5 mm, same as the kinematic-sync revert).
+        * Robot A / floor / walls / vehicle — must never be near; reject within
+          ``body_margin`` (8 mm) so the planned path will not trip the
+          zero-tolerance ``nut_collision_fail`` during execution.
+        """
+        rb = self.robot_B
+        lo, hi = rb.arm.lower, rb.arm.upper
+        q_from = np.asarray(q_from, dtype=np.float64)
+        q_to = np.asarray(q_to, dtype=np.float64)
+        q_save, _ = rb.joint_state()
+        tire = getattr(self.handles, "tire", None)
+        floor_bodies = [getattr(self.handles, "plane", None)]
+        floor_bodies.extend(getattr(self.handles, "floor_rim", []) or [])
+        floor_bodies = [b for b in floor_bodies if b is not None]
+        min_link = int(getattr(self.cfg, "robot_ab_collision_min_link", 2))
+        vehicle = getattr(self.handles, "vehicle", None)
+        back_wall = getattr(self.handles, "cargo_back_wall", None)
+        n = max(1, int(steps))
+        ok = True
+
+        def too_close(body, link_filter, margin):
+            for cp in p.getClosestPoints(bodyA=rb.uid, bodyB=body,
+                                         distance=float(margin) + 0.02,
+                                         physicsClientId=self.client):
+                if link_filter(int(cp[3]), int(cp[4])) and float(cp[8]) < margin:
+                    return True
+            return False
+
+        for i in range(n + 1):
+            t = float(i) / float(n)
+            s = t * t * (3.0 - 2.0 * t)
+            q = np.clip((1.0 - s) * q_from + s * q_to, lo, hi)
+            for slot, qq in zip(rb.arm.indices, q):
+                p.resetJointState(rb.uid, int(slot), float(qq),
+                                  targetVelocity=0.0, physicsClientId=self.client)
+            hit = False
+            if tire is not None and too_close(
+                    tire, lambda lb, lo_: lb > 1, tire_margin):
+                hit = True
+            if not hit:
+                for fb in floor_bodies:
+                    if too_close(fb, lambda lb, lo_: lb > 1, body_margin):
+                        hit = True
+                        break
+            if not hit and too_close(
+                    self.robot_A.uid,
+                    lambda lb, la: lb > min_link or la > min_link, body_margin):
+                hit = True
+            if not hit and vehicle is not None and too_close(
+                    vehicle, lambda lb, lo_: lb > 1, body_margin):
+                hit = True
+            if not hit and back_wall is not None and too_close(
+                    back_wall, lambda lb, lo_: lb > 1, body_margin):
+                hit = True
+            if hit:
+                ok = False
+                break
+        for slot, qq in zip(rb.arm.indices, q_save):
+            p.resetJointState(rb.uid, int(slot), float(qq), targetVelocity=0.0,
+                              physicsClientId=self.client)
+        rb._cmd_q = None
+        return ok
+
+    def _nut_clean_prep_path_q(
+            self, idx: int, approach_q: np.ndarray, stage_q: np.ndarray,
+            seg_steps: int):
+        """Collision-free waypoint path so approach→staging avoids the tire.
+
+        When the direct joint lerp ``approach→stage_q`` clips the tire (which
+        otherwise forces a one-frame snap), plan a short collision-free joint
+        path through *outward* waypoints ``W`` on the bolt axis — further from
+        the hub than the staging point, hence tire-clear. Tries a single
+        waypoint first; if no single-waypoint path is clear, prepends an axial
+        pre-lift of the approach (back the socket straight out along the bolt
+        axis, an almost-always-clear short move) and searches again.
+
+        Returns a list ``[W1, ...]`` of INTERMEDIATE configs (endpoints excluded)
+        such that ``approach→W1→…→stage_q`` is clear by margin at every sample,
+        or ``None``. Pure planning: IK + geometric collision sampling only, so
+        the macro endpoints — and the trained chain — are untouched.
+        """
+        rb = self.robot_B
+        approach_q = np.asarray(approach_q, dtype=np.float64)
+        stage_q = np.asarray(stage_q, dtype=np.float64)
+        quat = self._coaxial_quat_preserving_roll(idx)
+        base_ax = self._nut_staging_axial()
+        axis = self._nut_axis_unit(idx)
+        seg = max(1, int(seg_steps))
+        stage_pt = self._nut_point_on_axis(idx, base_ax)
+        try:
+            radial = stage_pt - self._nut_ref_center()
+            radial = radial - float(np.dot(radial, axis)) * axis
+            rn = float(np.linalg.norm(radial))
+            radial = radial / rn if rn > 1e-6 else np.zeros(3)
+        except Exception:
+            radial = np.zeros(3)
+        q_save, _ = rb.joint_state()
+
+        def _set(q):
+            for s, qq in zip(rb.arm.indices, q):
+                p.resetJointState(rb.uid, int(s), float(qq), targetVelocity=0.0,
+                                  physicsClientId=self.client)
+
+        # Outward staging waypoint candidates (axial standoff × radial lift).
+        def _outward_W():
+            for out in (0.10, 0.16, 0.24, 0.32, 0.42, 0.55):
+                for rad in (0.0, 0.08, 0.16, 0.28):
+                    w_pos = (self._nut_point_on_axis(idx, base_ax + out)
+                             + radial * rad)
+                    for warm in (stage_q, approach_q):
+                        try:
+                            _set(warm)
+                            W = rb.solve_arm_joints_in_snapshot(
+                                w_pos, quat, warm)
+                        except Exception:
+                            continue
+                        yield np.asarray(W, dtype=np.float64)
+
+        result = None
+        # --- single waypoint: approach → W → stage ---------------------------
+        for W in _outward_W():
+            if (self._nut_pathB_clear(approach_q, W, seg)
+                    and self._nut_pathB_clear(W, stage_q, seg)):
+                result = [W]
+                break
+        # --- two waypoints: approach → A_lift → W → stage --------------------
+        if result is None:
+            _set(approach_q)
+            ee_app = np.asarray(rb.ee_pose()[0], dtype=np.float64)
+            eq_app = np.asarray(rb.ee_pose()[1], dtype=np.float64)
+            for lift in (0.10, 0.18, 0.28):
+                a_pos = ee_app + axis * lift
+                try:
+                    _set(approach_q)
+                    A_lift = np.asarray(
+                        rb.solve_arm_joints_in_snapshot(a_pos, eq_app,
+                                                        approach_q),
+                        dtype=np.float64)
+                except Exception:
+                    continue
+                if not self._nut_pathB_clear(approach_q, A_lift, seg):
+                    continue
+                for W in _outward_W():
+                    if (self._nut_pathB_clear(A_lift, W, seg)
+                            and self._nut_pathB_clear(W, stage_q, seg)):
+                        result = [A_lift, W]
+                        break
+                if result is not None:
+                    break
+        _set(q_save)
+        rb._cmd_q = None
+        return result
+
     def _nut_prepare_clean_branch(self, idx: int) -> bool:
         """Cache clean-branch endpoints at APPROACH→INSERT handoff (no teleport).
 
@@ -2494,30 +2765,82 @@ class TyroEnv(gym.Env):
         leg, ``macro_stage==-1``) before INSERT/HOLD/RETRACT. Returns ``False``
         if no clean staging config exists.
         """
-        stage_q = self._nut_clean_staging_q(idx)
-        if stage_q is None:
-            return False
-        seat_q = self._nut_clean_seat_q(idx)
+        # The whole handoff is pure planning: IK restarts and collision sweeps
+        # teleport B all over via resetJointState, then restore. In GUI mode
+        # those intermediate poses get drawn — the "flicker / pose snaps away and
+        # back" the user sees. Freeze the visualiser for the duration so only the
+        # final committed pose is shown (no effect in DIRECT/headless).
+        with self._render_frozen():
+            return self._nut_prepare_clean_branch_impl(idx)
+
+    def _nut_prepare_clean_branch_impl(self, idx: int) -> bool:
         rb = self.robot_B
         approach_q, _ = rb.joint_state()
         approach_q = np.asarray(approach_q, dtype=np.float64)
-        stage_q = np.asarray(stage_q, dtype=np.float64)
+        seed = (approach_q if bool(getattr(self.cfg, "nut_clean_approach_seed",
+                                            False)) else None)
+        seat_q = self._nut_clean_seat_q(idx, seed_q=seed)
+        if seat_q is None:
+            return False
+        stage_out = self._nut_clean_staging_q(
+            idx, seed_q=seed, seat_q=seat_q, return_raw=(seed is not None))
+        if seed is not None:
+            stage_prep, stage_raw = stage_out
+        else:
+            stage_prep = stage_out
+            stage_raw = stage_out
+        if stage_prep is None:
+            return False
+        stage_q = np.asarray(stage_prep, dtype=np.float64)
+        seat_q = np.asarray(seat_q, dtype=np.float64)
+        # Lightweight winding-cleanup (no IK re-solve): re-express the raw IK
+        # staging on the joint winding nearest the live approach config so the
+        # scripted PREP leg no longer spins a wrist joint a full turn. The
+        # RETRACT/resume endpoint is moved to the SAME winding (kept consistent,
+        # unlike v23's approach-seed hybrid) so the policy resumes on a single,
+        # FK-identical staging config. obs at the resume boundary changes only by
+        # FK-identical ±2πk; verify the chain still holds before relying on it.
+        if (not bool(getattr(self.cfg, "nut_clean_approach_seed", False))
+                and bool(getattr(self.cfg, "nut_clean_shortest_macro", False))):
+            stage_q = self._nut_shortest_arm_target(approach_q, stage_q)
+            stage_raw = stage_q
+        seat_insert = self._nut_shortest_arm_target(stage_q, seat_q)
+        plunge_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
+        if not self._nut_joint_lerp_path_tire_clean(stage_q, seat_insert,
+                                                      plunge_len):
+            seat_insert = seat_q
         self._nut_clean_approach_q = approach_q.copy()
         self._nut_clean_plunge_from = stage_q.copy()
-        self._nut_clean_plunge_to = (
-            np.asarray(seat_q, dtype=np.float64).copy() if seat_q is not None
-            else None
-        )
+        self._nut_clean_plunge_to = seat_insert.copy()
+        # RETRACT ends on the raw IK staging winding so v22 policies (trained
+        # on the un-expressed branch) stay in-distribution until v23 fine-tune
+        # converges; PREP/INSERT still use the approach-nearest winding.
+        self._nut_clean_stage_retract = np.asarray(stage_raw, dtype=np.float64).copy()
         skip = float(getattr(self.cfg, "nut_clean_prep_skip_rad", 0.15))
         self._nut_clean_skip_prep = (
             float(np.linalg.norm(approach_q - stage_q)) < skip
         )
         prep_len = int(getattr(self.cfg, "nut_clean_prep_len", 30))
+        self._nut_clean_prep_path = None
         if prep_len <= 0 or self._nut_clean_skip_prep:
             self._nut_clean_use_prep = False
         else:
             self._nut_clean_use_prep = self._nut_joint_lerp_path_tire_clean(
                 approach_q, stage_q, prep_len)
+            # "Real robot" cleanup: the direct PREP lerp clips the tire and
+            # would snap in one frame. Route it through a collision-free outward
+            # waypoint path so the approach→staging move is smooth and
+            # continuous. Endpoints unchanged → policy/chain unaffected.
+            if (not self._nut_clean_use_prep
+                    and bool(getattr(self.cfg,
+                                     "nut_clean_macro_smooth", False))):
+                path = self._nut_clean_prep_path_q(
+                    idx, approach_q, stage_q,
+                    max(1, prep_len // 3))
+                if path:
+                    self._nut_clean_prep_path = [
+                        np.asarray(w, dtype=np.float64).copy() for w in path]
+                    self._nut_clean_use_prep = True
         return self._nut_clean_plunge_to is not None
 
     def _nut_set_arm_q(self, arm_q: np.ndarray) -> None:
@@ -2558,14 +2881,34 @@ class TyroEnv(gym.Env):
             if approach_q is None:
                 return
             leg_len = int(getattr(self.cfg, "nut_clean_prep_len", 30))
-            q_from = np.asarray(approach_q, dtype=np.float64)
+            approach_q = np.asarray(approach_q, dtype=np.float64)
+            path = getattr(self, "_nut_clean_prep_path", None)
+            if path:
+                # Multi-segment smooth PREP: approach→W1→…→staging through the
+                # planned collision-free waypoints (no tire-clip snap). Split the
+                # leg into equal segments and smoothstep within each.
+                nodes = [approach_q] + [np.asarray(w, dtype=np.float64)
+                                        for w in path] + [stage_q]
+                n_seg = len(nodes) - 1
+                step = int(self._nut_macro_step)
+                u = float(np.clip(step / max(1, leg_len), 0.0, 1.0)) * n_seg
+                k = min(int(u), n_seg - 1)
+                t = u - k
+                s = t * t * (3.0 - 2.0 * t)
+                self._nut_set_arm_q((1.0 - s) * nodes[k] + s * nodes[k + 1])
+                return
+            q_from = approach_q
             q_to = stage_q
         elif stg == 0:
             leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
             q_from, q_to = stage_q, seat_q
         elif stg == 2:
             leg_len = int(getattr(self.cfg, "nut_clean_plunge_len", 25))
-            q_from, q_to = seat_q, stage_q
+            stage_retract = np.asarray(
+                getattr(self, "_nut_clean_stage_retract", stage_q),
+                dtype=np.float64,
+            )
+            q_from, q_to = seat_q, stage_retract
         else:               # HOLD: hold the seat config
             self._nut_set_arm_q(seat_q)
             return
@@ -4819,10 +5162,17 @@ class TyroEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32).reshape(self.cfg.action.dim)
         action = np.clip(action, -1.0, 1.0)
         nut_task = bool(getattr(self.cfg, "nut_fastening_task", False))
-        if self._mount_hold_left > 0 and self._mount_frozen_q is not None:
-            self.robot_A.drive_arm_targets(self._mount_frozen_q)
-        else:
-            self._apply_action(action)
+        # Action application runs all the nut-task IK / collision probes
+        # (clean-branch planning, seat-branch search, macro target solves) that
+        # teleport Robot B via resetJointState. Freeze the GUI for the whole
+        # apply phase so none of those intermediate poses flicker on screen;
+        # rendering is restored before the physics step so only the committed
+        # motion is drawn (no effect in DIRECT/headless).
+        with self._render_frozen():
+            if self._mount_hold_left > 0 and self._mount_frozen_q is not None:
+                self.robot_A.drive_arm_targets(self._mount_frozen_q)
+            else:
+                self._apply_action(action)
 
         for _ in range(self.cfg.decimation):
             p.stepSimulation(physicsClientId=self.client)

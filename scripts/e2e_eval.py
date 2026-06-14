@@ -97,6 +97,60 @@ class ScenarioResult:
     e2e_success: bool
 
 
+def _nut_overrides_v16(*, render: bool, dr_range_m: float, max_steps: int) -> dict:
+    """Legacy planner+residual nut stack (v16_dr checkpoints)."""
+    return dict(
+        render=render,
+        scene_layout="fanuc_spacious",
+        nut_fastening_task=True,
+        nut_b_planner_residual=True,
+        terminate_on="never",
+        max_steps=max_steps,
+        USE_DOMAIN_RANDOMIZATION=True,
+        RANDOM_POSITION_RANGE=dr_range_m,
+        DR_CARGO_ENABLE=False,
+        nut_a_hold_jitter_rad=float(np.deg2rad(6.0)),
+        contact_force_terminate_above=0.0,
+        collision_terminates=False,
+    )
+
+
+def _nut_overrides_v23(*, render: bool, dr_range_m: float, max_steps: int) -> dict:
+    """v23 pure-RL clean-branch + approach-seed IK (matches training)."""
+    return dict(
+        render=render,
+        scene_layout="fanuc_spacious",
+        nut_fastening_task=True,
+        nut_pure_rl=True,
+        nut_b_planner_residual=False,
+        nut_b_hotstart_enable=True,
+        nut_b_hotstart_alpha=0.0,
+        nut_b_hotstart_random_bolt=False,
+        nut_per_leg_episode=False,
+        nut_b_align_servo=True,
+        nut_a_kinematic_freeze=True,
+        nut_collision_fail=True,
+        nut_b_solo_action=True,
+        nut_arrive_lat_tol=0.015,
+        nut_seat_lat_mult=1.0,
+        nut_b_axial_insert_servo=True,
+        nut_insert_depth_tol=0.007,
+        nut_b_insert_branch_search=True,
+        nut_b_clean_branch_insert=True,
+        nut_clean_approach_seed=True,
+        nut_clean_seat_cache="",
+        nut_a_hold_jitter_rad=float(np.deg2rad(6.0)),
+        nut_stall_steps=0,
+        terminate_on="never",
+        max_steps=max_steps,
+        USE_DOMAIN_RANDOMIZATION=True,
+        RANDOM_POSITION_RANGE=dr_range_m,
+        DR_CARGO_ENABLE=False,
+        contact_force_terminate_above=0.0,
+        collision_terminates=False,
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="E2E eval: A mount + B nut under hub DR.")
     ap.add_argument(
@@ -106,8 +160,23 @@ def main() -> int:
     )
     ap.add_argument(
         "--model-b",
-        default="runs/nut_fastening_v16_dr/final.zip",
-        help="Robot B nut-fastening checkpoint (.zip).",
+        default=None,
+        help="Robot B nut-fastening checkpoint (.zip). Default: v16_dr or v23_dr.",
+    )
+    ap.add_argument(
+        "--v23",
+        action="store_true",
+        help=(
+            "Use v23 pure-RL clean-branch B wiring (implies longer horizon, "
+            "solo 3-d action, approach-seed IK). Default model-b: "
+            "runs/nut_fastening_v23_dr/final.zip."
+        ),
+    )
+    ap.add_argument(
+        "--b-max-steps",
+        type=int,
+        default=None,
+        help="Robot B episode horizon (default: 2000 v16, 6000 v23 chain).",
     )
     ap.add_argument("--scenarios", type=int, default=100)
     ap.add_argument("--seed", type=int, default=42,
@@ -159,19 +228,37 @@ def main() -> int:
     if n <= 0:
         ap.error("--scenarios must be positive")
 
+    if args.model_b is None:
+        args.model_b = (
+            "runs/nut_fastening_v23_dr/final.zip" if args.v23
+            else "runs/nut_fastening_v16_dr/final.zip"
+        )
+    b_max_steps = int(args.b_max_steps) if args.b_max_steps is not None else (
+        6000 if args.v23 else 2000
+    )
+
     model_a_path = _resolve_model_path(args.model_a)
-    model_b_path = _resolve_model_path(args.model_b)
+    model_b_path = None if args.only == "a" else _resolve_model_path(args.model_b)
     print(f"[e2e] loading A: {model_a_path}")
-    print(f"[e2e] loading B: {model_b_path}")
     model_a = PPO.load(model_a_path, device="cpu")
-    model_b = PPO.load(model_b_path, device="cpu")
+    if model_b_path is not None:
+        print(f"[e2e] loading B: {model_b_path}")
+        model_b = PPO.load(model_b_path, device="cpu")
+    else:
+        model_b = None
     print(
         f"[e2e] A layout obs={model_a.observation_space.shape[0]} "
         f"act={model_a.action_space.shape[0]}"
     )
+    if model_b is not None:
+        print(
+            f"[e2e] B layout obs={model_b.observation_space.shape[0]} "
+            f"act={model_b.action_space.shape[0]}"
+        )
+
     print(
-        f"[e2e] B layout obs={model_b.observation_space.shape[0]} "
-        f"act={model_b.action_space.shape[0]}"
+        f"[e2e] B stack: {'v23 pure-RL' if args.v23 else 'v16 planner+residual'}  "
+        f"max_steps={b_max_steps}"
     )
 
     mount_overrides = dict(
@@ -188,20 +275,14 @@ def main() -> int:
         start_pos_curriculum_enable=True,
         include_hub_guide_obs=True,
     )
-    nut_overrides = dict(
-        render=args.render,
-        scene_layout="fanuc_spacious",
-        nut_fastening_task=True,
-        nut_b_planner_residual=True,
-        terminate_on="never",
-        max_steps=2000,
-        USE_DOMAIN_RANDOMIZATION=True,
-        RANDOM_POSITION_RANGE=dr_range_m,
-        DR_CARGO_ENABLE=False,
-        nut_a_hold_jitter_rad=float(np.deg2rad(6.0)),
-        contact_force_terminate_above=0.0,
-        collision_terminates=False,
-    )
+    if args.v23:
+        nut_overrides = _nut_overrides_v23(
+            render=args.render, dr_range_m=dr_range_m, max_steps=b_max_steps,
+        )
+    else:
+        nut_overrides = _nut_overrides_v16(
+            render=args.render, dr_range_m=dr_range_m, max_steps=b_max_steps,
+        )
 
     print(
         f"[e2e] DR hub range: ±{args.dr_range_cm:.1f} cm  "
@@ -226,11 +307,11 @@ def main() -> int:
         which = args.only
         print(f"[e2e] VIEW-ONLY mode: Robot {which.upper()} ({n} scenarios)")
         if which == "a":
-            env = TyroEnv(cfg=cfg_a, render=True, seed=args.seed)
+            env = TyroEnv(cfg=cfg_a, render=args.render, seed=args.seed)
             env.set_start_pos_easy_prob(float(args.mix_easy_prob))
             model = model_a
         else:
-            env = TyroEnv(cfg=cfg_b, render=True, seed=args.seed + 1)
+            env = TyroEnv(cfg=cfg_b, render=args.render, seed=args.seed + 1)
             model = model_b
         for i in range(n):
             off = offsets[i]
@@ -400,6 +481,8 @@ def main() -> int:
         "meta": {
             "model_a": str(args.model_a),
             "model_b": str(args.model_b),
+            "b_stack": "v23" if args.v23 else "v16",
+            "b_max_steps": b_max_steps,
             "scenarios": n,
             "seed": args.seed,
             "dr_range_cm": args.dr_range_cm,

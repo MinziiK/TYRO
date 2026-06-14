@@ -84,6 +84,23 @@ def main() -> int:
         help="v20 wiring: v19 + INSERT axial servo + seat depth 0.7 cm "
              "(match v20 checkpoints; implies --nut-pure-rl).",
     )
+    ap.add_argument(
+        "--v23",
+        action="store_true",
+        help="v23 wiring: v20/v22 + approach-seeded clean IK (no wrist_1 spin).",
+    )
+    ap.add_argument(
+        "--v24",
+        action="store_true",
+        help="v24 wiring: v20/v22 + lightweight shortest-macro winding cleanup "
+             "(no wrist spin, no IK re-solve).",
+    )
+    ap.add_argument(
+        "--smooth-macro",
+        action="store_true",
+        help="Smooth clean-branch PREP (waypoint routing, no 1-frame snap on "
+             "most bolts). No retrain needed.",
+    )
     ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--dr-range-cm", type=float, default=5.0,
@@ -128,7 +145,7 @@ def main() -> int:
         nut_a_hold_jitter_rad=float(np.deg2rad(6.0)),
         contact_force_terminate_above=0.0, collision_terminates=False,
     )
-    if bool(args.v19) or bool(args.v20):
+    if bool(args.v19) or bool(args.v20) or bool(args.v23) or bool(args.v24):
         args.nut_pure_rl = True
     if bool(args.nut_pure_rl):
         nut_overrides.update(
@@ -140,7 +157,7 @@ def main() -> int:
         )
         if args.per_leg is not None:
             nut_overrides["nut_per_leg_episode"] = bool(args.per_leg)
-        if bool(args.v19) or bool(args.v20):
+        if bool(args.v19) or bool(args.v20) or bool(args.v23) or bool(args.v24):
             nut_overrides.update(
                 nut_b_align_servo=True,
                 nut_a_kinematic_freeze=True,
@@ -150,15 +167,22 @@ def main() -> int:
                 nut_seat_lat_mult=1.0,
                 nut_a_hold_jitter_rad=0.0,
             )
-        if bool(args.v20):
+        if bool(args.v20) or bool(args.v23) or bool(args.v24):
             nut_overrides.update(
                 nut_b_axial_insert_servo=True,
                 nut_insert_depth_tol=0.007,
                 nut_b_insert_branch_search=True,
-                # v22 — collision-aware clean-branch INSERT/HOLD/RETRACT so the
-                # GUI shows the same tire-free seating the trained model uses.
                 nut_b_clean_branch_insert=True,
             )
+        if bool(args.v23):
+            nut_overrides["nut_clean_approach_seed"] = True
+            nut_overrides["nut_clean_seat_cache"] = ""
+        if bool(args.v24):
+            nut_overrides["nut_clean_shortest_macro"] = True
+        if bool(args.smooth_macro):
+            nut_overrides["nut_clean_macro_smooth"] = True
+            nut_overrides["nut_clean_prep_len"] = 72
+            nut_overrides["nut_clean_plunge_len"] = 45
     cfg = make_env_config(stage=3, phase=1, **nut_overrides)
     if bool(args.nut_pure_rl) and args.per_leg is None:
         cfg.nut_per_leg_episode = True

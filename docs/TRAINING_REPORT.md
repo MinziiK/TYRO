@@ -936,13 +936,49 @@ B는 5 cm에서 10/10 성공률 ~59%로 **E2E 병목** — A(0.81) × B(0.59) �
 > 재생성: `python scripts/plot_e2e_projected.py` (formal eval 준비 전 참고용).
 > E2E 실측: A/B checkpoint + `--dr-hub-offset` eval 하니스 (향후).
 
-### 16.4 향후 계획
+### 16.4 v17 → v24 진화: 연속 체인 · 스핀 제거 · GUI 클린업 (2026-06-14)
 
-1. **B 5 cm 강건성 보완** — `max_steps` 2500+, 추가 DR fine-tune, v16 checkpoint resume
-2. **Formal E2E eval** — 허브 ±0/2/5 cm × N=100 시나리오, `e2e_projected.png`를 실측으로 교체
-3. **Phase B:** 6-stage full cycle (A+B 동시) — `--remount-cycle`
-4. **Sim2Real:** domain randomization Phase 2/3, A 실 policy + B 협동
-5. **통합 평가:** A mount → B nut → A hold → cycle repeat
+v15/v16(플래너+잔차)은 명목에서도 연속 10/10이 ~74%에 그쳤다. 이후 **pure-RL**
+(플래너 제거, B가 직접 접근/정렬)로 전환하고, INSERT의 타이어 충돌 문제를
+**clean-branch macro**로 풀어 연속 10/10을 명목에서 달성했다.
+
+| 단계 | run / 스크립트 | 핵심 변경 | 결과 |
+|------|----------------|-----------|------|
+| v20~v22 | `run_b_nut_train_v22_stage2.sh` | pure-RL + branch-aware INSERT + clean-branch seating | **명목 연속 10/10** |
+| v23 (폐기) | ~~`run_b_nut_dr_finetune_v23.sh`~~ | approach-seed IK로 스핀 제거 시도 | 체인 회귀 (1~3/10) |
+| v24 Stage A | `run_b_nut_v24_chain_recover.sh` | `nut_clean_shortest_macro` (FK 동일 ±2πk winding 정리) + **DR 없이** 체인 회복 | **명목 연속 10/10, 스핀 제거** (`nut_fastening_v24_chain`) |
+| v24 Stage B | `run_b_nut_v24_dr_stageB.sh` | v24_chain resume + 허브 0→5 cm DR | 진행 중 (`nut_fastening_v24_dr_stageB`) |
+
+**스핀 제거의 핵심 교훈.** 볼트마다 wrist_1이 360° 도는 현상은 매크로 endpoint의
+관절 winding(±2π) 때문이었다. 이를 바꾸면 정책의 resume 관측(`qB` raw 정규화 각도)이
+**OOD가 되어** 연속 체인이 무너진다 → 재학습 불가피. 게다가 "스핀 제거 + DR"을
+동시에 학습하면 체인이 붕괴(v23/v24-combined 실측 1~3/10)하므로 **단계 분리**가
+필수: **Stage A**(DR 없이 스핀-free 체인 회복) → **Stage B**(DR만 추가).
+
+**DR 필요성 실측 (Stage A 모델, `nut_fastening_v24_chain`).**
+
+| 조건 | 연속 체결 |
+|------|-----------|
+| 허브 offset 0 (DR off/on 무관) | **10/10** |
+| 허브 offset 2 cm | **0/10** |
+| 허브 offset 0.3~4.4 cm | 0~1/10 |
+
+→ Stage A 모델은 명목 전용이라 sub-cm 오프셋에도 무너진다. E2E(±5 cm)에는 **Stage B
+DR 파인튜닝이 필수**임이 정량 확인됐다.
+
+**GUI 텔레포트/깜빡임 제거.** clean-branch 계획은 IK 재시작·충돌 스윕을 위해 B를
+`resetJointState`로 순간이동했다 복원하는데, GUI에서 그 중간 자세가 그려져
+"자세가 확 바뀌었다 돌아오는" 깜빡임이 보였다. `step()`의 action 적용 구간 전체를
+**참조계수 렌더 freeze**(`TyroEnv._render_frozen`)로 감싸, 물리 스텝 직전에만
+렌더링을 켜 **확정 자세 한 프레임만** 그리도록 수정(headless/DIRECT 무영향).
+
+### 16.5 향후 계획
+
+1. **Stage B 수렴 대기** — `nut_fastening_v24_dr_stageB` 3M, 허브 0→5 cm
+2. **±5 cm 강건성 재측정** — offset 2/5 cm에서 10/10 회복 확인
+3. **Formal E2E eval** — 허브 ±0/2/5 cm × N=100 시나리오, `e2e_projected.png`를 실측으로 교체
+4. **Phase B:** 6-stage full cycle (A+B 동시) — `--remount-cycle`
+5. **Sim2Real:** domain randomization Phase 2/3, A 실 policy + B 협동
 
 ---
 
@@ -962,7 +998,11 @@ TYRO/
 ├── scripts/
 │   ├── run_phase1_pipeline.sh      # A 초기 학습
 │   ├── run_phase1_mount_ft03.sh    # A 파인튜닝
-│   ├── run_b_nut_train_v14.sh      # B nut 학습 (플래너+잔차)
+│   ├── run_b_nut_train_v14.sh      # B nut 학습 (플래너+잔차, 레거시)
+│   ├── run_b_nut_train_v22_stage2.sh   # B pure-RL clean-branch (명목 10/10)
+│   ├── run_b_nut_v24_chain_recover.sh  # v24 Stage A: 스핀-free 체인 회복 (DR off)
+│   ├── run_b_nut_v24_dr_stageB.sh      # v24 Stage B: 허브 0→5cm DR 파인튜닝
+│   ├── view_nut.py                 # GUI 뷰어 (--v24 --smooth-macro)
 │   ├── smoke_nut_planner_v14.py    # 잔차=0 명목 궤적 10/10 검증
 │   ├── e2e_nut_oracle.py           # teleport oracle 10/10 (경로 증명)
 │   ├── plot_nut_progress.py        # B 너트 체결 학습곡선 PNG

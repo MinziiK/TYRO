@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Headless E2E eval: Robot A (mount DR) + Robot B (nut DR), 100 hub scenarios.
+# For v23 pure-RL B stack use scripts/run_e2e_eval_v23.sh instead.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
