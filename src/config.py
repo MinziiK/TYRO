@@ -825,6 +825,15 @@ class EnvConfig:
     #: EMA blend for kinematic tire sync (1.0 = snap, 0.35 = smooth).
     #: Low values cut the "수직 유지" teleport jitter while keeping reach.
     kinematic_tire_sync_alpha: float = 0.65
+    #: Visual-only: during the carry stage (task_stage == 1) the grasp is a
+    #: ``JOINT_FIXED`` EE bond, which lets the 0.5 kg tire swing ±2-3 cm
+    #: relative to the gripper while the arm accelerates out of the
+    #: hot-start hold. At GUI frame rate this reads as the tire
+    #: "teleporting" above the gripper. When True, the tire is hard
+    #: re-placed onto ``EE * T_ee_tire`` every step during carry so it
+    #: stays perfectly rigid to the gripper. Default False so training and
+    #: headless eval physics are untouched; enable only for GUI demos.
+    carry_tire_rigid_sync: bool = False
     #: **2026-06-04 (insertion smoothing)** — per-joint motor speed cap
     #: (rad/s) applied via PyBullet POSITION_CONTROL ``maxVelocity`` in
     #: ``UR10Robot.drive_arm_targets``. 0 = unlimited (legacy). The carry
@@ -876,6 +885,48 @@ class EnvConfig:
     #: this standoff is unnecessary (and the multi-via code path is left in
     #: place for any future scene redesign).
     planner_stage1_approach_standoff: float = 0.0
+    #: Stage 0 hover height (m) above grasp — legacy waypoint mode only
+    #: (``planner_stage0_z_xy_coupled=False``). When coupled, Z tracks XY
+    #: progress straight to the live grasp anchor (no hover buffer).
+    planner_stage0_hover_dz: float = 0.12
+    #: Fraction of the HOME→hover XY leg completed at the early-Z via-point.
+    planner_stage0_early_xy_frac: float = 0.30
+    #: Fraction of HOME→hover Z drop completed at the early-Z via-point.
+    planner_stage0_early_z_frac: float = 0.55
+    #: When True, Stage-0 Z drop tracks XY progress (simultaneous lower).
+    planner_stage0_z_xy_coupled: bool = True
+    #: Finish Z descent this fraction before XY completes along the
+    #: approach (0.32 ⇒ Z done at 68 % horizontal travel; last leg is
+    #: level). Prevents a sudden plunge in front of the tire.
+    planner_stage0_z_ahead_frac: float = 0.32
+    #: Per-step chained IK to the nominal EE pose during Stage 0 (not baked
+    #: joint replay) so the realised path tracks the Cartesian descent.
+    planner_stage0_cartesian_replay: bool = False
+    #: Use closed-loop DLS EE servo (not open-loop IK) for Stage 0 replay.
+    planner_stage0_dls_replay: bool = False
+    planner_stage0_dls_pos_gain: float = 1.5
+    planner_stage0_dls_max_joint_step: float = 0.14
+    #: After the nominal traj finishes, keep kinematic IK servoing to the
+    #: live 6-o'clock grasp anchor until the pickup gate fires.
+    planner_stage0_terminal_grasp_servo: bool = True
+    planner_stage0_terminal_grasp_max_steps: int = 80
+    #: Re-chain this many tail baked joints to the live grasp anchor.
+    planner_stage0_rebake_tail: int = 25
+    #: Only run the terminal grasp servo on the last traj waypoint (not
+    #: when XY nears the tire — that caused a visible plunge at the front).
+    planner_stage0_terminal_early_xy: bool = False
+    #: Stage 0 pickup fires only when EE Z is within this margin above the
+    #: 6-o'clock grasp anchor (prevents grasping while still in front/above).
+    planner_stage0_pickup_max_dz: float = 0.045
+    #: Stage 1 post-grasp vertical lift (m) before the carry arch begins.
+    #: Clears the tire from the rack/stand before any lateral hub motion.
+    planner_stage1_pickup_lift_dz: float = 0.10
+    #: Replay baked joints kinematically through the post-grasp lift so the
+    #: 100 kg load does not fight the position PD (visible carry wobble).
+    planner_stage1_kinematic_until_lift: bool = True
+    #: Extra baked-replay steps after the pickup-lift index before policy
+    #: residuals are allowed (prevents early carry wobble).
+    planner_stage1_force_baked_extra_steps: int = 25
     #: Hub-mounting target in world (= hub_pos_nominal under the new
     #: Robot B-centric layout).
     tire_mount_pos: Tuple[float, float, float] = (0.0, 0.80, 0.22)
@@ -2518,6 +2569,16 @@ def apply_fanuc_spacious_layout(cfg: "EnvConfig") -> None:
     #: bore, r=0.282). This gives the PPO residual a feasible nominal to
     #: refine instead of one that drives the tire into the truck structure.
     cfg.planner_stage1_approach_standoff = 0.70
+    cfg.planner_stage0_hover_dz = 0.0
+    cfg.planner_stage0_z_xy_coupled = True
+    cfg.planner_stage0_z_ahead_frac = 0.32
+    cfg.planner_stage0_cartesian_replay = False
+    cfg.planner_stage0_dls_replay = False
+    cfg.planner_stage0_terminal_grasp_servo = True
+    cfg.planner_stage0_terminal_early_xy = False
+    cfg.planner_stage1_pickup_lift_dz = 0.12
+    cfg.planner_stage1_kinematic_until_lift = True
+    cfg.planner_stage1_force_baked_extra_steps = 30
 
     #: Robot B (UR10e) sits at the WORLD ORIGIN and reaches all hub bolts (see
     #: hub placement above). Phase 1 still freezes B at HOME; the obs frame is

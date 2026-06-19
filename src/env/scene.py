@@ -196,7 +196,8 @@ class Scene:
         if not bolts:
             raise RuntimeError("Scene built with zero bolts — check URDF or config.")
 
-        target_idx = int(self.np_random.integers(0, len(bolts)))
+        # First bolt in ``nut_bolt_order`` (index 0) — not random per reset.
+        target_idx = 0
         tb = bolts[target_idx]
         p.changeVisualShape(
             tb.uid,

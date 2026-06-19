@@ -286,6 +286,10 @@ class TyroEnv(gym.Env):
         # Kinematic upright lock (``lock_tire_upright_when_grasped``):
         # tire pose is re-written each step; no JOINT_FIXED.
         self._grasp_kinematic: bool = False
+        # ``carry_tire_rigid_sync`` visual lock: True while the tire mass has
+        # been zeroed for the rigid carry (so physics never drifts it between
+        # the per-sub-step snaps). Restored to ``tire_mass`` on carry exit.
+        self._carry_mass_zeroed: bool = False
         self._grasp_yaw_ee0: Optional[float] = None
         self._grasp_com_offset_ee: Optional[np.ndarray] = None
         # **2026-06-02 (cargo penetration fix)** — last safe (no cargo / back-
@@ -301,6 +305,14 @@ class TyroEnv(gym.Env):
         # Joint targets seeded by attached-hot-start; lets the first
         # planner step skip a redundant IK solve when action ≈ 0.
         self._planner_hold_arm_targets: Optional[np.ndarray] = None
+        # Stage-1 carry: first traj index whose nominal EE has risen at
+        # least ``planner_carry_lift_skip_min_dz`` above the grasp Z.
+        # Waypoints before this are yaw-alignment near the tire; skipped
+        # on replan when ``planner_skip_s1_yaw_preamble`` is enabled.
+        self._carry_lift_from_idx: int = 0
+        # EE Z at grasp time; Stage-1 keeps baked replay until the arm
+        # clears this height + ``planner_carry_lift_skip_min_dz``.
+        self._s1_grasp_ee_z: Optional[float] = None
         # Mount-and-hold (``cfg.mount_hold_steps``): freeze arm + pinned tire.
         self._mount_hold_left: int = 0
         self._mount_frozen_q: Optional[np.ndarray] = None
@@ -329,6 +341,58 @@ class TyroEnv(gym.Env):
         # the policy loop. Force manual stepping only.
         if mode == p.GUI:
             p.setRealTimeSimulation(0, physicsClientId=self.client)
+            # Hide the default side panels (left parameter tree + right
+            # RGB/depth/segmentation preview strips) for a clean demo view.
+            # Keep only the 3D viewport. No effect on physics or headless.
+            try:
+                p.configureDebugVisualizer(
+                    p.COV_ENABLE_GUI, 0, physicsClientId=self.client)
+                p.configureDebugVisualizer(
+                    p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0,
+                    physicsClientId=self.client)
+                p.configureDebugVisualizer(
+                    p.COV_ENABLE_DEPTH_BUFFER_PREVIEW, 0,
+                    physicsClientId=self.client)
+                p.configureDebugVisualizer(
+                    p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW, 0,
+                    physicsClientId=self.client)
+            except p.error:
+                pass
+
+    def _draw_world_axes(self, length: float = 1.0) -> None:
+        """Draw the world-origin RGB XYZ axis triad (GUI only).
+
+        Disabling ``COV_ENABLE_GUI`` to hide the side panels also hides
+        PyBullet's built-in axis overlay, so re-draw an explicit triad with
+        debug lines: X=red, Y=green, Z=blue. ``resetSimulation`` (run every
+        ``reset``) clears debug items, so this is re-issued from ``reset``.
+        No-op in DIRECT / headless.
+        """
+        if not (bool(getattr(self.cfg, "render", False)) and self.client >= 0):
+            return
+        # Skip while a render-freeze is active (e.g. the E2E handoff reset):
+        # issuing debug-draw calls into a frozen visualiser is unnecessary and
+        # has been observed to destabilise long software-rendered sessions.
+        if getattr(self, "_render_freeze_depth", 0) > 0:
+            return
+        try:
+            ids = getattr(self, "_axis_dbg_ids", [None, None, None])
+            specs = (
+                ([0, 0, 0], [length, 0, 0], [1, 0, 0]),
+                ([0, 0, 0], [0, length, 0], [0, 1, 0]),
+                ([0, 0, 0], [0, 0, length], [0, 0, 1]),
+            )
+            new_ids = []
+            for i, (a, b, c) in enumerate(specs):
+                kw = dict(lineWidth=2.0, physicsClientId=self.client)
+                if ids[i] is not None:
+                    new_ids.append(p.addUserDebugLine(
+                        a, b, c, replaceItemUniqueId=ids[i], **kw))
+                else:
+                    new_ids.append(p.addUserDebugLine(a, b, c, **kw))
+            self._axis_dbg_ids = new_ids
+        except p.error:
+            pass
 
     def close(self) -> None:
         if self.client >= 0:
@@ -380,6 +444,7 @@ class TyroEnv(gym.Env):
             self._np_random, _ = gym.utils.seeding.np_random(seed)
 
         p.resetSimulation(physicsClientId=self.client)
+        self._axis_dbg_ids = [None, None, None]
         # Invalidate the obs/action mask caches so they track the active cfg
         # layout. This matters when a single env is reconfigured between phases
         # (e.g. the E2E viewer switches mount→nut, changing obs/action dims);
@@ -389,6 +454,7 @@ class TyroEnv(gym.Env):
         # resetSimulation() invalidates all body / constraint ids — clear cache.
         self._grasp_constraint = None
         self._grasp_kinematic = False
+        self._carry_mass_zeroed = False
         self._grasp_yaw_ee0 = None
         self._grasp_com_offset_ee = None
         self._safe_tire_pos = None
@@ -403,6 +469,8 @@ class TyroEnv(gym.Env):
         # this one. ``_apply_attached_hot_start`` (run further down) sets
         # this back to a valid value when it fires.
         self._planner_hold_arm_targets = None
+        self._carry_lift_from_idx = 0
+        self._s1_grasp_ee_z = None
         self._mount_hold_left = 0
         self._mount_frozen_q = None
         self._mount_hold_finish_term = False
@@ -507,6 +575,9 @@ class TyroEnv(gym.Env):
         )
         self.handles = self.scene.build()
         self._maybe_disable_tire_hub_collision()
+        # resetSimulation() above cleared any debug items; redraw the world
+        # XYZ axis triad (GUI only, no-op headless).
+        self._draw_world_axes()
 
         # **2026-06-09 (DR mount-target sync)** — the Stage-1 mount planner
         # bakes its nominal end-pose from ``cfg.tire_mount_pos`` (a static
@@ -3552,6 +3623,41 @@ class TyroEnv(gym.Env):
         ur.last_target_pos = ur.ee_pose()[0].copy()
         hold_q, _ = ur.joint_state()
         self._planner_hold_arm_targets = hold_q.copy()
+        self._s1_grasp_ee_z = float(ur.ee_pose()[0][2])
+
+    def _capture_s1_grasp_ee_z(self) -> None:
+        """Record grasp-height EE Z for Stage-1 baked-replay gating."""
+        try:
+            ee, _ = self.robot_A.ee_pose()
+            self._s1_grasp_ee_z = float(np.asarray(ee, dtype=np.float64)[2])
+        except Exception:
+            self._s1_grasp_ee_z = None
+
+    def _stage1_force_baked(self) -> bool:
+        """Hold baked replay through pickup lift + early carry preamble."""
+        if int(self.task_stage) != 1:
+            return False
+        lift_from = int(getattr(self, "_carry_lift_from_idx", 0))
+        extra = int(getattr(
+            self.cfg, "planner_stage1_force_baked_extra_steps", 25,
+        ))
+        if lift_from > 0 and int(self.current_traj_step) < lift_from + extra:
+            return True
+        z_ref = getattr(self, "_s1_grasp_ee_z", None)
+        if z_ref is None:
+            return lift_from > 0 and int(self.current_traj_step) < lift_from
+        z_min = max(
+            float(getattr(self.cfg, "planner_carry_lift_skip_min_dz", 0.022)),
+            self._stage1_pickup_lift_dz(),
+        )
+        try:
+            ee, _ = self.robot_A.ee_pose()
+            return float(ee[2]) < float(z_ref) + z_min
+        except Exception:
+            return True
+
+    def _stage1_pickup_lift_dz(self) -> float:
+        return float(getattr(self.cfg, "planner_stage1_pickup_lift_dz", 0.10))
 
     def _cache_grasp_relative_transform(self) -> None:
         """Record T_ee_tire = inv(T_world_ee) ∘ T_world_tire at this moment.
@@ -3575,6 +3681,36 @@ class TyroEnv(gym.Env):
         )
         self._grasp_t_ee_tire_pos = np.asarray(t_pos, dtype=np.float64)
         self._grasp_t_ee_tire_quat = np.asarray(t_orn, dtype=np.float64)
+
+    def _replace_grasped_tire_rigid(self) -> bool:
+        """Hard re-place the grasped tire onto ``EE * T_ee_tire`` (visual).
+
+        Uses the transform cached at grasp time (``_grasp_t_ee_tire_*``) to
+        snap the tire back to its exact gripper-relative pose, cancelling the
+        ±cm swing the soft JOINT_FIXED bond exhibits during fast carry
+        acceleration. Velocity is zeroed so the next physics sub-step does
+        not re-inject the lag. Returns ``True`` iff a re-place happened.
+        """
+        t_pos = getattr(self, "_grasp_t_ee_tire_pos", None)
+        t_quat = getattr(self, "_grasp_t_ee_tire_quat", None)
+        if t_pos is None or t_quat is None or self.robot_A is None:
+            return False
+        ee_pos, ee_orn = self.robot_A.ee_pose()
+        new_pos, new_orn = p.multiplyTransforms(
+            np.asarray(ee_pos, dtype=np.float64).tolist(),
+            np.asarray(ee_orn, dtype=np.float64).tolist(),
+            np.asarray(t_pos, dtype=np.float64).tolist(),
+            np.asarray(t_quat, dtype=np.float64).tolist(),
+        )
+        p.resetBasePositionAndOrientation(
+            self.handles.tire, list(new_pos), list(new_orn),
+            physicsClientId=self.client,
+        )
+        p.resetBaseVelocity(
+            self.handles.tire, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+            physicsClientId=self.client,
+        )
+        return True
 
     def _is_tire_grasped(self) -> bool:
         return (
@@ -3914,7 +4050,8 @@ class TyroEnv(gym.Env):
             stage = {3: 1, 4: 2, 5: 3}.get(int(stage), int(stage))
 
         if stage == 0:
-            tire_p = np.asarray(self.cfg.tire_pickup_pos, dtype=np.float64)
+            tire_p, _ = self.scene.tire_pose()
+            tire_p = np.asarray(tire_p, dtype=np.float64).reshape(3)
             end_pos = tire_p + np.array([0.0, 0.0, -R], dtype=np.float64)
             return end_pos, palm_up
 
@@ -4051,7 +4188,7 @@ class TyroEnv(gym.Env):
             has_departure = float(np.linalg.norm(ds)) > 1e-6
         if has_approach or has_departure:
             # Multi-via path supporting:
-            #   * Stage 1 — [start, apex?, end+standoff, end] (+Y insertion)
+            #   * Stage 1 — [start, +Z lift?, apex?, end+standoff, end]
             #   * Stage 3 — [start, start+standoff, apex?, end] (−Y extraction
             #     first, mirror of Stage 1)
             waypoints = [start_arr]
@@ -4059,8 +4196,9 @@ class TyroEnv(gym.Env):
                 ds = np.asarray(departure_standoff, dtype=np.float64).reshape(3)
                 waypoints.append(start_arr + ds)
             if float(lift) > 1e-6:
+                arch_from = np.asarray(waypoints[-1], dtype=np.float64)
                 waypoints.append(
-                    0.5 * (start_arr + end_arr)
+                    0.5 * (arch_from + end_arr)
                     + np.array([0.0, 0.0, float(lift)], dtype=np.float64))
             if has_approach:
                 so = np.asarray(approach_standoff, dtype=np.float64).reshape(3)
@@ -4091,6 +4229,167 @@ class TyroEnv(gym.Env):
             traj_quat = _slerp_quats(start_quat, end_quat, n, times=t_warped)
         else:
             traj_quat = _slerp_quats(start_quat, end_quat, n)
+        return traj_pos, traj_quat
+
+    def _generate_stage0_pickup_trajectory(
+        self,
+        start_pose: Tuple[np.ndarray, np.ndarray],
+        end_pose: Tuple[np.ndarray, np.ndarray],
+        total_steps: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Stage 0 pickup: min-jerk XY with Z lowered ahead of horizontal travel."""
+        start_pos, start_quat = start_pose
+        end_pos, end_quat = end_pose
+        n = int(total_steps)
+        start_arr = np.asarray(start_pos, dtype=np.float64).reshape(3)
+        end_arr = np.asarray(end_pos, dtype=np.float64).reshape(3)
+        if bool(getattr(self.cfg, "planner_stage0_z_xy_coupled", True)):
+            z_ahead = float(getattr(
+                self.cfg, "planner_stage0_z_ahead_frac", 0.32,
+            ))
+            z_ahead = float(np.clip(z_ahead, 0.0, 0.75))
+            if z_ahead <= 1e-6:
+                traj_pos = _min_jerk_positions(start_arr, end_arr, n)
+            else:
+                xy0 = start_arr[:2]
+                xy1 = end_arr[:2]
+                z0 = float(start_arr[2])
+                z1 = float(end_arr[2])
+                xy_span = float(np.linalg.norm(xy1 - xy0))
+                xy_traj = _min_jerk_positions(
+                    np.array([xy0[0], xy0[1], 0.0], dtype=np.float64),
+                    np.array([xy1[0], xy1[1], 0.0], dtype=np.float64),
+                    n,
+                )
+                z_denom = max(1e-6, 1.0 - z_ahead)
+                traj_pos = np.zeros((n, 3), dtype=np.float64)
+                for i in range(n):
+                    if xy_span > 1e-6:
+                        frac_xy = float(
+                            np.linalg.norm(xy_traj[i, :2] - xy0) / xy_span
+                        )
+                    else:
+                        frac_xy = float(i) / max(n - 1, 1)
+                    frac_xy = min(1.0, max(0.0, frac_xy))
+                    z_frac = min(1.0, frac_xy / z_denom)
+                    traj_pos[i, 0] = xy_traj[i, 0]
+                    traj_pos[i, 1] = xy_traj[i, 1]
+                    traj_pos[i, 2] = z0 + z_frac * (z1 - z0)
+                traj_pos[-1] = end_arr
+        else:
+            hover_dz = float(getattr(self.cfg, "planner_stage0_hover_dz", 0.12))
+            xy_frac = float(getattr(self.cfg, "planner_stage0_early_xy_frac", 0.30))
+            z_frac = float(getattr(self.cfg, "planner_stage0_early_z_frac", 0.55))
+            hover = end_arr + np.array([0.0, 0.0, hover_dz], dtype=np.float64)
+            xy_frac = float(np.clip(xy_frac, 0.05, 0.95))
+            z_frac = float(np.clip(z_frac, 0.05, 0.95))
+            early = start_arr.copy()
+            early[:2] = start_arr[:2] + xy_frac * (hover[:2] - start_arr[:2])
+            early[2] = start_arr[2] + z_frac * (hover[2] - start_arr[2])
+            traj_pos = _multi_min_jerk_positions(
+                [start_arr, early, hover, end_arr], n,
+            )
+        traj_quat = _slerp_quats(start_quat, end_quat, n)
+        return traj_pos, traj_quat
+
+    def _stage0_live_grasp_pos(self) -> np.ndarray:
+        """Live 6-o'clock outer grasp anchor for the cradle tire."""
+        tire_pos, _ = self.scene.tire_pose()
+        R = float(self.cfg.tire_outer_radius)
+        return (
+            np.asarray(tire_pos, dtype=np.float64).reshape(3)
+            + np.array([0.0, 0.0, -R], dtype=np.float64)
+        )
+
+    def _apply_stage0_terminal_grasp_servo(self, quat: np.ndarray) -> None:
+        """Kinematic descent to the live grasp anchor after traj playback."""
+        grasp = self._stage0_live_grasp_pos()
+        warm_q = getattr(self.robot_A, "_cmd_q", None)
+        if warm_q is None:
+            warm_q, _ = self.robot_A.joint_state()
+        q_cmd = self._solve_robot_a_planner_q(grasp, quat, warm_q=warm_q)
+        self.robot_A.last_target_pos = grasp.copy()
+        self.robot_A.apply_kinematic_arm_targets(q_cmd)
+
+    def _stage0_should_terminal_servo(self) -> bool:
+        """True when the arm should kinematically descend to the grasp anchor."""
+        if int(self.task_stage) != 0:
+            return False
+        if self._traj_pos is None:
+            return False
+        if not bool(getattr(self.cfg, "planner_stage0_terminal_grasp_servo", True)):
+            return False
+        n = int(self._traj_pos.shape[0])
+        if int(self.current_traj_step) >= max(0, n - 1):
+            return True
+        if not bool(getattr(self.cfg, "planner_stage0_terminal_early_xy", False)):
+            return False
+        ee, _ = self.robot_A.ee_pose()
+        grasp = self._stage0_live_grasp_pos()
+        ee = np.asarray(ee, dtype=np.float64)
+        dxy = float(np.linalg.norm(ee[:2] - grasp[:2]))
+        dz = float(ee[2] - grasp[2])
+        xy_tol = float(getattr(
+            self.cfg, "planner_stage0_terminal_xy_tol", 0.18,
+        ))
+        z_tol = float(getattr(
+            self.cfg, "planner_stage0_terminal_z_tol", 0.015,
+        ))
+        return dxy < xy_tol and dz > z_tol
+
+    def _find_pickup_lift_traj_index(self, start_z: float) -> int:
+        """First index whose nominal Z clears ``start_z + pickup_lift_dz``."""
+        if self._traj_pos is None:
+            return 0
+        z_min = self._stage1_pickup_lift_dz()
+        n = int(self._traj_pos.shape[0])
+        for i in range(n):
+            pos = np.asarray(self._traj_pos[i], dtype=np.float64)
+            if float(pos[2]) >= float(start_z) + z_min - 1e-4:
+                return i
+        return max(0, n - 1)
+
+    def _generate_stage1_carry_trajectory(
+        self,
+        start_pose: Tuple[np.ndarray, np.ndarray],
+        end_pose: Tuple[np.ndarray, np.ndarray],
+        total_steps: int,
+        *,
+        lift: float,
+        orient_front_load_k: float,
+        approach_standoff: Optional[np.ndarray],
+        departure_standoff: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Stage 1 carry with vertical lift first, yaw rotation deferred."""
+        start_pos, start_quat = start_pose
+        end_pos, end_quat = end_pose
+        traj_pos, _ = self._generate_nominal_trajectory(
+            start_pose,
+            end_pose,
+            total_steps=total_steps,
+            lift=lift,
+            orient_front_load_k=0.0,
+            approach_standoff=approach_standoff,
+            departure_standoff=departure_standoff,
+        )
+        n = int(total_steps)
+        start_z = float(np.asarray(start_pos, dtype=np.float64).reshape(3)[2])
+        lift_end = self._find_pickup_lift_traj_index(start_z)
+        lift_end = min(max(0, int(lift_end)), n - 1)
+        traj_quat = np.repeat(
+            np.asarray(start_quat, dtype=np.float64).reshape(1, 4),
+            n,
+            axis=0,
+        )
+        n_rot = n - lift_end - 1
+        if n_rot > 0:
+            t_lin = np.linspace(0.0, 1.0, n_rot, dtype=np.float64)
+            k = float(orient_front_load_k)
+            if k > 1.0 + 1e-6:
+                t_lin = 1.0 - np.power(1.0 - t_lin, k)
+            rot_quats = _slerp_quats(start_quat, end_quat, n_rot, times=t_lin)
+            traj_quat[lift_end + 1:] = rot_quats
+        traj_quat[-1] = np.asarray(end_quat, dtype=np.float64).reshape(4)
         return traj_pos, traj_quat
 
     def compute_all_stage_trajectories(
@@ -4164,16 +4463,19 @@ class TyroEnv(gym.Env):
         return self._hub_axis_standoff_vector()
 
     def _stage_departure_standoff(self, stage: int) -> Optional[np.ndarray]:
-        """Departure via offset (disabled).
+        """Departure via offset before the carry/return arch.
 
-        **2026-06-05** — the coaxial −Y extraction leg now lives entirely in
-        Stage 2 (demount), whose end-pose is the Stage-1 mount pose translated
-        −Y by the standoff. Stage 3 therefore STARTS already at the standoff
-        via-point and only has to arc back to the cradle (the reverse of the
-        Stage-1 carry arch), so it needs no extra departure standoff. Returning
-        None keeps Stage 3 a clean ``standoff → apex → cradle`` mirror of the
-        carry instead of inserting a second redundant −Y leg.
+        Stage 1: straight +Z lift to clear the tire from the rack before any
+        lateral hub motion. Stage 3 keeps ``None`` (extraction leg lives in
+        Stage 2 demount).
         """
+        st = int(stage)
+        if bool(getattr(self.cfg, "remount_cycle_enable", False)):
+            st = {3: 1, 4: 2, 5: 3}.get(st, st)
+        if st == 1:
+            dz = self._stage1_pickup_lift_dz()
+            if dz > 1e-6:
+                return np.array([0.0, 0.0, dz], dtype=np.float64)
         return None
 
     def _replan_for_current_stage(self) -> None:
@@ -4244,26 +4546,250 @@ class TyroEnv(gym.Env):
             )
         standoff = self._stage_approach_standoff(int(self.task_stage))
         depart = self._stage_departure_standoff(int(self.task_stage))
-        traj_pos, traj_quat = self._generate_nominal_trajectory(
-            (np.asarray(start_pos, dtype=np.float64),
-             np.asarray(start_quat, dtype=np.float64)),
-            (np.asarray(end_pos, dtype=np.float64),
-             np.asarray(end_quat, dtype=np.float64)),
-            total_steps=n,
-            lift=lift,
-            orient_front_load_k=front_load_k,
-            approach_standoff=standoff,
-            departure_standoff=depart,
+        start_pose = (
+            np.asarray(start_pos, dtype=np.float64),
+            np.asarray(start_quat, dtype=np.float64),
         )
+        end_pose = (
+            np.asarray(end_pos, dtype=np.float64),
+            np.asarray(end_quat, dtype=np.float64),
+        )
+        if (
+            int(self.task_stage) == 0
+            and (
+                bool(getattr(self.cfg, "planner_stage0_z_xy_coupled", True))
+                or float(getattr(self.cfg, "planner_stage0_hover_dz", 0.12)) > 1e-6
+            )
+        ):
+            traj_pos, traj_quat = self._generate_stage0_pickup_trajectory(
+                start_pose, end_pose, total_steps=n,
+            )
+        elif int(self.task_stage) == 1 and self._stage1_pickup_lift_dz() > 1e-6:
+            traj_pos, traj_quat = self._generate_stage1_carry_trajectory(
+                start_pose,
+                end_pose,
+                total_steps=n,
+                lift=lift,
+                orient_front_load_k=front_load_k,
+                approach_standoff=standoff,
+                departure_standoff=depart,
+            )
+        else:
+            traj_pos, traj_quat = self._generate_nominal_trajectory(
+                start_pose,
+                end_pose,
+                total_steps=n,
+                lift=lift,
+                orient_front_load_k=front_load_k,
+                approach_standoff=standoff,
+                departure_standoff=depart,
+            )
         self._traj_pos = traj_pos
         self._traj_quat = traj_quat
         self.current_traj_step = 0
         self._traj_stall = 0
         if bool(getattr(self.cfg, "planner_precompute_joint_traj", True)):
-            self._traj_q = self._bake_planner_joint_trajectory(traj_pos, traj_quat)
-            self._traj_q = self._smooth_baked_joint_trajectory(self._traj_q)
+            stage0_cart = (
+                int(self.task_stage) == 0
+                and bool(getattr(
+                    self.cfg, "planner_stage0_cartesian_replay", True,
+                ))
+            )
+            if stage0_cart:
+                self._traj_q = None
+            else:
+                self._traj_q = self._bake_planner_joint_trajectory(
+                    traj_pos, traj_quat,
+                )
+                self._traj_q = self._smooth_baked_joint_trajectory(self._traj_q)
+            hold_q = getattr(self, "_planner_hold_arm_targets", None)
+            if hold_q is not None and self._traj_q is not None:
+                prefix = int(getattr(
+                    self.cfg, "planner_hold_rebake_prefix", 20,
+                ))
+                if int(self.task_stage) == 1:
+                    lift_idx = self._find_carry_lift_traj_index(
+                        np.asarray(start_pos, dtype=np.float64),
+                    )
+                    prefix = max(prefix, int(lift_idx) + 1)
+                self._traj_q = self._rebake_traj_prefix_from_joint_q(
+                    np.asarray(hold_q, dtype=np.float64), prefix=prefix,
+                )
+            elif int(self.task_stage) == 0 and self._traj_q is not None:
+                q0, _ = self.robot_A.joint_state()
+                self._traj_q = self._rebake_traj_prefix_from_joint_q(
+                    np.asarray(q0, dtype=np.float64),
+                    prefix=int(self._traj_q.shape[0]),
+                    pin_near_grasp=False,
+                )
+                # Re-solve the tail so the baked FK reaches the grasp anchor.
+                tail = int(getattr(self.cfg, "planner_stage0_rebake_tail", 25))
+                self._traj_q = self._rebake_traj_suffix_to_grasp(
+                    tail=max(1, tail),
+                )
         else:
             self._traj_q = None
+        self._carry_lift_from_idx = 0
+        if int(self.task_stage) == 1 and self._traj_pos is not None:
+            lift_idx = self._find_carry_lift_traj_index(
+                np.asarray(start_pos, dtype=np.float64),
+            )
+            self._carry_lift_from_idx = int(lift_idx)
+            if bool(getattr(self.cfg, "planner_skip_s1_yaw_preamble", True)):
+                self.current_traj_step = int(lift_idx)
+
+    def _find_carry_lift_traj_index(
+        self,
+        grasp_ee: Optional[np.ndarray] = None,
+    ) -> int:
+        """First traj index whose nominal Z clears the grasp height + margin."""
+        if self._traj_pos is None:
+            return 0
+        if grasp_ee is None:
+            grasp_ee, _ = self.robot_A.ee_pose()
+        grasp_ee = np.asarray(grasp_ee, dtype=np.float64).reshape(3)
+        z_min = max(
+            float(getattr(self.cfg, "planner_carry_lift_skip_min_dz", 0.022)),
+            self._stage1_pickup_lift_dz(),
+        )
+        n = int(self._traj_pos.shape[0])
+        for i in range(n):
+            pos = np.asarray(self._traj_pos[i], dtype=np.float64)
+            if float(pos[2]) >= float(grasp_ee[2]) + z_min:
+                return i
+        return max(0, n - 1)
+
+    def _rebake_traj_prefix_from_joint_q(
+        self,
+        q0: np.ndarray,
+        *,
+        prefix: int = 20,
+        pin_near_grasp: bool = True,
+    ) -> np.ndarray:
+        """Re-chain the early baked joints from the live grasp pose.
+
+        ``_bake_planner_joint_trajectory`` warm-starts every waypoint from
+        HOME, so ``_traj_q[0]`` can land on a different IK branch than the
+        actual grasp joints even when the nominal EE pose matches. That
+        mismatch makes the first few policy steps (and the GUI lerp) visibly
+        bounce away from the tire before the carry arch begins.
+        """
+        if self._traj_q is None or self._traj_pos is None or self._traj_quat is None:
+            return self._traj_q
+        ur = self.robot_A
+        n = int(self._traj_q.shape[0])
+        end = min(max(1, int(prefix)), n)
+        out = np.asarray(self._traj_q, dtype=np.float64).copy()
+        q0 = np.clip(np.asarray(q0, dtype=np.float64).reshape(-1),
+                     ur.arm.lower, ur.arm.upper)
+        out[0] = q0
+        palm_up = self._planner_palm_up_active()
+        state_id = p.saveState(physicsClientId=self.client)
+        try:
+            for jidx, qv in zip(ur.arm.indices, q0):
+                p.resetJointState(
+                    ur.uid, jidx,
+                    targetValue=float(qv), targetVelocity=0.0,
+                    physicsClientId=self.client,
+                )
+            grasp_ee, grasp_quat = ur.ee_pose()
+            grasp_ee = np.asarray(grasp_ee, dtype=np.float64)
+            grasp_quat = np.asarray(grasp_quat, dtype=np.float64)
+            self._traj_pos[0] = grasp_ee.copy()
+            self._traj_quat[0] = grasp_quat.copy()
+            pos_tol = float(getattr(
+                self.cfg, "planner_hold_rebake_pos_tol", 0.045,
+            ))
+            z_tol = float(getattr(
+                self.cfg, "planner_hold_rebake_z_tol", 0.035,
+            ))
+            rest = q0.copy()
+            for i in range(1, end):
+                pos = np.asarray(self._traj_pos[i], dtype=np.float64)
+                near_grasp = False
+                if pin_near_grasp:
+                    near_grasp = (
+                        float(np.linalg.norm(pos - grasp_ee)) < pos_tol
+                        and float(pos[2]) < float(grasp_ee[2]) + z_tol
+                    )
+                if near_grasp:
+                    out[i] = q0.copy()
+                    continue
+                quat = np.asarray(self._traj_quat[i], dtype=np.float64)
+                if palm_up:
+                    quat = self._tilt_lock_palm_up_quat(quat)
+                q = ur.solve_arm_joints_in_snapshot(pos, quat, rest)
+                out[i] = q
+                rest = q.copy()
+                for jidx, qv in zip(ur.arm.indices, q):
+                    p.resetJointState(
+                        ur.uid, jidx,
+                        targetValue=float(qv), targetVelocity=0.0,
+                        physicsClientId=self.client,
+                    )
+        finally:
+            p.restoreState(stateId=state_id, physicsClientId=self.client)
+            p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
+        return out
+
+    def _solve_robot_a_planner_q(
+        self,
+        pos: np.ndarray,
+        quat: np.ndarray,
+        warm_q: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Chained IK for planner replay (Stage 0 cartesian path)."""
+        ur = self.robot_A
+        if warm_q is None:
+            warm_q, _ = ur.joint_state()
+        return ur.solve_arm_joints_in_snapshot(
+            np.asarray(pos, dtype=np.float64),
+            np.asarray(quat, dtype=np.float64),
+            np.asarray(warm_q, dtype=np.float64),
+        )
+
+    def _rebake_traj_suffix_to_grasp(self, *, tail: int = 25) -> np.ndarray:
+        """Re-chain the tail baked joints so FK reaches the live grasp pose."""
+        if self._traj_q is None or self._traj_pos is None or self._traj_quat is None:
+            return self._traj_q
+        ur = self.robot_A
+        n = int(self._traj_q.shape[0])
+        tail_n = min(max(1, int(tail)), n)
+        grasp = self._stage0_live_grasp_pos()
+        self._traj_pos[-1] = grasp.copy()
+        out = np.asarray(self._traj_q, dtype=np.float64).copy()
+        palm_up = self._planner_palm_up_active()
+        start_i = max(0, n - tail_n)
+        state_id = p.saveState(physicsClientId=self.client)
+        try:
+            seed_i = max(0, start_i - 1)
+            rest = out[seed_i].copy()
+            for jidx, qv in zip(ur.arm.indices, rest):
+                p.resetJointState(
+                    ur.uid, int(jidx),
+                    targetValue=float(qv), targetVelocity=0.0,
+                    physicsClientId=self.client,
+                )
+            for i in range(start_i, n):
+                pos = grasp if i == n - 1 else np.asarray(
+                    self._traj_pos[i], dtype=np.float64,
+                )
+                quat = np.asarray(self._traj_quat[i], dtype=np.float64)
+                if palm_up:
+                    quat = self._tilt_lock_palm_up_quat(quat)
+                q = ur.solve_arm_joints_in_snapshot(pos, quat, rest)
+                out[i] = q
+                rest = q.copy()
+                for jidx, qv in zip(ur.arm.indices, q):
+                    p.resetJointState(
+                        ur.uid, int(jidx),
+                        targetValue=float(qv), targetVelocity=0.0,
+                        physicsClientId=self.client,
+                    )
+        finally:
+            p.restoreState(stateId=state_id, physicsClientId=self.client)
+            p.removeState(stateUniqueId=state_id, physicsClientId=self.client)
+        return out
 
     def _smooth_baked_joint_trajectory(self, traj_q: Optional[np.ndarray]
                                        ) -> Optional[np.ndarray]:
@@ -4915,12 +5441,25 @@ class TyroEnv(gym.Env):
 
         if self.task_stage == 0:
             grasp_target = tire_pos + np.array([0.0, 0.0, -R], dtype=np.float64)
-            if float(np.linalg.norm(ee_pos - grasp_target)) < float(self._approach_tol):
+            d_grasp = float(np.linalg.norm(ee_pos - grasp_target))
+            dz_above = float(ee_pos[2] - grasp_target[2])
+            z_cap = float(getattr(
+                self.cfg, "planner_stage0_pickup_max_dz", 0.030,
+            ))
+            if (
+                d_grasp < float(self._approach_tol)
+                and dz_above <= z_cap
+            ):
                 self._release_world_pin()
                 self._attach_tire_to_robot_A()
                 self.task_stage = 1
                 self._pickup_bonus_paid = True
                 events["picked_up"] = True
+                hold_q, _ = self.robot_A.joint_state()
+                self._planner_hold_arm_targets = np.asarray(
+                    hold_q, dtype=np.float64,
+                ).copy()
+                self._capture_s1_grasp_ee_z()
                 self._maybe_promote_to_fixed_grasp()
                 self._prev_d_approach = None
                 self._prev_d_return = None
@@ -5174,13 +5713,59 @@ class TyroEnv(gym.Env):
             else:
                 self._apply_action(action)
 
+        # Visual-only carry rigidity: during carry (task_stage == 1) the tire
+        # is held by a kinematic grasp (no physical constraint), so during the
+        # decimation sub-steps it free-falls / drifts as a loose rigid body and
+        # is only snapped back at the END of the step. The GUI renders every
+        # sub-step, so that free body motion shows up as the tire "jittering /
+        # moving on top of Robot A". When enabled, re-snap the tire onto the
+        # cached EE↔tire transform after EVERY sub-step so it stays perfectly
+        # rigid to the gripper on screen (no effect on headless physics result).
+        carry_rigid = (
+            bool(getattr(self.cfg, "carry_tire_rigid_sync", False))
+            and not nut_task
+            and int(self.task_stage) == 1
+            and not self._mount_seat_active
+            and self._is_tire_grasped()
+        )
+        # Zero the tire mass during rigid carry so ``stepSimulation`` never
+        # moves it (no per-sub-step free-fall for the GUI to render); restore
+        # the dynamic mass the moment rigid carry ends (mount-seat / Stage 2)
+        # so the seating physics behave normally.
+        if carry_rigid and not self._carry_mass_zeroed:
+            try:
+                p.changeDynamics(self.handles.tire, -1, mass=0.0,
+                                 physicsClientId=self.client)
+            except p.error:
+                pass
+            self._carry_mass_zeroed = True
+        elif self._carry_mass_zeroed and not carry_rigid:
+            try:
+                p.changeDynamics(self.handles.tire, -1,
+                                 mass=float(self.cfg.tire_mass),
+                                 physicsClientId=self.client)
+            except p.error:
+                pass
+            self._carry_mass_zeroed = False
+        carry_rigid_synced = False
+        if carry_rigid:
+            # Snap before the first sub-step too, so the very first rendered
+            # frame of the step already shows the tire rigid to the gripper.
+            self._replace_grasped_tire_rigid()
         for _ in range(self.cfg.decimation):
             p.stepSimulation(physicsClientId=self.client)
+            if carry_rigid:
+                carry_rigid_synced = self._replace_grasped_tire_rigid()
         palm_up_corrected = False
         # Nut task: Robot A is a frozen fixture — no palm-up re-lock IK.
         if self._mount_hold_left <= 0 and not nut_task:
             palm_up_corrected = self._enforce_robot_a_palm_up()
-        if (self._grasp_kinematic and self._use_kinematic_tire_sync()
+            if carry_rigid and palm_up_corrected:
+                # Palm-up re-lock moved the arm; re-snap the tire to match.
+                carry_rigid_synced = self._replace_grasped_tire_rigid()
+        # Non-rigid path keeps the legacy post-step kinematic upright sync.
+        if (not carry_rigid and self._grasp_kinematic
+                and self._use_kinematic_tire_sync()
                 and not self._mount_seat_active):
             self._sync_grasped_tire_upright()
         # The palm-up re-lock / kinematic tire sync above move bodies via
@@ -5189,7 +5774,7 @@ class TyroEnv(gym.Env):
         # this step's collision/contact-force gates see the corrected world
         # (``getClosestPoints`` checks are already pose-current; this fixes the
         # ``getContactPoints``-based robot-link checks).
-        if palm_up_corrected:
+        if palm_up_corrected or carry_rigid_synced:
             p.performCollisionDetection(physicsClientId=self.client)
 
         self._step_count += 1
@@ -5688,17 +6273,88 @@ class TyroEnv(gym.Env):
                 final_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
             residual_active = float(np.max(np.abs(action[0:3]))) >= 1e-4
+            lift_from = int(getattr(self, "_carry_lift_from_idx", 0))
+            force_baked = bool(getattr(
+                self.cfg, "planner_force_baked_while_approaching", True,
+            )) and (int(self.task_stage) == 0 or self._stage1_force_baked())
             use_dls = bool(getattr(self.cfg, "use_dls_cartesian_servo", False)) and (
-                residual_active
+                (residual_active and not force_baked)
                 or bool(getattr(self.cfg, "planner_dls_always", False))
             )
             use_baked = (
                 not use_dls
                 and self._traj_q is not None
                 and bool(getattr(self.cfg, "planner_precompute_joint_traj", True))
-                and not residual_active
+                and (not residual_active or force_baked)
             )
-            if use_dls:
+            stage0_kinematic = (
+                force_baked
+                and int(self.task_stage) == 0
+                and bool(getattr(
+                    self.cfg, "planner_stage0_kinematic_baked", True,
+                ))
+            )
+            stage1_kinematic = (
+                force_baked
+                and int(self.task_stage) == 1
+                and bool(getattr(
+                    self.cfg, "planner_stage1_kinematic_until_lift", True,
+                ))
+                and int(self.current_traj_step) < int(
+                    getattr(self, "_carry_lift_from_idx", 0)
+                ) + int(getattr(
+                    self.cfg, "planner_stage1_force_baked_extra_steps", 25,
+                ))
+            )
+            stage0_cartesian = (
+                force_baked
+                and int(self.task_stage) == 0
+                and bool(getattr(
+                    self.cfg, "planner_stage0_cartesian_replay", True,
+                ))
+            )
+            stage0_terminal = self._stage0_should_terminal_servo()
+            if stage0_terminal:
+                self._apply_stage0_terminal_grasp_servo(final_quat)
+                at_tail = int(self.current_traj_step) >= n - 1
+                if at_tail:
+                    max_extra = int(getattr(
+                        self.cfg, "planner_stage0_terminal_grasp_max_steps", 80,
+                    ))
+                    cap = max(0, n - 1) + max(1, max_extra)
+                    if int(self.current_traj_step) < cap:
+                        self.current_traj_step += 1
+            elif stage0_cartesian:
+                self.robot_A.last_target_pos = nominal_pos.copy()
+                if bool(getattr(self.cfg, "planner_stage0_dls_replay", True)):
+                    self.robot_A.drive_ee_servo_dls(
+                        final_pos, final_quat,
+                        damping=float(getattr(
+                            self.cfg, "planner_dls_damping", 0.06)),
+                        max_joint_step=float(getattr(
+                            self.cfg, "planner_stage0_dls_max_joint_step",
+                            0.14,
+                        )),
+                        pos_gain=float(getattr(
+                            self.cfg, "planner_stage0_dls_pos_gain", 1.5,
+                        )),
+                        orn_gain=float(getattr(
+                            self.cfg, "planner_dls_orn_gain", 0.8)),
+                        adaptive=bool(getattr(
+                            self.cfg, "planner_dls_adaptive", True)),
+                        manip_threshold=float(getattr(
+                            self.cfg, "planner_dls_manip_threshold", 0.02)),
+                    )
+                else:
+                    warm_q = getattr(self.robot_A, "_cmd_q", None)
+                    if warm_q is None:
+                        warm_q, _ = self.robot_A.joint_state()
+                    q_cmd = self._solve_robot_a_planner_q(
+                        final_pos, final_quat, warm_q=warm_q,
+                    )
+                    self.robot_A.apply_kinematic_arm_targets(q_cmd)
+                self._advance_traj_index(nominal_pos)
+            elif use_dls:
                 # 2026-06-04 — closed-loop DLS resolved-rate servo toward
                 # the nominal+residual EE pose. Replaces per-step absolute
                 # IK to kill the 40–70 cm EE snaps near the hub singularity.
@@ -5719,16 +6375,45 @@ class TyroEnv(gym.Env):
                 # time (chained warm-start IK). Avoids per-step HOME-
                 # anchored IK in ``apply_palm_up_pose``, which was the
                 # main source of visible tremor with zero policy residual.
-                q_cmd = np.asarray(self._traj_q[idx], dtype=np.float64)
+                hold_q = getattr(self, "_planner_hold_arm_targets", None)
+                lift_idx = int(getattr(self, "_carry_lift_from_idx", 0))
+                skip_hold = (
+                    hold_q is not None
+                    and lift_idx > 0
+                    and int(self.current_traj_step) == lift_idx
+                )
+                q_cmd = np.asarray(
+                    hold_q if skip_hold else self._traj_q[idx],
+                    dtype=np.float64,
+                )
                 self.robot_A.last_target_pos = nominal_pos.copy()
-                self.robot_A.drive_arm_targets(q_cmd)
+                if stage0_kinematic or stage1_kinematic:
+                    self.robot_A.apply_kinematic_arm_targets(q_cmd)
+                else:
+                    self.robot_A.drive_arm_targets(q_cmd)
+                if skip_hold:
+                    self._planner_hold_arm_targets = None
                 self._advance_traj_index(nominal_pos)
             else:
                 hold_q = getattr(self, "_planner_hold_arm_targets", None)
                 skip_ik = (
                     hold_q is not None
-                    and int(self.current_traj_step) == 0
-                    and not residual_active
+                    and (
+                        int(self.current_traj_step) == 0
+                        or (
+                            int(getattr(self, "_carry_lift_from_idx", 0)) > 0
+                            and int(self.current_traj_step)
+                            == int(getattr(self, "_carry_lift_from_idx", 0))
+                        )
+                    )
+                    and (
+                        not residual_active
+                        or bool(getattr(
+                            self.cfg,
+                            "planner_hold_skip_ik_ignore_residual",
+                            True,
+                        ))
+                    )
                 )
                 # When a baked joint trajectory exists, warm-start the
                 # residual-offset IK from the baked solution for this

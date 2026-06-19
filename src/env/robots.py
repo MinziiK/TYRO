@@ -554,6 +554,27 @@ class UR10Robot(Robot):
         )
         self.drive_arm_targets(cur_q + delta)
 
+    def apply_kinematic_arm_targets(self, arm_targets: np.ndarray) -> None:
+        """Snap joints to ``arm_targets`` and seed PD at the same posture.
+
+        Used for Stage-0 HOME→pickup baked replay: per-step PD tracking
+        lags the min-jerk joint plan by ~30 cm near the tire, but
+        consecutive baked waypoints are close enough in joint space that
+        a kinematic step reads as smooth motion while preserving the
+        IK branch that reaches the grasp gate.
+        """
+        arm_targets = np.clip(
+            np.asarray(arm_targets, dtype=np.float64).reshape(-1),
+            self.arm.lower, self.arm.upper,
+        )
+        for idx, qv in zip(self.arm.indices, arm_targets):
+            p.resetJointState(
+                self.uid, int(idx),
+                targetValue=float(qv), targetVelocity=0.0,
+                physicsClientId=self.client,
+            )
+        self.drive_arm_targets(arm_targets)
+
     def drive_arm_targets(self, arm_targets: np.ndarray) -> None:
         """Send (optionally smoothed) joint targets to the arm motors."""
         arm_targets = np.clip(

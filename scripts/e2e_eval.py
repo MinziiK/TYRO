@@ -151,6 +151,55 @@ def _nut_overrides_v23(*, render: bool, dr_range_m: float, max_steps: int) -> di
     )
 
 
+def _nut_overrides_v24(*, render: bool, dr_range_m: float, max_steps: int) -> dict:
+    """v24 pure-RL clean-branch + shortest-macro (matches Stage B2/B3 training)."""
+    o = dict(
+        render=render,
+        scene_layout="fanuc_spacious",
+        nut_fastening_task=True,
+        nut_pure_rl=True,
+        nut_b_planner_residual=False,
+        nut_b_hotstart_enable=True,
+        nut_b_hotstart_alpha=0.0,
+        nut_b_hotstart_random_bolt=False,
+        nut_per_leg_episode=False,
+        nut_b_align_servo=True,
+        nut_a_kinematic_freeze=True,
+        nut_collision_fail=True,
+        nut_b_solo_action=True,
+        nut_arrive_lat_tol=0.015,
+        nut_seat_lat_mult=1.0,
+        nut_b_axial_insert_servo=True,
+        nut_insert_depth_tol=0.007,
+        nut_b_insert_branch_search=True,
+        nut_b_clean_branch_insert=True,
+        nut_clean_shortest_macro=True,
+        # Macro timing MUST match the validated B3 eval (smooth PREP + longer
+        # plunge). These are not training-only knobs: the scripted macro length
+        # changes seating timing/collisions, and the headless eval that scored
+        # 5cm mean 9.6 used exactly these. Apply in BOTH headless and GUI.
+        nut_clean_macro_smooth=True,
+        nut_clean_prep_len=72,
+        nut_clean_plunge_len=45,
+        # E2E uses A's actual seated-tire hold pose (deterministic), not the
+        # 6deg training jitter. The jitter is a robustness randomisation for
+        # training; at deployment A holds where it mounted. Some jitter draws
+        # placed A's frozen arm in immediate contact with B (step-1
+        # nut_collision), which is an artificial setup failure, not a policy
+        # one. The model trained WITH jitter, so jitter=0 is strictly easier.
+        nut_a_hold_jitter_rad=0.0,
+        nut_stall_steps=0,
+        terminate_on="never",
+        max_steps=max_steps,
+        USE_DOMAIN_RANDOMIZATION=True,
+        RANDOM_POSITION_RANGE=dr_range_m,
+        DR_CARGO_ENABLE=False,
+        contact_force_terminate_above=0.0,
+        collision_terminates=False,
+    )
+    return o
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="E2E eval: A mount + B nut under hub DR.")
     ap.add_argument(
@@ -162,6 +211,14 @@ def main() -> int:
         "--model-b",
         default=None,
         help="Robot B nut-fastening checkpoint (.zip). Default: v16_dr or v23_dr.",
+    )
+    ap.add_argument(
+        "--v24",
+        action="store_true",
+        help=(
+            "Use v24 pure-RL shortest-macro B wiring. Default model-b: "
+            "runs/nut_fastening_v24_dr_stageB3/ckpts/ppo_1749440_steps.zip."
+        ),
     )
     ap.add_argument(
         "--v23",
@@ -229,12 +286,16 @@ def main() -> int:
         ap.error("--scenarios must be positive")
 
     if args.model_b is None:
-        args.model_b = (
-            "runs/nut_fastening_v23_dr/final.zip" if args.v23
-            else "runs/nut_fastening_v16_dr/final.zip"
-        )
+        if args.v24:
+            args.model_b = (
+                "runs/nut_fastening_v24_dr_stageB3/ckpts/ppo_1749440_steps.zip"
+            )
+        elif args.v23:
+            args.model_b = "runs/nut_fastening_v23_dr/final.zip"
+        else:
+            args.model_b = "runs/nut_fastening_v16_dr/final.zip"
     b_max_steps = int(args.b_max_steps) if args.b_max_steps is not None else (
-        6000 if args.v23 else 2000
+        2500 if args.v24 else (6000 if args.v23 else 2000)
     )
 
     model_a_path = _resolve_model_path(args.model_a)
@@ -256,10 +317,8 @@ def main() -> int:
             f"act={model_b.action_space.shape[0]}"
         )
 
-    print(
-        f"[e2e] B stack: {'v23 pure-RL' if args.v23 else 'v16 planner+residual'}  "
-        f"max_steps={b_max_steps}"
-    )
+    b_stack = "v24" if args.v24 else ("v23" if args.v23 else "v16")
+    print(f"[e2e] B stack: {b_stack}  max_steps={b_max_steps}")
 
     mount_overrides = dict(
         render=args.render,
@@ -271,11 +330,16 @@ def main() -> int:
         DR_CARGO_ENABLE=False,
         planner_pos_offset_scale=0.06,
         mount_radius_tol=float(args.mount_radius_tol),
+        mount_seat_glide_steps=10,
         contact_force_terminate_above=0.0,
         start_pos_curriculum_enable=True,
         include_hub_guide_obs=True,
     )
-    if args.v23:
+    if args.v24:
+        nut_overrides = _nut_overrides_v24(
+            render=args.render, dr_range_m=dr_range_m, max_steps=b_max_steps,
+        )
+    elif args.v23:
         nut_overrides = _nut_overrides_v23(
             render=args.render, dr_range_m=dr_range_m, max_steps=b_max_steps,
         )
@@ -400,11 +464,15 @@ def main() -> int:
                 e2e_success=e2e_ok,
             ))
     else:
-        # Headless: keep both envs open; A→B per scenario (true E2E order).
-        env_a = TyroEnv(cfg=cfg_a, render=False, seed=args.seed)
-        env_b = TyroEnv(cfg=cfg_b, render=False, seed=args.seed + 1)
-        env_a.set_start_pos_easy_prob(float(args.mix_easy_prob))
+        # Headless: fresh A and B env PER scenario. Reusing a single env_b
+        # across scenarios leaves nut-task state from the previous episode
+        # that reset() does not fully clear (e.g. clean-branch caches, motor
+        # overrides), which collapsed B (0/10, step-1 collisions) even though
+        # the SAME offsets score 10/10 with a fresh env. Recreating per
+        # scenario matches the validated single-env eval harness exactly.
+        env_a = env_b = None
         print(f"[e2e] A start pose: mix easy_prob={args.mix_easy_prob}")
+        print("[e2e] headless: fresh A/B env per scenario (matches eval harness)")
         for i in range(n):
             off = offsets[i]
             norm_cm = float(np.linalg.norm(off)) * 100.0
@@ -413,18 +481,25 @@ def main() -> int:
                 f"hub=({off[0]*100:+.2f}, {off[1]*100:+.2f}) cm  "
                 f"|hub|={norm_cm:.2f} cm"
             )
+            env_a = TyroEnv(cfg=cfg_a, render=False, seed=args.seed + i * 2)
+            env_a.set_start_pos_easy_prob(float(args.mix_easy_prob))
             a = _run_policy(
                 env_a, model_a, seed=args.seed + i * 2,
                 hub_offset=off, deterministic=det,
             )
+            env_a.close()
+            env_a = None
             print(
                 f"  A: success={a['success']}  steps={a['steps']}  "
                 f"term={a['termination']}"
             )
+            env_b = TyroEnv(cfg=cfg_b, render=False, seed=args.seed + i * 2 + 1)
             b = _run_policy(
                 env_b, model_b, seed=args.seed + i * 2 + 1,
                 hub_offset=off, deterministic=det,
             )
+            env_b.close()
+            env_b = None
             e2e_ok = bool(a["success"] and b["success"])
             print(
                 f"  B: success={b['success']}  steps={b['steps']}  "
@@ -449,8 +524,6 @@ def main() -> int:
                 b_n_fastened=int(b["n_fastened"]),
                 e2e_success=e2e_ok,
             ))
-        env_a.close()
-        env_b.close()
 
     elapsed = time.time() - t0
     n_a = sum(r.a_success for r in results)
@@ -481,7 +554,7 @@ def main() -> int:
         "meta": {
             "model_a": str(args.model_a),
             "model_b": str(args.model_b),
-            "b_stack": "v23" if args.v23 else "v16",
+            "b_stack": b_stack,
             "b_max_steps": b_max_steps,
             "scenarios": n,
             "seed": args.seed,
