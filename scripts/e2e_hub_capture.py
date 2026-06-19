@@ -414,7 +414,7 @@ def main() -> int:
         help="e2e_eval JSON.",
     )
     ap.add_argument(
-        "--out-dir", default="runs/e2e_eval/hub_captures",
+        "--out-dir", default="runs/e2e_eval/hub_captures_far",
         help="Output root (scenario subfolders created here).",
     )
     ap.add_argument(

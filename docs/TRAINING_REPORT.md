@@ -1,11 +1,12 @@
 # TYRO 이중 로봇 강화학습 — 전체 학습 보고서
 
-> **작성일:** 2026-06-08  
+> **작성일:** 2026-06-19 (최종 갱신)  
 > **프로젝트:** TYRO — 듀얼암 타이어 마운팅 시뮬레이션 + PPO 학습  
-> **대상:** Robot A (FANUC R2000iC) Phase A 마운트 · Robot B (UR10e+너트러너) 볼트 체결
+> **배포 스택:** Robot A `phase1_mount_v3_dr` · Robot B `nut_fastening_v24_dr_stageB3` (1.75M ckpt)
 
-> 본 보고서는 **현재 최신 모델** 기준으로 작성되었습니다. 두 로봇 모두 동일한
-> **Min-Jerk 명목 궤적 + PPO 잔차** 구조를 사용합니다.
+> **제어 구조 (현재):** Robot A는 **Min-Jerk 명목 궤적 + PPO 잔차**(6-DOF).
+> Robot B(v24)는 **pure-RL 3-DOF 위치 제어 + clean-branch 스크립트 매크로**
+> (플래너 잔차 없음, coaxial 방향 락). E2E는 두 에피소드를 순차 실행한다.
 
 ---
 
@@ -18,15 +19,16 @@
 5. [로봇 모델 및 제어](#5-로봇-모델-및-제어)
 6. [관측 공간 (Observation)](#6-관측-공간-observation)
 7. [액션 공간 (Action)](#7-액션-공간-action)
-8. [제어 구조 — Min-Jerk Planner + PPO Residual](#8-제어-구조--min-jerk-planner--ppo-residual)
+8. [제어 구조 (A: Planner+잔차 / B: Pure-RL+매크로)](#8-제어-구조)
 9. [Robot A — Phase A 타이어 마운트 학습](#9-robot-a--phase-a-타이어-마운트-학습)
 10. [Robot B — 너트 체결 학습](#10-robot-b--너트-체결-학습)
 11. [PPO 학습 설정 (공통)](#11-ppo-학습-설정-공통)
 12. [커리큘럼 및 도메인 랜덤화](#12-커리큘럼-및-도메인-랜덤화)
 13. [종료 조건 및 안전 게이트](#13-종료-조건-및-안전-게이트)
 14. [학습 파이프라인 및 실행 방법](#14-학습-파이프라인-및-실행-방법)
-15. [설계 근거 (명목 궤적 + 잔차)](#15-설계-근거-명목-궤적--잔차)
-16. [현재 결과 및 향후 계획](#16-현재-결과-및-향후-계획)
+15. [설계 근거](#15-설계-근거)
+16. [현재 결과 및 E2E 실측](#16-현재-결과-및-e2e-실측)
+17. [E2E 평가 — 보상·설정·지표](#17-e2e-평가--보상설정지표)
 
 ---
 
@@ -38,13 +40,13 @@
 
 | 단계 | 로봇 | 작업 | 상태 |
 |------|------|------|------|
-| **Phase A** | Robot A (FANUC) | 타이어 픽업 → 허브 마운트 → 지지 | ✅ 학습 완료 (best 모델) |
-| **Phase A'** | Robot B (UR10e) | A가 지지하는 동안 10개 볼트 순차 체결 | 🔄 학습 중 (플래너+잔차) |
-| **Phase B** | A + B | 6단계 풀사이클 (픽업→마운트→복귀→재파지→디마운트→거치) | ⏳ 대기 |
+| **Phase A** | Robot A (FANUC) | 타이어 픽업 → 허브 마운트 | ✅ `phase1_mount_v3_dr` (±5 cm DR) |
+| **Phase A'** | Robot B (UR10e) | A 지지 중 10볼트 순차 체결 | ✅ v24 chain → DR Stage B3 |
+| **E2E** | A + B | 마운트 후 동일 허브 offset에서 B 체결 | ✅ 100 시나리오 실측 (§16, §17) |
+| **Phase B** | A + B | 6단계 풀사이클 (픽업→…→거치) | ⏳ 미착수 |
 
-> **공통 구조:** 두 로봇 모두 **명목 궤적(Min-Jerk 플래너) + PPO 잔차**로 제어한다.
-> 충돌-free 명목 경로를 깔고 정책은 그 위 미세 보정(±cm)만 학습하므로, 정책이 장거리
-> 경로를 자력 탐색할 필요가 없다(§8, §15).
+> Robot A는 명목+잔차, Robot B(v24)는 **pure-RL 접근 + env 매크로 체결**.
+> B의 장거리 reach는 학습으로, INSERT/HOLD/RETRACT는 clean-branch 매크로가 담당한다(§10, §15).
 
 ### 1.2 기술 스택
 
@@ -85,7 +87,7 @@
 | `contact_erp` | 0.2 | 접촉 Error Reduction Parameter |
 | `contact_cfm` | 2e-5 | Constraint Force Mixing |
 | `gravity` | (0, 0, −9.81) m/s² | |
-| `max_steps` | 600 (Phase A) / 600 (nut) | 에피소드 최대 스텝 (≈30초) |
+| `max_steps` | 2000 (A mount train/eval) / 2000–4000 (B v24 train) / 2500 (E2E B) | 태스크별 horizon |
 
 ### 2.2 환경 구성 요소
 
@@ -326,17 +328,21 @@ Phase A에서 타이어를 수직으로 지지하는 V-cradle.
 | hub_guide_vector | 3 | (hub − eeA) / ws — S1 운반 방향 cue |
 | **합계** | **85** | |
 
-### 6.2 Nut Task (Robot B) — 99차원 (85 + 7 + 7)
+### 6.2 Nut Task (Robot B, v24 pure-RL) — 94차원
 
-Phase A 85차원에 **7차원 nut 전용 채널** 추가:
+Phase A **85차원** 베이스(6-DOF `prev_action` + `hub_guide_vector`)에서 B frozen 마스킹 후,
+**+12차원 nut 전용 블록**:
 
 | 채널 | 차원 | 설명 |
 |------|------|------|
-| vec_to_staging / ws | 3 | (staging_point − tool_tip) / ws — 접근 목표 벡터 |
+| vec_to_staging / ws | 3 | (staging_point − tool_tip) / ws |
 | bolt_axis_unit | 3 | 볼트 축 단위벡터 (월드 −Y) |
-| theta_normalized | 1 | tool +Z ↔ bolt axis angle / (π/2) |
+| theta_normalized | 1 | tool +Z ↔ bolt axis / (π/2) |
+| nut_axial, nut_lateral | 2 | 소켓 축방향 깊이·횡편차 (m, 정규화) |
+| nut_subphase, nut_macro_stage | 2 | APPROACH(0) vs MACRO(1), 매크로 leg index |
+| axial_err_to_target | 1 | 현재 매크로 leg 목표 대비 축 오차 |
 
-> Robot A 채널은 nut task에서 **frozen + 마스킹**(0으로 zero-out). Robot B만 학습.
+> Robot A 채널은 **frozen + obs 마스킹**(0). 정책은 B의 **3-DOF Δposition**만 출력.
 
 ---
 
@@ -349,67 +355,54 @@ Phase A 85차원에 **7차원 nut 전용 채널** 추가:
 | Δpos_A [0:3] | [−1, 1] | × 0.03 m | EE 위치 잔차 (planner 위에 추가) |
 | Δrot_A [3:6] | [−1, 1] | × 0.05 rad | EE 회전 잔차 (planner lock 시 무시) |
 
-### 7.2 Nut Task — 12차원, 실제 활성 3채널
+### 7.2 Nut Task (v24 pure-RL) — 3차원
 
 | 채널 | 범위 | 스케일 | 설명 |
 |------|------|--------|------|
-| Δpos_A [0:3] | [−1, 1] | — | A frozen (마스킹, 보상 dead) |
-| Δrot_A [3:6] | [−1, 1] | — | A frozen (마스킹) |
-| **잔차_B [6:9]** | [−1, 1] | × **0.05 m** | **명목 EE 궤적 위 XYZ 잔차** (`nut_planner_pos_residual_scale`) |
-| Δrot_B [9:12] | [−1, 1] | — | coaxial 락으로 dead (마스킹) |
+| **Δpos_B [0:3]** | [−1, 1] | per-step EE Δ (pure-RL) | **유일한 활성 제어** — coaxial 락으로 방향 고정 |
 
-> **잔차 구조:** `action[6:9]`는 **명목 궤적의 현재 점 위에 더하는 XYZ 잔차**다. 방향은
-> 볼트축 coaxial로 하드 락(`nut_b_lock_coaxial`)되어 회전 채널 `[9:12]`은 죽고, A 채널
-> `[0:6]`도 frozen이라 **실효 제어 자유도는 3 (XYZ)**. APPROACH(sub=0)에서만 적용하며
-> MACRO(sub=1)는 환경이 직접 구동(정책 무시).
+> v24에서는 `nut_b_solo_action=True` → action space **3-DOF**. A 채널·B 회전 채널 없음.
+> APPROACH(sub=0)에서 정책이 EE 위치를 직접 구동; MACRO(sub=1) INSERT는 axial servo가
+> env 구동(정책 action 무시). HOLD/RETRACT는 매크로 joint lerp.
 
 ---
 
-## 8. 제어 구조 — Min-Jerk Planner + PPO Residual
+## 8. 제어 구조
 
-### 8.1 개요
+### 8.1 Robot A — Min-Jerk Planner + PPO Residual
 
 ```
-┌─────────────────────────────────────────────────┐
-│  FSM Stage Transition                            │
-│  ┌───────────────────────────────────────────┐  │
-│  │  Min-Jerk Planner                         │  │
-│  │  current EE → stage end-pose              │  │
-│  │  (5th-order position + SLERP orientation) │  │
-│  │  → baked joint trajectory (200 steps)       │  │
-│  └───────────────────────────────────────────┘  │
-│                      ↓ nominal pose              │
-│  ┌───────────────────────────────────────────┐  │
-│  │  PPO Policy (residual)                    │  │
-│  │  action ∈ [-1,1]^6 × scale(0.03m)        │  │
-│  │  → nominal + residual = target EE pose    │  │
-│  └───────────────────────────────────────────┘  │
-│                      ↓                           │
-│  ┌───────────────────────────────────────────┐  │
-│  │  IK → joint targets → PyBullet motors     │  │
-│  └───────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────┘
+FSM 전이 → Min-Jerk baked traj (200 step) → nominal EE[idx]
+         → + action[0:3]×0.03m (pos_only, palm-up lock) → IK → motors
 ```
-
-### 8.2 Planner 파라미터
 
 | 파라미터 | 값 | 설명 |
 |----------|-----|------|
 | `use_planner_residual` | True | Master switch |
-| `planner_pos_offset_scale` | **0.03 m** | 잔차 위치 스케일 (0.20→0.12→0.03 축소) |
-| `planner_rot_offset_scale` | 0.15 rad | 잔차 회전 (lock mode에서 무시) |
-| `planner_enable_rot_offset` | False | 회전 잔차 비활성 (pos_only) |
-| `planner_lock_palm_up` | True | tool +Z = world +Z 강제 |
-| `planner_lock_palm_up_stages` | (0,1,2,3) | 전 스테이지 palm-up |
+| `planner_pos_offset_scale` | **0.03 m** (train) / **0.06 m** (A DR fine-tune) | 잔차 위치 스케일 |
+| `planner_enable_rot_offset` | False | 회전 잔차 비활성 |
+| `planner_lock_palm_up` | True | tool +Z = world +Z |
 | `planner_traj_steps` | 200 | baked trajectory 길이 |
-| `planner_waypoint_gate_enable` | False | EE 도착 게이트 (FANUC: OFF) |
 
-### 8.3 Palm-up Tilt-Lock
+### 8.2 Robot B (v24) — Pure-RL APPROACH + Clean-Branch Macro
 
-- **목적:** 타이어가 수직 자세를 유지하도록 공구 +Z = world +Z 강제
-- **방식:** planner가 SLERP로 yaw만 허용, pitch/roll은 world +Z에 고정
-- **post-step enforcement:** `fanuc_enforce_palm_up_post_step` — 매 step 후 tool +Z 재정렬 (threshold 0.9998)
-- **Stage 1 carry arch:** 0.35m (base column clearance)
+```
+APPROACH: policy Δpos (3-DOF) + nut_b_lock_coaxial (방향 고정)
+       → arrive gate → clean-branch PREP/INSERT/HOLD/RETRACT (env joint lerp)
+       → bolt fastened → next bolt (순서 nut_bolt_order)
+```
+
+| 파라미터 | 값 | 설명 |
+|----------|-----|------|
+| `nut_pure_rl` | True | 플래너 잔차 OFF |
+| `nut_b_clean_branch_insert` | True | 타이어 충돌 없는 seat branch |
+| `nut_clean_shortest_macro` | True | ±2π winding 정리 (스핀 제거) |
+| `nut_clean_macro_smooth` | True | PREP smooth lerp |
+| `nut_clean_prep_len` / `plunge_len` | **30 / 25** (train default) | E2E·배포 eval: **72 / 45** (`e2e_eval.py`) |
+| `nut_b_axial_insert_servo` | True | INSERT 축방향 env servo |
+| `nut_b_align_servo` | True | arrive 전 축 정렬 servo |
+| `nut_arrive_lat_tol` | 0.015 m | arrive 횡편차 게이트 |
+| `nut_arrive_pos_tol` | 0.08 m | staging 캡처 구 |
 
 ---
 
@@ -449,7 +442,7 @@ S0 (Approach)  ──pickup──→  S1 (Carry/Mount)  ──mount──→  S2
 | S3 | `w_return × exp(−d/decay)` | 3.0 / 0.5m | 크래들 복귀 |
 | S3 | `w_pb_return × Δd` | 30.0 | 복귀 PB |
 | All | `w_vertical × err` | 1.0 | 타이어 수직 유지 |
-| All | `w_step_alive` | 0.15/step | hover 방지 |
+| All | `w_step_alive` | **−0.15/step** | hover 방지 (mix bypass, 매 스텝 차감) |
 | All | `w_collision` | 10.0 | 충돌 페널티 |
 | All | `w_sync_joint_a` | 0.005 | A 관절 속도 페널티 |
 
@@ -493,188 +486,184 @@ python -u -m src.train \
   --resume-mode full
 ```
 
-**결과:** 수렴, best 모델 확보. 결정론적 eval에서 타이어 중심 d ≈ 0 (~0.4 cm) 허브 안착.
+**결과:** v2 수렴 → ft03 best 확보. 결정론적 eval에서 타이어 중심 d ≈ 0 (~0.4 cm) 허브 안착.
+
+#### Phase A DR fine-tune (`run_phase_a_dr_finetune.sh` → `phase1_mount_v3_dr`)
+
+| 항목 | 값 |
+|------|-----|
+| resume | `phase1_mount_v2_ft03/best/best_model.zip` (policy-only, reset steps) |
+| hub DR | 0→5 cm (hold 200k, ramp 1M) |
+| `planner_pos_offset_scale` | **0.06 m** |
+| easy prob | 0.85→0.8 |
+| `total_steps` | 2M |
+| 배포 | `runs/phase1_mount_v3_dr/final.zip` |
+
+> E2E·배포 eval은 `terminate_on=mount`, `max_steps=2000`, `mix_easy_prob=0.8`(§17.2).
+> full 4-stage train(`terminate_on=never`)과 달리 **R_demount/R_success 미발생**.
 
 ---
 
-## 10. Robot B — 너트 체결 학습
+## 10. Robot B — 너트 체결 학습 (v24)
 
 ### 10.1 태스크 정의
 
-- Robot A가 **학습된 mount-end pose**로 타이어를 지지 (frozen, 매 step joint target 재구동)
-- Robot B가 **10개 볼트를 순차적으로** 체결 (0→1→...→9)
-- **기하학적 충실도만:** 너트 바디/토크 없음, 동축 접근 + 삽입 + 유지 + 후퇴
-- **볼트 축 = 월드 −Y:** 공구 +Z를 볼트축에 정렬하여 Y축으로 진입
+- Robot A: 타이어 **허브에 pre-seat** + mount-hold 자세로 **frozen fixture**
+- Robot B: **10볼트 순차 체결** — 순서 `(0, 5, 7, 2, 3, 8, 9, 4, 6, 1)`
+- 시작 볼트: **항상 0번** (`scene.py` target_idx=0, premark 없음)
+- 기하학적 체결: 너트 바디/토크 없음, coaxial 접근 + env 매크로 삽입/유지/후퇴
+- 볼트 축 = 월드 **−Y**; 공구 +Z = 삽입 방향 (+Y)
 
-### 10.2 환경 설정 (nut_fastening_task)
-
-| 설정 | 값 | 설명 |
-|------|-----|------|
-| `nut_fastening_task` | True | 마스터 스위치 |
-| `freeze_robot_b` | **False** (override) | B 학습 활성 |
-| `collision_terminates` | **False** (override) | 기하 체결, 충돌 종료 OFF |
-| `contact_force_terminate_above` | **0.0** (override) | 접촉력 종료 OFF |
-| `nut_mount_endpose_path` | `data/nut_mount_endpose.npz` | A 지지 자세 (학습된) |
-| `nut_a_hold_jitter_rad` | 3° | A 자세 jitter (강건성) |
-
-### 10.3 2-Phase 서브 FSM
+### 10.2 서브 FSM (APPROACH + MACRO)
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  APPROACH (sub=0) — 명목 궤적 + PPO 잔차                 │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │  명목: Min-Jerk 궤적 (현재→허브중앙→staging,     │    │
-│  │        볼트 간은 XZ hop) → joint-space로 IK 체인  │    │
-│  │  정책: action[6:9] × 0.05 m XYZ 잔차만 (3-DOF)   │    │
-│  │  방향: 볼트축 coaxial 하드 락 (θ ≈ 0 항상)        │    │
-│  │  게이트: d_stage < 8cm AND θ < ang_tol → MACRO   │    │
-│  └─────────────────────────────────────────────────┘    │
-│                      ↓ arrive gate                       │
-│  MACRO (sub=1) — 환경 스크립트 (정책 무시)               │
-│  ┌─────────────────────────────────────────────────┐    │
-│  │  INSERT: joint-space lerp → hub face (base)     │    │
-│  │  HOLD: 6 step dwell                             │    │
-│  │  RETRACT: joint-space lerp → bolt tip + clear   │    │
-│  │  → bolt fastened → 다음 볼트 명목 궤적 재생성     │    │
-│  └─────────────────────────────────────────────────┘    │
-│                      ↓ all 10 done                       │
-│  SUCCESS (all_fastened) → R_all_fastened                  │
-└─────────────────────────────────────────────────────────┘
+APPROACH (sub=0) — pure-RL 3-DOF, coaxial lock
+  policy가 HOME → staging까지 EE 이동
+  arrive: d_stage < 8cm, θ < 5°, lateral < 1.5cm
+       ↓
+MACRO (sub=1) — clean-branch env script
+  PREP (optional smooth lerp) → INSERT (axial servo) → HOLD (6 step)
+  → RETRACT → fastened → 다음 볼트
+       ↓ (10/10)
+  all_fastened → is_success
 ```
 
-> **명목 궤적 생성 (`_generate_nut_approach_traj`):**
-> - 첫 볼트: `[현재 EE, 허브 링 중앙(0,−0.21,0), staging]` 3-웨이포인트 Min-Jerk
-> - 볼트 → 볼트: `[현재 EE, XZ hop(Y=이전 retract Y 고정), staging]` (순수 XZ transit)
-> - Cartesian min-jerk 경로를 `_ik_b_rollfree`로 **관절공간 궤적으로 변환**(branch-stable).
->   잔차=0이면 관절 lerp를 직접 구동, 잔차≠0이면 명목 관절로 reset 후 EE에 잔차를 더해 IK.
-> - reset 시 + 매 볼트 체결 후 재생성. 명목 궤적이 HOME→볼트 접근을 담당하므로 hot-start 발판은 불필요.
+### 10.3 보상 구조 (farm-proof)
 
-### 10.4 Scripted Macro 상세
+**공통 mix:** `total = 0.3×dense + 0.7×fsm_bonus − 0.15` (`step_alive`)
 
-| 파라미터 | 값 | 설명 |
-|----------|-----|------|
-| `nut_scripted_macro` | True | 매크로 활성 |
-| `nut_arrive_pos_tol` | **0.08 m** | 캡처 구 (staging point 거리) |
-| `nut_arrive_steps` | 1 | 연속 in-gate step (1이면 즉시 트리거) |
-| `nut_hold_steps` | 6 | INSERT 후 dwell |
-| `nut_macro_step_m` | 0.04 m | 매크로 leg stride |
-| `nut_macro_leg_max_steps` | 30 | leg timeout |
-| `nut_insert_margin` | 0.03 m | staging을 더 바깥으로 (긴 plunge) |
-| `nut_retract_clear` | 0.03 m | retract 추가 클리어 |
-
-**Macro 실행:** joint-space lerp (q_from → q_to, leg_len steps). Roll-free IK로 leg endpoint를 reset 시 1회 precompute + cache. 물리 contact 없이 기하학적 슬라이드.
-
-### 10.5 보상 구조 — farm-proof PB + corridor
-
-정책의 역할을 **명목 궤적 위 미세 보정 + 충돌 회피**로 한정한다. 따라서
-"주차해서 빨아먹을 수 있는" standing 양수 커널(align/reach/lateral/axial/path)을
-**전부 0으로 제거**하고, 전진에만 보상이 붙는 potential-based shaping(PB)과 페널티만 남긴다.
-
-#### APPROACH 단계 (sub=0) — dense
-
-| 항목 | 공식 | 가중치/파라미터 | 설명 |
-|------|------|----------------|------|
-| **PB nut** | `w × (d_prev − d_now)` | w=**25** | staging까지 유클리드 거리 감소분만 보상 (farm 불가) |
-| **Corridor 페널티** | `−w × max(0, Y_excursion)` | w=**8.0**, margin 0.02 m | staging 평면보다 허브쪽(+Y)으로 넘어가면 선형 페널티 |
-| (standing 커널) | — | **0** | align/reach/lateral/axial/path 전부 제거 |
-
-> **standing 커널 제거 이유:** `exp(−거리)` 형태의 항상-양수 보상은 정책이 볼트 옆
-> ~12 cm에 주차해 per-step income을 빨아먹는 farm을 만든다(체결보다 이득). PB만 남기면
-> "전진해야만 보상"이 되고, 명목 궤적이 경로 자체를 제공하므로 standing 커널 없이도 접근이 성립한다.
-
-#### Sparse (FSM 이벤트)
-
-| 이벤트 | 보너스 | 설명 |
-|--------|--------|------|
-| R_arrive (staging 도달 → macro 트리거) | + | APPROACH 성공 |
-| R_insert (INSERT+HOLD 완료) | + | 삽입 |
-| R_fasten (볼트 1개 체결) | + | 볼트당 |
-| R_all_fastened (10개 전체) | ++ | 에피소드 성공 |
-
-#### 페널티 (항상)
+#### APPROACH (sub=0) — dense (×0.3)
 
 | 항목 | 공식 | 가중치 | 설명 |
 |------|------|--------|------|
-| **Collision** | `getContactPoints` A-B 접촉 | w=40.0 | 실제 표면 접촉(mesh-aware) |
-| **Joint-vel** | `−w × ‖dq_B‖` | w=0.02 | 최소 관절변화 |
-| Action / Jerk L2 | dead 채널 마스킹 | — | 활성 3채널(XYZ 잔차)만 |
-| `ent_coef` | — | 0.008 | 탐험 |
+| **pb_nut** | `25×(d_prev−d_now)` | w=25 | staging까지 거리 **감소분만** (유일한 주요 양수) |
+| **nut_path** | `−8×max(0, Y_excursion)` | w=8, margin 2cm | 허브쪽(+Y) 평면 이탈 페널티 |
+| **nut_joint_vel** | `−0.02×‖dq_B‖` | w=0.02 | 관절 속도 페널티 |
+| **collision** | `−40` | w_nut_collision=40 | A-B mesh 접촉 |
+| **action, jerk** | L2 | w=0.01 | 활성 3채널만 |
 
-### 10.6 커리큘럼
+standing exp 커널(align/reach/lateral/axial/path/ba_clear)은 **전부 0**.
 
-| 커리큘럼 | 설정 | 비고 |
-|----------|---------|------|
-| **Hot-start alpha** | **OFF** | 명목 궤적이 HOME→볼트 접근을 담당하므로 발판 불필요 |
-| **Per-bolt random start** | **OFF** (항상 bolt 0 cold-start) | premark 인플레 제거, `n_fastened_policy` 정직 측정 |
-| **Arrive angle tolerance** | 35° → 12° (hold 400k, ramp 2.0M) | 정렬 게이트 점진 강화 (coaxial 락이라 보조적) |
+#### Sparse (×0.7 실효)
 
-> **hot-start를 쓰지 않는 이유:** 명목 궤적이 항상 충돌-free 접근 경로를 제공하므로
-> reverse-curriculum 발판 자체가 필요 없다 (`make_env_config`가 `nut_b_planner_residual=True`면
-> `nut_b_hotstart_enable`을 자동 OFF).
+| 이벤트 | 설정값 | **실효** | 시점 |
+|--------|--------|---------|------|
+| `R_arrive` | +40 | **+28** | staging 도달 → 매크로 진입 |
+| `R_insert` | +60 | **+42** | INSERT+HOLD 완료 |
+| `R_fasten` | +120 | **+84** | 볼트 1개 RETRACT 완료 |
+| `R_all_fastened` | +500 | **+350** | 10/10 → `is_success=True` |
 
-### 10.7 물리 수정 (근본 원인 대응)
+볼트 1개 희소 합(실효): **154**. 10/10 완벽 시 희소만 **~1,890** + APPROACH PB 누적.
 
-| 수정 | Before | After | 효과 |
-|------|--------|-------|------|
-| Motor force cap | [400,400,300,60,60,60] | **[6000,6000,4000,1000,1000,1000]** | sag 36.8→0~2.5cm |
-| Self-collision filter | 없음 | nut_runner ↔ wrist links OFF | 16,300N 가짜 접촉 제거 |
-| IK warm-start | HOME (arm.rest) | **현재 관절** | 먼 호 branch flip 방지 |
-| Socket↔hub/tire filter | 없음 | B links ↔ hub/tire OFF | 동축 슬라이드 |
-| Coaxial 방향 락 | Δrot 누적 | **볼트축 하드 락** | θ 표류(46°) 제거, 3-DOF로 축소 |
+#### MACRO (sub=1)
 
-### 10.8 학습 설정 (`run_b_nut_train_v14.sh`)
+INSERT axial servo 구간: 정책 action/jerk/pb **0** (env 구동). HOLD/RETRACT는 매크로 joint lerp.
 
-```bash
-python -u -m src.train \
-  --stage 3 --phase 1 --scene-layout fanuc_spacious \
-  --nut-fastening --nut-hold-steps 6 \
-  --nut-b-planner-residual \
-  --no-nut-hotstart-curriculum \
-  --nut-arrive-ang-curriculum \
-  --nut-arrive-ang-start-deg 35 --nut-arrive-ang-end-deg 12 \
-  --nut-arrive-ang-hold-steps 400000 --nut-arrive-ang-ramp-steps 2000000 \
-  --num-envs 88 --n-steps 279 --batch-size 1024 \
-  --device cpu --eval-freq 250000 --eval-episodes 5 \
-  --log-std-init -0.5 \
-  --terminate-on never --max-steps 600 \
-  --total-steps 3500000 --run-name nut_fastening_v14
-```
+### 10.4 v24 학습 파이프라인 (4단계)
 
-| 플래너 CLI / config | 기본 | 설명 |
-|------|------|------|
-| `--nut-b-planner-residual` | False | 명목 궤적 + 잔차 모드 (hot-start 자동 OFF) |
-| `nut_planner_pos_residual_scale` | 0.05 m | 잔차 XYZ 스케일 |
-| `nut_planner_traj_steps` | 120 | 명목 궤적 leg당 샘플 수 |
+| Stage | 스크립트 | run-name | 목표 | total steps |
+|-------|---------|----------|------|-------------|
+| **A** | `run_b_nut_v24_chain_recover.sh` | `nut_fastening_v24_chain` | 스핀-free 연속 10/10 (DR off) | 4M |
+| **B** | `run_b_nut_v24_dr_stageB.sh` | `nut_fastening_v24_dr_stageB` | 허브 DR 0→5 cm | 3M |
+| **B2** | `run_b_nut_v24_dr_stageB2.sh` | `nut_fastening_v24_dr_stageB2` | 1.25M ckpt에서 DR 3.5→5 cm | 2M |
+| **B3** | `run_b_nut_v24_dr_stageB3.sh` | `nut_fastening_v24_dr_stageB3` | 5 cm 코너 집중 (4.5→5 cm) | 2M |
 
-> **검증:** `scripts/smoke_nut_planner_v14.py` — 잔차=0(명목만)으로 **10/10 체결** 확인
-> (1592 step). 즉 명목 경로·FSM·매크로가 정책 없이도 전 볼트를 충돌-free로 체결 가능.
+**배포 ckpt:** `runs/nut_fastening_v24_dr_stageB3/ckpts/ppo_1749440_steps.zip` (1.75M)
+
+> Stage B `final.zip`은 붕괴(3/10). 중간 ckpt 스캔으로 **1.25M(B) → B2 → B3** 경로 채택.
+
+### 10.5 B-side PPO 하이퍼파라미터 (v24 공통 베이스)
+
+| 파라미터 | Stage A (chain) | Stage B | Stage B2 | Stage B3 |
+|----------|----------------|---------|----------|----------|
+| `num_envs` | 88 | 88 | 88 | 88 |
+| `n_steps` | 279 | 279 | 279 | 279 |
+| `batch_size` | 1024 | 1024 | 1024 | 1024 |
+| `lr` | **1e-4** | **1e-4** | **5e-5** | **3e-5** |
+| `ent_coef` | **0.001** | **0.001** | **0.0005** | **0.0005** |
+| `log_std_init` | −1.0 | −1.0 | −1.0 | −1.2 |
+| `max_steps` | 2000 | 4000 | 4000 | 4000 |
+| `eval_episodes` | 30 | 20 | 20 | 20 |
+| resume | v22 stage2 policy-only | v24_chain policy-only | B@1.25M policy-only | B2@1.5M policy-only |
+
+SB3 공통: `gamma=0.995`, `gae_lambda=0.95`, `clip_range=0.2`, `vf_coef=0.5`,
+`max_grad_norm=0.5`, `n_epochs=10`, `net_arch=[256,256]`, `device=cpu`.
+
+### 10.6 B 커리큘럼 (v24)
+
+| 커리큘럼 | Stage A | Stage B/B2/B3 |
+|----------|---------|---------------|
+| hot-start alpha | 0.3→0 (hold 200k, ramp 1.5M) | 0.15→0 (B) / 0.05→0 (B2/B3) |
+| arrive ang tol | **5° 고정** | **5° 고정** |
+| arrive pos tol | **8 cm 고정** | **8 cm 고정** |
+| DR hub range | off | 0→5 cm (B) / 3.5→5 (B2) / 4.5→5 (B3) |
+| A hold jitter | — | ±6° (train) / **0° (E2E)** |
 
 ---
 
-## 11. PPO 학습 설정 (공통)
+## 11. PPO 학습 설정
 
-| 파라미터 | 값 | CLI |
-|----------|-----|-----|
+### 11.1 Stable-Baselines3 기본값 (`src/train.py`)
+
+| 파라미터 | 기본값 | CLI |
+|----------|--------|-----|
 | Algorithm | PPO | — |
 | Policy | MlpPolicy | — |
-| net_arch | [256, 256] | `--net-arch 256,256` |
-| learning_rate | 3e-4 | `--lr 3e-4` |
-| gamma | 0.995 | `--gamma 0.995` |
-| gae_lambda | 0.95 | `--gae-lambda 0.95` |
-| clip_range | 0.2 | `--clip-range 0.2` |
-| ent_coef | 0.0 | `--ent-coef 0.0` |
-| vf_coef | 0.5 | `--vf-coef 0.5` |
-| max_grad_norm | 0.5 | `--max-grad-norm 0.5` |
-| n_epochs | 10 | `--n-epochs 10` |
-| n_steps | 341 | `--n-steps 341` |
-| batch_size | 1024 | `--batch-size 1024` |
-| log_std_init | −0.5 | `--log-std-init -0.5` |
-| num_envs | 72 | `--num-envs 72` |
-| device | CPU | `--device cpu` |
-| eval_freq | 250,000 | `--eval-freq 250000` |
-| eval_episodes | 5 | `--eval-episodes 5` |
+| `net_arch` | [256, 256] | `--net-arch 256,256` |
+| `learning_rate` | 3e-4 | `--lr` |
+| `gamma` | 0.995 | `--gamma` |
+| `gae_lambda` | 0.95 | `--gae-lambda` |
+| `clip_range` | 0.2 | `--clip-range` |
+| `ent_coef` | **0.0** | `--ent-coef` |
+| `vf_coef` | 0.5 | `--vf-coef` |
+| `max_grad_norm` | 0.5 | `--max-grad-norm` |
+| `n_epochs` | 10 | `--n-epochs` |
+| `n_steps` | 2048 | `--n-steps` |
+| `batch_size` | 128 | `--batch-size` |
+| `log_std_init` | 0.0 | `--log-std-init` |
 
-> **CPU 선택 이유:** env collection이 wall-time의 ~98.6%. BLAS/OMP thread = 1로 설정하여 72개 SubprocVecEnv worker oversubscription 방지.
+> 실제 run은 아래 파이프라인 표처럼 CLI로 override한다.
+
+### 11.2 파이프라인별 실측 하이퍼파라미터
+
+#### Robot A — mount (`run_phase1_pipeline.sh` → `run_phase_a_dr_finetune.sh`)
+
+| 파라미터 | v2 / ft03 | v3_dr (DR fine-tune) |
+|----------|-----------|----------------------|
+| `num_envs` | 72 | 72 |
+| `n_steps` | 341 | 341 |
+| `batch_size` | 1024 | 1024 |
+| `lr` | 3e-4 (default) | 3e-4 |
+| `ent_coef` | 0.0 | 0.0 |
+| `log_std_init` | −0.5 | −0.5 |
+| `eval_episodes` | 5 | 10 |
+| `total_steps` | 2M + 3M (ft03) | 2M |
+| `planner_pos_offset_scale` | 0.03 m | **0.06 m** |
+| `max_steps` | 600 (train default) | 600 |
+
+#### Robot B — v24 (§10.5 표 참조)
+
+Stage A/B/B2/B3 각각 `lr`, `ent_coef`, `log_std_init`, DR curriculum이 다름.
+공통: `num_envs=88`, `n_steps=279`, `batch_size=1024`, `device=cpu`,
+`eval_freq=250000`, `terminate_on=never`.
+**rollout batch** = 88×279 = **24,552** env-step / update (A mount: 72×341 = 24,552).
+
+### 11.3 Rollout 로깅 지표 (`RewardBreakdownCallback`)
+
+| 로그 키 | 의미 |
+|---------|------|
+| `rollout/success_rate` | 에피소드 `is_success` 비율 |
+| `reward/{term}` | 보상 항목별 **스텝 평균** (pb_nut, fsm_bonus, guide_A, …) |
+| `env/contact_force_mean` | 접촉력 |
+| `env/ik_residual_A/B_mean` | IK 잔차 |
+| `curriculum/*` | DR range, mount tol, hot-start alpha, … |
+
+**B 핵심 지표:** `n_fastened_policy`(premark 제외), `rollout/success_rate`(10/10).
+
+### 11.4 CPU / threading
+
+env collection이 wall-time ~98%. `OMP/MKL/OPENBLAS=1`, `CUDA_VISIBLE_DEVICES=""`.
+72–88 SubprocVecEnv worker oversubscription 방지.
 
 ---
 
@@ -684,25 +673,28 @@ python -u -m src.train \
 
 | 커리큘럼 | 파라미터 | 설명 |
 |-----------|---------|------|
-| **시작 위치 easy prob** | mid=0.85 → end=0.8 | 타이어가 허브 근처에서 시작할 확률 |
+| **시작 위치 easy prob** | v2: 0.7→0.6 / ft03·v3_dr: **0.85→0.8** | 타이어가 허브 근처에서 시작할 확률 |
 | **마운트 tol ramp** | soft(0.55m,45°) → hard(0.12m,5°) over 2.5M | 점진적 정밀도 요구 |
+| **Hub DR (v3_dr)** | 0→5 cm, hold 200k, ramp 1M | E2E용 A robustness |
 | **Attached hot-start** | 타이어 pre-attached | Stage 0 pickup skip, Stage 1부터 |
 
-### 12.2 Robot B 커리큘럼
+### 12.2 Robot B 커리큘럼 (v24)
 
-| 커리큘럼 | 파라미터 | 설명 |
-|-----------|---------|------|
-| **Hot-start alpha** | **OFF** | 명목 궤적이 접근 경로 제공 (발판 불필요) |
-| **Per-bolt random start** | **OFF** | 항상 bolt 0 cold-start, 정직 지표 |
-| **Arrive angle tol** | 35°→12° over 2.0M | 정렬 점진적 강화 (coaxial 락 보조) |
+| 커리큘럼 | 설정 |
+|-----------|------|
+| Hot-start alpha | 0.3→0 (Stage A) / 0.05→0 (B2/B3) |
+| arrive ang/pos tol | **5° / 8 cm 고정** (v24) |
+| DR hub range | Stage B: 0→5 cm → B2: 3.5→5 → B3: 4.5→5 cm |
+| Per-bolt random start | OFF (bolt 0 cold-start) |
 
-### 12.3 도메인 랜덤화 (Phase 2/3)
+### 12.3 도메인 랜덤화 (현재 배포)
 
-| Phase | 범위 | 설명 |
-|-------|------|------|
-| 1 | 0 cm | 고정 (현재) |
-| 2 | ±2 cm | 허브/카고 XY jitter |
-| 3 | ±5 cm | 더 넓은 jitter |
+| 로봇 | run | DR 범위 | cargo DR |
+|------|-----|---------|----------|
+| A | `phase1_mount_v3_dr` | 학습·E2E: 허브 XY **0→5 cm** | OFF (`--no-dr-cargo`) |
+| B | `v24_dr_stageB3` | **학습** 4.5→5 cm; **E2E eval** uniform ±5 cm | OFF |
+
+> 카고/백월은 허브와 **동행 drift** → 상대 geometry 유지. 독립 cargo jitter는 사용하지 않음.
 
 ---
 
@@ -718,7 +710,7 @@ python -u -m src.train \
 | Collision | OFF (penalty only) | OFF | per-step −10 페널티 |
 | Workspace | ON | ON | EE workspace 이탈 |
 | Contact force | 2500N / 50000N | 50000N | 과도 접촉력 |
-| Max steps | 600 | 600 | timeout |
+| Max steps | 2000 (E2E/eval) | 2000 | mount horizon |
 
 ### 13.2 Robot B (Nut Task)
 
@@ -728,64 +720,67 @@ python -u -m src.train \
 | Collision | **OFF** | 기하 체결, socket↔hub/tire filtered |
 | Contact force | **OFF** (0.0) | |
 | Vertical | **OFF** | 타이어 mounted 상태 |
-| Max steps | 600 | timeout |
+| Max steps | 4000 (train) / 2500 (E2E) | timeout |
 
 ---
 
 ## 14. 학습 파이프라인 및 실행 방법
 
-### 14.1 전체 파이프라인
+### 14.1 전체 파이프라인 (현재)
 
 ```
-1. Robot A Phase A 학습 (2M step)
-   └─ run_phase1_pipeline.sh → phase1_mount_v2/
+1. Robot A mount
+   run_phase1_pipeline.sh (2M) → run_phase1_mount_ft03.sh (3M resume)
 
-2. Robot A 파인튜닝 (3M step, resume)
-   └─ run_phase1_mount_ft03.sh → phase1_mount_v2_ft03/
+2. Robot A DR
+   run_phase_a_dr_finetune.sh → phase1_mount_v3_dr/ (2M, hub 0→5cm)
 
-3. A mount-end pose 추출
-   └─ scripts/extract_mount_endpose.py → data/nut_mount_endpose.npz
+3. Robot B v24 chain (DR off, spin-free)
+   run_b_nut_v24_chain_recover.sh → nut_fastening_v24_chain/ (4M)
 
-4. Robot B nut fastening 학습 (3.5M step)
-   └─ run_b_nut_train_v14.sh → nut_fastening_v14/
+4. Robot B DR stages
+   run_b_nut_v24_dr_stageB.sh (3M)
+   → run_b_nut_v24_dr_stageB2.sh (2M, from 1.25M ckpt)
+   → run_b_nut_v24_dr_stageB3.sh (2M, 5cm corner)
+
+5. E2E eval
+   scripts/run_e2e_eval.sh (100 scenarios, ±5cm)
+   scripts/e2e_hub_capture.py (허브 PNG 캡처)
 ```
 
-### 14.2 실행 방법
+### 14.2 실행 예시
 
 ```bash
-# 환경 준비
 conda activate tyro
-python scripts/poc_fanuc_urdf.py --fetch    # FANUC 메시
-python scripts/fetch_ur10e.py --fetch          # UR10e 메시
 
-# Robot A 학습
-bash scripts/run_phase1_pipeline.sh          # 2M step
-bash scripts/run_phase1_mount_ft03.sh          # 3M step finetune
+# A DR fine-tune
+bash scripts/run_phase_a_dr_finetune.sh
 
-# Robot B 학습 (플래너 + 잔차)
-python scripts/smoke_nut_planner_v14.py        # 잔차=0 명목만으로 10/10 검증
-bash scripts/run_b_nut_train_v14.sh            # 3.5M step
+# B v24 chain → DR
+bash scripts/run_b_nut_v24_chain_recover.sh
+bash scripts/run_b_nut_v24_dr_stageB.sh
+bash scripts/run_b_nut_v24_dr_stageB2.sh
+bash scripts/run_b_nut_v24_dr_stageB3.sh
 
-# 모니터링
-tensorboard --logdir runs/ --port 6006
-python scripts/plot_nut_progress.py            # 너트 체결 학습곡선 PNG 생성
+# E2E 100 시나리오
+bash scripts/run_e2e_eval.sh
+
+# GUI 연속 뷰
+bash scripts/run_e2e_view_v24.sh
 ```
 
-### 14.3 체크포인트 위치
+### 14.3 배포 체크포인트
 
-| Run | Best Model | Final |
-|-----|-----------|-------|
-| phase1_mount_v2 | `runs/phase1_mount_v2/best/best_model.zip` | `runs/phase1_mount_v2/final.zip` |
-| phase1_mount_v2_ft03 | `runs/phase1_mount_v2_ft03/best/best_model.zip` | — |
-| nut_fastening_v14 | `runs/nut_fastening_v14/best/best_model.zip` | (학습 중) |
+| Run | Deploy |
+|-----|--------|
+| `phase1_mount_v3_dr` | `runs/phase1_mount_v3_dr/final.zip` |
+| `nut_fastening_v24_dr_stageB3` | `runs/nut_fastening_v24_dr_stageB3/ckpts/ppo_1749440_steps.zip` |
 
 ---
 
-## 15. 설계 근거 (명목 궤적 + 잔차)
+## 15. 설계 근거
 
-현재 모델의 핵심 설계 — **"두 로봇 모두 명목 궤적 + PPO 잔차로 제어한다"** — 의
-근거가 되는 4가지 원칙이다. 각 원칙은 단순 RL(정책이 모든 것을 자력 학습)이 부딪히는
-구체적 실패 양상과, 그것을 구조적으로 제거하는 설계 결정으로 구성된다.
+현재 v24 스택의 핵심 설계 원칙 4가지.
 
 ### 15.1 원칙 ① — 물리적 한계는 학습이 아니라 물리로 푼다
 
@@ -810,175 +805,194 @@ income을 빨아먹는 farm을 만든다(체결보다 이득). 하나를 막으�
 소득원이 되는 whack-a-mole이 발생한다. **설계:** standing 커널을 **전부 0**으로 하고,
 전진분만 보상하는 potential-based shaping(PB) + corridor 페널티만 유지한다.
 
-### 15.4 원칙 ④ — 장거리 reach는 RL에 맡기지 않는다 (핵심)
+### 15.4 원칙 ④ — Robot A: 명목+잔차 / Robot B: pure-RL + 매크로
 
-가장 결정적인 원칙. 정책이 HOME에서 볼트까지 **1.7 m를 자력 탐색**하게 두면 수렴하지
-않는다. 그러나 충돌-free 경로 자체는 해석적으로 알려져 있다:
+Robot A는 Min-Jerk 명목+잔차로 장거리 carry/mount를 해결한다.
 
-- `scripts/e2e_nut_oracle.py` — 볼트 순서 `(0,5,7,2,3,8,9,4,6,1)` + **XZ-only transit(Y 고정)**
-  teleport oracle로 **10/10 체결, A-B 충돌 0** 증명. 경로·FSM·IK는 실행 가능하다.
-
-**설계:** 이 oracle 경로를 **명목 궤적**으로 깔고(Robot A의 Min-Jerk 플래너와 동일 패턴),
-정책은 그 위 ±5 cm XYZ 잔차만 학습한다. 방향은 coaxial 하드 락으로 표류를 차단한다.
-잔차=0 스모크에서 명목만으로 10/10이 나오므로, 학습은 "경로 발견"이 아니라
-**"충돌 회피 + 미세 정합"**이라는 훨씬 쉬운 문제로 축소된다.
+Robot B(v24)는 **접근(APPROACH)만 RL**로 학습하고, INSERT/HOLD/RETRACT는
+**clean-branch 매크로**가 담당한다. v14 planner+잔차는 DR/연속 체인에서 한계가 있어
+폐기. 스핀 제거(`nut_clean_shortest_macro`)와 DR 학습은 **단계 분리** 필수
+(Stage A: chain 회복 → Stage B/B2/B3: DR only).
 
 ### 15.5 핵심 교훈
 
-> 두 로봇 모두 **장거리 reach를 RL의 자력 탐색에 맡기면 수렴하지 않는다.** 해석적으로
-> 알 수 있는 충돌-free 경로는 명목 궤적으로 깔고, RL은 그 위 미세 보정만 배우게 하는 것이
-> 프로젝트 전체를 관통하는 설계 원칙이다.
+> A는 명목+잔차, B는 **접근 RL + env 체결 매크로**. DR·매크로·체인 변경을 동시에
+> 학습하면 chain 붕괴(v23). E2E는 A mount 성공 × B 10/10의 **곱**이므로 B DR가 병목.
 
 ---
 
-## 16. 현재 결과 및 향후 계획
+## 16. 현재 결과 및 E2E 실측
 
-### 16.1 Robot A (Phase A)
+### 16.1 Robot A (`phase1_mount_v3_dr`)
 
 | 항목 | 결과 |
 |------|------|
-| 학습 | ✅ 수렴 — `phase1_mount_v2` 2.0M + `ft03` 3.84M + **`v3_dr` DR 2.0M** (2026-06-09) |
-| 마운트 정밀도 | d ≈ 0 (~0.4 cm), theta ≈ 0 |
-| 게이트 커리큘럼 | 반경 0.55→**0.12 m**, 각도 45°→**5°** (하드 스펙 도달) |
-| 성공률 (0 cm, ft03) | 하드 게이트 구간 rollout **~0.80** |
-| 성공률 (허브 DR **±5 cm**, v3_dr) | rollout **~0.81** (DR ramp 완료 구간) |
-| Best / deploy model | `runs/phase1_mount_v3_dr/final.zip` |
+| 학습 | v2 2M + ft03 3M + **v3_dr 2M** (hub 0→5 cm) |
+| 배포 | `runs/phase1_mount_v3_dr/final.zip` |
+| E2E (100 sc, ±5 cm) | **A success 79%** |
 
-#### 학습 곡선 — 성공률 vs 게이트 조임 + 허브 DR
+### 16.2 Robot B (`v24_dr_stageB3` @ 1.75M)
 
-![Robot A Phase-A 마운트 성공률 vs 게이트 조임](phase_a_progress.png)
+| 항목 | 결과 |
+|------|------|
+| Stage A chain | 명목 연속 **10/10**, 스핀 제거 |
+| Stage B | final 붕괴 → **1.25M ckpt** 채택 |
+| Stage B2 | 0 cm **9.6/10**, 2 cm **10.0/10** (mean) |
+| Stage B3 | 5 cm corner 보강 (4.5→5 cm 집중) |
+| E2E (100 sc, ±5 cm) | **B success 17%** (10/10) |
 
-**그래프 읽는 법.** 가로축은 **세 run을 이어 붙인** 학습 스텝(×10⁶): `v2` → `ft03` → `v3_dr`.
+### 16.3 E2E 100 시나리오 실측 (2026-06-16)
 
-| 요소 | 축 | 의미 |
-|------|-----|------|
-| 진한 초록 선 | 왼쪽 | `success_rate` 이동평균(7-window) — 마운트 성공 비율 |
-| 연한 초록 선 | 왼쪽 | rollout별 raw `success_rate` |
-| 파란 점선 | 오른쪽 | `mount_radius_tol` — 마운트 거리 게이트(작을수록 엄격) |
-| 주황 점선 | 오른쪽 | `hub DR offset` (m) — 허브 XY 랜덤 오프셋 half-range |
-| 노란 음영 | — | 허브 DR fine-tune 구간 (0→5 cm) |
-| 회색 세로 점선 | — | run resume 지점 (`ft03`, `v3_dr`) |
-| 빨강 점선 | 왼쪽 | 성공률 1.0 기준선 |
+**하니스:** `scripts/e2e_eval.py --v24 --scenarios 100 --dr-range-cm 5`
 
-**해석.** `v2`→`ft03` 구간에서 게이트를 0.55 m→0.12 m로 조여도 성공률은 ~0.95→~0.80을 유지한다.
-`v3_dr`(약 5.8M step~)에서 허브를 0→5 cm로 흔들어도 **성공률 ~0.80–0.90**을 유지 — DR fine-tune이
-허브 위치 변화에 대한 A 강건성을 실제로 확보했다. (DR run에서는 mount 게이트도 함께
-ramp되므로 파란 점선이 일시적으로 다시 넓어지는 구간이 보인다.)
+| 지표 | 값 |
+|------|-----|
+| A mount rate | **79%** (79/100) |
+| B 10/10 rate | **17%** (17/100) |
+| **E2E success** | **15%** (15/100) |
+| B `n_fastened` mean | **3.14** / 10 (partial 체결 다수) |
 
-> 재생성: `python scripts/plot_phase_a_progress.py` (`v2` + `ft03` + `v3_dr` 로그 파싱).
+**병목:** B DR @ ±5 cm. A는 ~80%로 안정, B가 E2E 곱의 제한 요인.
 
-### 16.2 Robot B (Nut Fastening)
+**E2E 성공 중 가장 먼 허브:** scenario 11 (x=+4.7 cm, y=+3.9 cm, max|축|=4.7 cm).
 
-| 항목 | 결과 (2026-06-09) |
-|------|-------------------|
-| **잔차=0 스모크** | **10/10 체결** (명목 궤적만, 1592 step) |
-| Oracle E2E | **10/10** 충돌-free (볼트 순서 + XZ transit) |
-| 학습 (nominal) | ✅ `nut_fastening_v15` 3.5M — rollout `success_rate` **~0.74**, `n_fastened_policy` **~4.3** |
-| DR fine-tune | ✅ `nut_fastening_v16_dr` 1.5M — 허브 0→5 cm ramp |
-| DR **±5 cm** (v16 종료) | rollout `success_rate` **~0.59**, `n_fastened_policy` **~3.7** |
-| Deploy model | `runs/nut_fastening_v16_dr/final.zip` (DR), `runs/nut_fastening_v15/final.zip` (0 cm nominal) |
+> JSON: `runs/e2e_eval/e2e_100sc_5cm_20260615_184724.json`
 
-#### 학습 곡선 — 정책 체결 볼트 수 + 허브 DR
+### 16.4 v24 진화 요약
 
-![Robot B 너트 체결 학습 곡선](nut_fastening_progress.png)
+| 단계 | 핵심 | 결과 |
+|------|------|------|
+| v22 pure-RL + clean-branch | 타이어 충돌 회피 seating | 명목 10/10 |
+| v23 (폐기) | approach-seed IK + DR 동시 | chain 1–3/10 |
+| v24 Stage A | `nut_clean_shortest_macro` | 스핀-free 10/10 |
+| v24 Stage B→B3 | DR only, ckpt 스캔 | B2 1.5M deploy → B3 1.75M |
 
-**그래프 읽는 법.** 가로축은 **두 run을 이어 붙인** 학습 스텝(×10⁶): `v15`(nominal) → `v16_dr`.
+### 16.5 향후
 
-| 요소 | 축 | 의미 |
-|------|-----|------|
-| 진한 초록 선 | 왼쪽 | `n_fastened_policy` 이동평균(7-window) |
-| 연한 초록 선 | 왼쪽 | rollout별 raw 값 |
-| 파란 점선 | 오른쪽 | rollout `success_rate` (10/10 전체 성공) |
-| 빨강 점선 | 왼쪽 | 목표 10/10 |
-| 노란 음영 | — | 허브 DR fine-tune 구간 (0→5 cm) |
-| 회색 세로 점선 | — | `v16_dr` resume 지점 (~3.5M step) |
+1. B 5 cm corner 추가 보강 (horizon / arrive tol / workspace edge)
+2. E2E `b_max_steps`·A jitter ablation
+3. Phase B 6-stage full cycle (`--remount-cycle`)
 
-**해석.** `v15`에서 명목(0 cm) 기준 `n_fastened_policy`는 ~4.3, `success_rate` ~0.74로
-수렴 — 잔차=0 스모크(10/10) 대비 정책 잔차·게이트·horizon(2000 step) 때문에 10/10
-전체 성공은 ~75% 수준. `v16_dr`에서 허브 DR 0→5 cm ramp 후 **success_rate ~0.55–0.60**으로
-하락 — DR에 대한 B 강건성은 부분적으로 학습됐으나 **5 cm에서 목표(0.92+)에는 미달**.
-실패 원인은 대부분 `max_steps` 타임아웃(§15.4).
+---
 
-> 재생성: `python scripts/plot_nut_progress.py` (`v15` + `v16_dr` 로그 파싱).
+## 17. E2E 평가 — 보상·설정·지표
 
-#### 학습 로그 기반 수렴 성능 (Measured, rollout)
+E2E는 **두 개의 독립 에피소드**다. 보상은 이어지지 않으며 `a_reward`, `b_reward`로
+각각 합산된다. 성공 판정은 `is_success` 플래그(A mount, B all_fastened).
 
-> 아래는 **별도 eval 하니스가 아닌** SB3 rollout 로그의 이동평균 구간 실측이다.
-> `success_rate` = 에피소드 10/10 전체 성공 비율.
+### 17.1 공통 보상 mix
 
-| 조건 | `n_fastened_policy` | `success_rate` (10/10) | 근거 run |
-|------|---------------------|------------------------|----------|
-| 0 cm (nominal) | ~4.3 | ~0.74 | `nut_fastening_v15` 종료 |
-| ±5 cm (DR ramp 완료) | ~3.7 | ~0.59 | `nut_fastening_v16_dr` 종료 |
+```
+total = 0.3 × dense + 0.7 × fsm_bonus − 0.15   (step_alive, 매 스텝)
+```
 
-### 16.3 End-to-end 강건성 (학습 rollout 기반 추정)
+희소 보너스 **실효값 = 설정값 × 0.7**.
 
-> ⚠️ **본 절 표는 formal multi-scenario eval 하니스가 아니라**, A/B DR fine-tune
-> rollout `success_rate`의 곱으로 **1차 추정**한 값이다. 허브별 N=100 시나리오 실측은
-> 아직 미실행. `e2e_projected.png`는 초기 구조 기반 예상치이며, 아래 표가 **현재
-> 학습 실측에 더 가깝다.**
+### 17.2 Phase A — Robot A 마운트 (`terminate_on=mount`)
 
-**평가 정의 (목표).** 1회 성공 = A 마운트 성공 AND B 10/10 체결.
-아래 표는 각 로봇 rollout 성공률의 독립 곱: `P(A) × P(B)`.
+**설정** (`scripts/e2e_eval.py` mount_overrides):
 
-| 허브 오프셋 | A mount (rollout) | B 10/10 (rollout) | **E2E 추정** | 출처 |
-|------------|-------------------|-------------------|-------------|------|
-| 0 cm | ~0.80 | ~0.74 | **~0.59** | ft03 + v15 |
-| ±5 cm | ~0.81 | ~0.59 | **~0.48** | v3_dr + v16_dr |
+| 항목 | 값 |
+|------|-----|
+| `terminate_on` | `"mount"` — **R_mount 직후 종료** |
+| `mix_easy_prob` | 0.8 |
+| `mount_radius_tol` | 0.55 m (soft) |
+| `planner_pos_offset_scale` | 0.06 m |
+| `max_steps` | 2000 |
+| DR | ±5 cm (`RANDOM_POSITION_RANGE`) |
 
-![예상 end-to-end 강건성 곡선 (projected — 초기 추정, 아래 표로 대체 예정)](e2e_projected.png)
+**FSM (E2E에서 도달 가능):**
 
-**해석.** A는 DR fine-tune 후 ±5 cm에서도 mount 성공률 ~81%로 **강건**.
-B는 5 cm에서 10/10 성공률 ~59%로 **E2E 병목** — A(0.81) × B(0.59) ≈ **48%**.
-초기 projected(~71% @5 cm)보다 낮다. B 쪽 추가 DR 학습·horizon 확대·5 cm 구간
-집중 fine-tune이 필요.
+```
+S0 Approach ──pickup──→ S1 Carry/Mount ──mount──→ [종료]
+```
 
-> 재생성: `python scripts/plot_e2e_projected.py` (formal eval 준비 전 참고용).
-> E2E 실측: A/B checkpoint + `--dr-hub-offset` eval 하니스 (향후).
+`R_demount`, `R_success`는 **발생하지 않음**.
 
-### 16.4 v17 → v24 진화: 연속 체인 · 스핀 제거 · GUI 클린업 (2026-06-14)
+#### Dense (×0.3)
 
-v15/v16(플래너+잔차)은 명목에서도 연속 10/10이 ~74%에 그쳤다. 이후 **pure-RL**
-(플래너 제거, B가 직접 접근/정렬)로 전환하고, INSERT의 타이어 충돌 문제를
-**clean-branch macro**로 풀어 연속 10/10을 명목에서 달성했다.
+| Stage | 항목 | 가중치 |
+|-------|------|--------|
+| S0 | `approach_A` (exp + close) | 3.0 + 2.0 |
+| S0 | `pb_approach` | 5.0 × Δd |
+| S1 | `guide_A` | 8.0 × exp(−‖hub−ee‖/0.5) |
+| S1 | `pb_carry` | 10.0 × Δd_A |
+| All | `vertical_pen`, `collision`, `action`, `jerk`, `sync_joint_a` | §9.3 |
+| All | `step_alive` | **−0.15/step** |
 
-| 단계 | run / 스크립트 | 핵심 변경 | 결과 |
-|------|----------------|-----------|------|
-| v20~v22 | `run_b_nut_train_v22_stage2.sh` | pure-RL + branch-aware INSERT + clean-branch seating | **명목 연속 10/10** |
-| v23 (폐기) | ~~`run_b_nut_dr_finetune_v23.sh`~~ | approach-seed IK로 스핀 제거 시도 | 체인 회귀 (1~3/10) |
-| v24 Stage A | `run_b_nut_v24_chain_recover.sh` | `nut_clean_shortest_macro` (FK 동일 ±2πk winding 정리) + **DR 없이** 체인 회복 | **명목 연속 10/10, 스핀 제거** (`nut_fastening_v24_chain`) |
-| v24 Stage B | `run_b_nut_v24_dr_stageB.sh` | v24_chain resume + 허브 0→5 cm DR | 진행 중 (`nut_fastening_v24_dr_stageB`) |
+#### Sparse (×0.7 실효)
 
-**스핀 제거의 핵심 교훈.** 볼트마다 wrist_1이 360° 도는 현상은 매크로 endpoint의
-관절 winding(±2π) 때문이었다. 이를 바꾸면 정책의 resume 관측(`qB` raw 정규화 각도)이
-**OOD가 되어** 연속 체인이 무너진다 → 재학습 불가피. 게다가 "스핀 제거 + DR"을
-동시에 학습하면 체인이 붕괴(v23/v24-combined 실측 1~3/10)하므로 **단계 분리**가
-필수: **Stage A**(DR 없이 스핀-free 체인 회복) → **Stage B**(DR만 추가).
+| 이벤트 | 설정 | **실효** |
+|--------|------|---------|
+| `R_pickup` | +300 | **+210** (S0→S1, easy start에서 생략 가능) |
+| `R_mount` | +300 | **+210** (S1→S2, **에피소드 종료**) |
+| `R_fail` | −50 | **−35** |
 
-**DR 필요성 실측 (Stage A 모델, `nut_fastening_v24_chain`).**
+**A 에피소드 희소 합:** pickup+mount ≈ **420** (pickup 포함 시) / **210** (mount만).
 
-| 조건 | 연속 체결 |
-|------|-----------|
-| 허브 offset 0 (DR off/on 무관) | **10/10** |
-| 허브 offset 2 cm | **0/10** |
-| 허브 offset 0.3~4.4 cm | 0~1/10 |
+### 17.3 Phase B — Robot B 너트 (v24)
 
-→ Stage A 모델은 명목 전용이라 sub-cm 오프셋에도 무너진다. E2E(±5 cm)에는 **Stage B
-DR 파인튜닝이 필수**임이 정량 확인됐다.
+**설정** (`_nut_overrides_v24`):
 
-**GUI 텔레포트/깜빡임 제거.** clean-branch 계획은 IK 재시작·충돌 스윕을 위해 B를
-`resetJointState`로 순간이동했다 복원하는데, GUI에서 그 중간 자세가 그려져
-"자세가 확 바뀌었다 돌아오는" 깜빡임이 보였다. `step()`의 action 적용 구간 전체를
-**참조계수 렌더 freeze**(`TyroEnv._render_frozen`)로 감싸, 물리 스텝 직전에만
-렌더링을 켜 **확정 자세 한 프레임만** 그리도록 수정(headless/DIRECT 무영향).
+| 항목 | E2E train | E2E eval |
+|------|-----------|----------|
+| `nut_pure_rl` | True | True |
+| `nut_clean_shortest_macro` | True | True |
+| `nut_clean_prep_len` / `plunge_len` | train default 30/25 | **E2E eval 72/45** |
+| `nut_a_hold_jitter_rad` | 6° (train) | **0°** (deterministic fixture) |
+| `max_steps` | 4000 (train) | **2500** |
+| `terminate_on` | never | never |
 
-### 16.5 향후 계획
+reset: 타이어 **허브 pre-seat**, A mount-hold IK, B bolt 0부터 cold-start.
 
-1. **Stage B 수렴 대기** — `nut_fastening_v24_dr_stageB` 3M, 허브 0→5 cm
-2. **±5 cm 강건성 재측정** — offset 2/5 cm에서 10/10 회복 확인
-3. **Formal E2E eval** — 허브 ±0/2/5 cm × N=100 시나리오, `e2e_projected.png`를 실측으로 교체
-4. **Phase B:** 6-stage full cycle (A+B 동시) — `--remount-cycle`
-5. **Sim2Real:** domain randomization Phase 2/3, A 실 policy + B 협동
+> **매크로 타이밍:** 학습 기본값은 `prep=30`, `plunge=25`. E2E harness는 B3 검증
+> 설정과 동일하게 **72/45**를 강제한다(`e2e_eval.py` `_nut_overrides_v24`).
+> 배포 eval·GUI는 harness와 동일 wiring을 쓸 것.
+
+#### APPROACH dense (×0.3) — §10.3과 동일
+
+`pb_nut`(25×Δd), `nut_path`(−8×Y_excursion), `nut_joint_vel`, `collision`(−40), `action`/`jerk`.
+
+#### Sparse per bolt (×0.7)
+
+| 이벤트 | 설정 | **실효** |
+|--------|------|---------|
+| `R_arrive` | +40 | +28 |
+| `R_insert` | +60 | +42 |
+| `R_fasten` | +120 | +84 |
+| `R_all_fastened` | +500 | +350 (10/10) |
+
+**10/10 완벽 시 희소 합(실효):** 10×154 + 350 ≈ **1,890** + APPROACH PB − 페널티.
+
+#### MACRO 구간
+
+INSERT axial servo: 정책 `action`/`pb_nut`/`jerk` = **0**. env clean-branch lerp.
+
+### 17.4 E2E eval 출력 지표
+
+| 필드 | 의미 |
+|------|------|
+| `a_success` / `b_success` | 각 `is_success` |
+| `e2e_success` | A ∧ B (10/10) |
+| `a_reward` / `b_reward` | 에피소드 **총 step reward** (스케일 다름, 디버그용) |
+| `b_n_fastened` | 체결 볼트 수 (0–10) |
+| `hub_offset_*` | 시나리오별 DR offset |
+
+**실행:**
+
+```bash
+bash scripts/run_e2e_eval.sh   # A=v3_dr, B=B3_1.75M, 100 sc, ±5cm
+```
+
+### 17.5 E2E reward 스케일 참고 (실측)
+
+A·B 총 reward는 **스케일·horizon이 달라 직접 비교 불가**. 성공 판정은 `is_success`만 사용.
+
+| 케이스 | `a_reward` (예) | `b_reward` (예) | 비고 |
+|--------|-----------------|-----------------|------|
+| E2E 성공 (sc0) | ~232 | ~1,659 | A 176 step, B 1798 step |
+| A만 성공 | ~200–400 | — | mount sparse ≈210–420 |
+| B partial (7/10) | — | ~800–1200 | 희소 7×154 미만 + PB |
 
 ---
 
@@ -996,19 +1010,19 @@ TYRO/
 │       ├── models.py      # 타이어/휠 프리미티브 모델링
 │       └── rewards.py     # RewardBreakdown dataclass
 ├── scripts/
-│   ├── run_phase1_pipeline.sh      # A 초기 학습
-│   ├── run_phase1_mount_ft03.sh    # A 파인튜닝
-│   ├── run_b_nut_train_v14.sh      # B nut 학습 (플래너+잔차, 레거시)
-│   ├── run_b_nut_train_v22_stage2.sh   # B pure-RL clean-branch (명목 10/10)
-│   ├── run_b_nut_v24_chain_recover.sh  # v24 Stage A: 스핀-free 체인 회복 (DR off)
-│   ├── run_b_nut_v24_dr_stageB.sh      # v24 Stage B: 허브 0→5cm DR 파인튜닝
-│   ├── view_nut.py                 # GUI 뷰어 (--v24 --smooth-macro)
-│   ├── smoke_nut_planner_v14.py    # 잔차=0 명목 궤적 10/10 검증
-│   ├── e2e_nut_oracle.py           # teleport oracle 10/10 (경로 증명)
-│   ├── plot_nut_progress.py        # B 너트 체결 학습곡선 PNG
-│   ├── plot_phase_a_progress.py    # A 성공률 vs 게이트 PNG
-│   ├── extract_mount_endpose.py    # A endpose 추출
-│   └── preview_nut_fastening.py    # GUI 진단
+│   ├── run_phase1_pipeline.sh           # A mount v2 (2M)
+│   ├── run_phase1_mount_ft03.sh         # A mount ft03 (3M)
+│   ├── run_phase_a_dr_finetune.sh       # A DR v3_dr (2M)
+│   ├── run_b_nut_v24_chain_recover.sh   # B v24 Stage A
+│   ├── run_b_nut_v24_dr_stageB.sh       # B DR Stage B
+│   ├── run_b_nut_v24_dr_stageB2.sh      # B DR Stage B2
+│   ├── run_b_nut_v24_dr_stageB3.sh      # B DR Stage B3 (deploy)
+│   ├── run_e2e_eval.sh                  # E2E 100 sc headless
+│   ├── run_e2e_view_v24.sh              # E2E GUI
+│   ├── e2e_eval.py                      # E2E harness
+│   ├── e2e_hub_capture.py               # 허브 before/after PNG
+│   ├── e2e_view_continuous.py           # 단일 창 A→B 연속 GUI
+│   └── view_nut.py                      # B 단독 GUI (--v24)
 ├── data/
 │   ├── urdf/              # 로봇 URDF (메시 별도 fetch)
 │   └── nut_mount_endpose.npz  # A 지지 자세
@@ -1030,4 +1044,5 @@ TYRO/
 
 ---
 
-*본 문서는 TYRO 프로젝트의 Robot A Phase A 마운트 및 Robot B 너트 체결 학습에 사용된 모든 설정, 모델링, 보상, 커리큘럼, 디버깅 과정을 정리한 것입니다.*
+*본 문서는 TYRO 프로젝트의 Robot A/B 학습·E2E 평가에 사용된 설정, 보상, PPO 하이퍼파라미터,
+v24 파이프라인, E2E 실측(2026-06)을 정리한 것입니다.*
